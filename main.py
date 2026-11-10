@@ -3084,6 +3084,26 @@ window.onerror = function(msg, url, line) {
 };
 
 document.addEventListener("DOMContentLoaded", () => {
+    if (typeof loadForexRates === 'function') {
+        loadForexRates();
+    }
+
+    const btnAnalyze = document.getElementById('btnAnalyze') || document.querySelector('.btn-primary') || document.querySelector('button');
+    if (btnAnalyze) {
+        btnAnalyze.onclick = function(e) {
+            e.preventDefault();
+            if (typeof loadValuation === 'function') {
+                loadValuation();
+            }
+        };
+    }
+
+    setTimeout(() => {
+        if (typeof loadValuation === 'function') {
+            loadValuation();
+        }
+    }, 400);
+});
     if (typeof loadForexRates === 'function') loadForexRates();
 
     const btnAnalyze = document.getElementById('btnAnalyze') || document.querySelector('.btn-primary') || document.querySelector('button');
@@ -3099,6 +3119,26 @@ document.addEventListener("DOMContentLoaded", () => {
     }, 300);
 });
         document.addEventListener("DOMContentLoaded", () => {
+    if (typeof loadForexRates === 'function') {
+        loadForexRates();
+    }
+
+    const btnAnalyze = document.getElementById('btnAnalyze') || document.querySelector('.btn-primary') || document.querySelector('button');
+    if (btnAnalyze) {
+        btnAnalyze.onclick = function(e) {
+            e.preventDefault();
+            if (typeof loadValuation === 'function') {
+                loadValuation();
+            }
+        };
+    }
+
+    setTimeout(() => {
+        if (typeof loadValuation === 'function') {
+            loadValuation();
+        }
+    }, 400);
+});
     loadForexRates();
 
     // 1. Bezpečné navázání tlačítka Analyzovat
