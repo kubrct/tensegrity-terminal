@@ -1,3 +1,7 @@
 fastapi
 uvicorn
 yfinance
+openpyxl
+reportlab
+pillow
+python-multipart
