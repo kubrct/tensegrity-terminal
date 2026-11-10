@@ -2769,19 +2769,9 @@ function renderTradingComps(data) {
     peerHtml += '</tbody></table>';
     safeSetHTML('peerCompsContainer', peerHtml);
 }
-        if (!document.getElementById('peerCompsContainer')) return;
-            const peerComps = data.peer_comps || data;
-            document.getElementById('peerSector').innerText = 'Orientační · ' + (peerComps.sector || '');
-            let peerHtml = '<table><thead><tr><th>Metoda</th><th>Sektorový násobek</th><th>Metrika (rok 5)</th><th>Implikovaná cena/akcii</th></tr></thead><tbody>';
-            (peerComps.multiples || []).forEach(peer => {
-                peerHtml += `<tr><td>${peer.method}</td><td>${peer.multiple.toFixed(1)}x</td><td>${formatCurrency(peer.forward_metric)}</td><td>${formatCurrency(peer.implied_share_price)}</td></tr>`;
-            });
-            peerHtml += '</tbody></table>';
-            document.getElementById('peerCompsContainer').innerHTML = peerHtml;
-        } // <--- Konec renderTradingComps
-
+        
 function renderSensitivityMatrix(matrixData) {
-if (!document.getElementById('sensitivityMatrix')) return;
+
     const container = document.getElementById('sensitivityMatrix') || document.getElementById('matrixContainer');
     if (!container) return;
 
@@ -2810,7 +2800,7 @@ if (!document.getElementById('sensitivityMatrix')) return;
 }
 
 function renderAmortizationSchedule(scheduleData) {
-if (!document.getElementById('lboScheduleContainer')) return;
+
     const container = document.getElementById('lboScheduleContainer') || document.getElementById('cashFlowContainer');
     if (!container) return;
 
