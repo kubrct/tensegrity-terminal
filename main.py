@@ -3073,7 +3073,7 @@ window.onerror = function(msg, url, line) {
     return true;
 };
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
     if (typeof loadForexRates === 'function') {
         loadForexRates();
     }
@@ -3098,7 +3098,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const btnAnalyze = document.getElementById('btnAnalyze') || document.querySelector('.btn-primary') || document.querySelector('button');
     if (btnAnalyze) {
-        btnAnalyze.onclick = (e) => {
+        btnAnalyze.onclick = async (e) => {
             e.preventDefault();
             if (typeof loadValuation === 'function') loadValuation();
         };
@@ -3108,7 +3108,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (typeof loadValuation === 'function') loadValuation();
     }, 300);
 });
-        document.addEventListener("DOMContentLoaded", () => {
+        document.addEventListener("DOMContentLoaded", async () => {
     if (typeof loadForexRates === 'function') {
         loadForexRates();
     }
@@ -3134,7 +3134,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // 1. Bezpečné navázání tlačítka Analyzovat
     const btnAnalyze = document.getElementById('btnAnalyze') || document.querySelector('.btn-primary') || document.querySelector('button');
     if (btnAnalyze) {
-        btnAnalyze.addEventListener('click', (e) => {
+        btnAnalyze.addEventListener('click', async (e) => {
             e.preventDefault();
             loadValuation();
         });
@@ -3160,7 +3160,7 @@ document.addEventListener("DOMContentLoaded", () => {
                 document.querySelector('button');
 
     if (btn) {
-        btn.addEventListener('click', (e) => {
+        btn.addEventListener('click', async (e) => {
             e.preventDefault();
             loadValuation();
         });
