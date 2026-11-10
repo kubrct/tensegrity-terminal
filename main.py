@@ -2743,10 +2743,32 @@ async function dispatchDrawerAction(endpoint) {
                 previousDebt = remainingDebt;
             });
             svg += '</svg>';
-            document.getElementById('debtWaterfallContainer')?.innerHTML = svg;
+            const el = document.getElementById('...');
+            if (el) el.innerHTML = html;
         }
 
-        function renderTradingComps(data) {
+        function safeSetHTML(id, html) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = html;
+}
+
+function safeSetText(id, text) {
+    const el = document.getElementById(id);
+    if (el) el.innerText = text;
+}
+
+function renderTradingComps(data) {
+    if (!data) return;
+    const peerComps = data.peer_comps || data;
+    safeSetText('peerSector', 'Orientační srovnání v odvětví');
+    
+    let peerHtml = '<table><thead><tr><th>Metoda</th><th>Násobek</th><th>Metrika</th><th>Implikovaná cena</th></tr></thead><tbody>';
+    ((peerComps && peerComps.multiples) || []).forEach(peer => {
+        peerHtml += `<tr><td>${peer.method || ''}</td><td>${peer.multiple || 0}x</td><td>${Number(peer.forward_metric || 0).toLocaleString()} USD</td><td>${peer.implied_share_price ? peer.implied_share_price.toFixed(2) + ' USD' : 'N/A'}</td></tr>`;
+    });
+    peerHtml += '</tbody></table>';
+    safeSetHTML('peerCompsContainer', peerHtml);
+}
         if (!document.getElementById('peerCompsContainer')) return;
             const peerComps = data.peer_comps || data;
             document.getElementById('peerSector').innerText = 'Orientační · ' + (peerComps.sector || '');
