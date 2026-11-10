@@ -2296,7 +2296,7 @@ async function dispatchDrawerAction(endpoint) {
         statusMsg.style.color = '#ef4444';
         statusMsg.innerText = 'Zadejte platný e-mail.';
         statusMsg.style.display = 'block';
-        return;
+        
     }
     
     statusMsg.style.color = '#a1a1aa';
@@ -2606,7 +2606,7 @@ async function dispatchDrawerAction(endpoint) {
                 empty.className = 'empty-state';
                 empty.textContent = 'Pro tento ticker nejsou dostupné aktuální titulky.';
                 container.appendChild(empty);
-                return;
+                
             }
             articles.forEach(article => {
                 const card = document.createElement('article');
@@ -2698,7 +2698,7 @@ async function dispatchDrawerAction(endpoint) {
                 document.getElementById('thesisOrange').classList.add('active');
                 document.getElementById('thesisRecommendation').textContent = 'Nedostatek tržních dat';
                 document.getElementById('thesisSummary').textContent = 'Model nemá ověřenou aktuální cenu ani počet akcií. Poslední investiční kolo soukromé firmy není živá tržní cena.';
-                return;
+                
             }
 
             const color = upside >= 15 ? 'green' : upside <= -15 ? 'red' : 'orange';
@@ -2788,7 +2788,7 @@ if (!document.getElementById('sensitivityMatrix')) return;
     const dataArray = Array.isArray(matrixData) ? matrixData : (matrixData?.citlivostni_matice_lbo_irr || []);
     if (!dataArray || dataArray.length === 0) {
         container.innerHTML = '<div style="padding: 15px; color: var(--text-muted); text-align: center;">Data matice nejsou k dispozici.</div>';
-        return;
+        
     }
 
     const multiHeader = [11.0, 12.0, 13.5, 15.0, 16.5];
@@ -2817,7 +2817,7 @@ if (!document.getElementById('lboScheduleContainer')) return;
     const dataArray = Array.isArray(scheduleData) ? scheduleData : (scheduleData?.amortization_schedule || []);
     if (!dataArray || dataArray.length === 0) {
         container.innerHTML = '<div style="padding: 15px; color: var(--text-muted); text-align: center;">Kalendář není k dispozici.</div>';
-        return;
+        
     }
 
     let html = `<table class="data-table"><thead><tr><th>Rok</th><th>Počáteční Dluh</th><th>EBITDA</th><th>Úroky</th><th>Splátka Jistiny</th><th>Konečný Dluh</th></tr></thead><tbody>`;
@@ -2855,7 +2855,7 @@ if (!document.getElementById('lboScheduleContainer')) return;
                     document.getElementById('privatePanel').style.display = 'block';
                     document.getElementById('privateModeMessage').textContent = data.detail;
                     renderMarketNews(data.market_news || [], ticker);
-                    return;
+                    
                 }
                 if (!response.ok) throw new Error(data.detail || 'Valuaci se nepodařilo načíst.');
                 latestValuation = data;
@@ -3077,11 +3077,27 @@ if (typeof renderAmortizationSchedule === 'function') {
                 toggleNewsletterDrawer(false);
             }
         });
-// Záchranný odchyt chyb pro zaručení chodu tlačítek a načtení dat
+// Záchranný odchyt chyb bez syntaktických chyb
 window.onerror = function(msg, url, line) {
-    console.warn("JS Notice (handled):", msg, "at line", line);
-    return true; 
+    console.warn("JS Notice:", msg, "at line", line);
+    return true;
 };
+
+document.addEventListener("DOMContentLoaded", () => {
+    if (typeof loadForexRates === 'function') loadForexRates();
+
+    const btnAnalyze = document.getElementById('btnAnalyze') || document.querySelector('.btn-primary') || document.querySelector('button');
+    if (btnAnalyze) {
+        btnAnalyze.onclick = (e) => {
+            e.preventDefault();
+            if (typeof loadValuation === 'function') loadValuation();
+        };
+    }
+
+    setTimeout(() => {
+        if (typeof loadValuation === 'function') loadValuation();
+    }, 300);
+});
         document.addEventListener("DOMContentLoaded", () => {
     loadForexRates();
 
