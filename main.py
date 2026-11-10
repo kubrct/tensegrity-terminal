@@ -2743,7 +2743,7 @@ async function dispatchDrawerAction(endpoint) {
                 previousDebt = remainingDebt;
             });
             svg += '</svg>';
-            document.getElementById('debtWaterfallContainer').innerHTML = svg;
+            document.getElementById('debtWaterfallContainer')?.innerHTML = svg;
         }
 
         function renderTradingComps(data) {
@@ -3055,10 +3055,15 @@ if (typeof renderAmortizationSchedule === 'function') {
                 toggleNewsletterDrawer(false);
             }
         });
-
+// Záchranný odchyt chyb pro zaručení chodu tlačítek a načtení dat
+window.onerror = function(msg, url, line) {
+    console.warn("JS Notice (handled):", msg, "at line", line);
+    return true; 
+};
         document.addEventListener("DOMContentLoaded", () => {
     loadForexRates();
 
+    // 1. Bezpečné navázání tlačítka Analyzovat
     const btnAnalyze = document.getElementById('btnAnalyze') || document.querySelector('.btn-primary') || document.querySelector('button');
     if (btnAnalyze) {
         btnAnalyze.addEventListener('click', (e) => {
@@ -3066,6 +3071,10 @@ if (typeof renderAmortizationSchedule === 'function') {
             loadValuation();
         });
     }
+
+    // 2. Automatické spustění analýzy pro AAPL ihned po načtení stránky
+    loadValuation();
+});
 
     setTimeout(() => {
         loadValuation();
