@@ -2747,6 +2747,7 @@ async function dispatchDrawerAction(endpoint) {
         }
 
         function renderTradingComps(data) {
+        if (!document.getElementById('peerCompsContainer')) return;
             const peerComps = data.peer_comps || data;
             document.getElementById('peerSector').innerText = 'Orientační · ' + (peerComps.sector || '');
             let peerHtml = '<table><thead><tr><th>Metoda</th><th>Sektorový násobek</th><th>Metrika (rok 5)</th><th>Implikovaná cena/akcii</th></tr></thead><tbody>';
@@ -2758,6 +2759,7 @@ async function dispatchDrawerAction(endpoint) {
         } // <--- Konec renderTradingComps
 
 function renderSensitivityMatrix(matrixData) {
+if (!document.getElementById('sensitivityMatrix')) return;
     const container = document.getElementById('sensitivityMatrix') || document.getElementById('matrixContainer');
     if (!container) return;
 
@@ -2786,6 +2788,7 @@ function renderSensitivityMatrix(matrixData) {
 }
 
 function renderAmortizationSchedule(scheduleData) {
+if (!document.getElementById('lboScheduleContainer')) return;
     const container = document.getElementById('lboScheduleContainer') || document.getElementById('cashFlowContainer');
     if (!container) return;
 
@@ -3054,6 +3057,20 @@ if (typeof renderAmortizationSchedule === 'function') {
         });
 
         document.addEventListener("DOMContentLoaded", () => {
+    loadForexRates();
+
+    const btnAnalyze = document.getElementById('btnAnalyze') || document.querySelector('.btn-primary') || document.querySelector('button');
+    if (btnAnalyze) {
+        btnAnalyze.addEventListener('click', (e) => {
+            e.preventDefault();
+            loadValuation();
+        });
+    }
+
+    setTimeout(() => {
+        loadValuation();
+    }, 300);
+});
     // 1. Spustíme kurzovní lístek
     if (typeof loadForexRates === 'function') {
         loadForexRates();
