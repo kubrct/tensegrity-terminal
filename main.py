@@ -1,1154 +1,1513 @@
-# -*- coding: utf-8 -*-
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-import asyncio
-import io
-import json
-import logging
 import os
-import re
+import json
+import math
+import time
+import smtplib
+import threading
+import datetime
+from io import BytesIO
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from typing import Dict, Any, List, Optional
+
 import yfinance as yf
-import openpyxl
+import pandas as pd
+import numpy as np
+import requests
+from fastapi import FastAPI, HTTPException, Response, Query
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-from datetime import datetime
-from email.utils import parseaddr
-from PIL import Image
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+# Volitelné knihovny pro export do Excelu a PDF
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
-app = FastAPI(title="Tensegrity Terminal API", version="12.5")
-STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
-os.makedirs(STATIC_DIR, exist_ok=True)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-logger = logging.getLogger(__name__)
+try:
+    from fpdf import FPDF
+    HAS_FPDF = True
+except ImportError:
+    HAS_FPDF = False
 
-FOREX_PAIRS = {
-    "EUR/CZK": "EURCZK=X",
-    "USD/CZK": "USDCZK=X",
-    "GBP/CZK": "GBPCZK=X"
-}
-FOREX_FALLBACK_RATES = {"EUR/CZK": 25.0, "USD/CZK": 23.0, "GBP/CZK": 29.0}
-LOGO_PATH = os.path.join(STATIC_DIR, "logo.png")
+# ==============================================================================
+# KONFIGURACE APLIKACE A PROSTŘEDÍ
+# ==============================================================================
+app = FastAPI(title="Tensegrity Terminal Intelligence", version="12.5")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def get_logo_bytes():
-    if not os.path.exists(LOGO_PATH):
-        return None
-    with Image.open(LOGO_PATH) as image:
-        image = image.convert("RGBA")
-        mark = image.crop((150, 250, 600, 600))
-        output = io.BytesIO()
-        mark.save(output, format="PNG")
-        return output.getvalue()
+SUBSCRIBERS_FILE = "subscribers.json"
+CACHE_STORE: Dict[str, Any] = {}
+CACHE_TTL = 180  # 3 minuty mezipaměti pro rychlou odezvu
 
-
-def get_live_forex_rates():
-    rates = {}
-    for pair, symbol in FOREX_PAIRS.items():
-        rate = FOREX_FALLBACK_RATES[pair]
-        live = False
-        try:
-            history = yf.Ticker(symbol).history(period="5d", interval="1d")
-            closes = history["Close"].dropna()
-            if not closes.empty:
-                rate = float(closes.iloc[-1])
-                live = True
-        except Exception as error:
-            logger.warning("Unable to fetch live forex rate for %s: %s", pair, error)
-        rates[pair] = {"rate": rate, "live": live}
-    return {
-        "rates": rates,
-        "updated_at": datetime.now().astimezone().isoformat(timespec="minutes")
-    }
+# Přihlašovací údaje pro odesílání e-mailů (nastavují se v prostředí serveru / Renderu)
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")
 
 
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", os.getenv("SMTP_USER", "kubenkamatyas@gmail.com"))
-SENDER_PASSWORD = os.getenv("SENDER_PASSWORD", os.getenv("SMTP_PASSWORD", ""))
-SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.json")
+# ==============================================================================
+# DATOVÉ MODELY PRO POŽADAVKY
+# ==============================================================================
+class OneOffNewsletterRequest(BaseModel):
+    email: str
+    ticker: str = "NVDA"
+    leverage: float = 30.0
+    growth: float = 5.0
+    exit_mult: float = 13.5
 
 
-def get_subscribers():
+class RegularSubscriptionRequest(BaseModel):
+    email: str
+    ticker: str = "NVDA"
+    schedule_day: str = "MONDAY"     # DAILY, WORKDAYS, MONDAY, FRIDAY
+    schedule_time: str = "08:00"     # HH:MM
+    leverage: float = 30.0
+    growth: float = 5.0
+    exit_mult: float = 13.5
+
+
+# ==============================================================================
+# POMOCNÉ FUNKCE PRO CACHE, FORMÁTOVÁNÍ A SPRÁVU ODBĚRATELŮ
+# ==============================================================================
+def get_cached(key: str) -> Optional[Any]:
+    entry = CACHE_STORE.get(key)
+    if entry and (time.time() - entry["ts"] < CACHE_TTL):
+        return entry["data"]
+    return None
+
+
+def set_cached(key: str, data: Any) -> None:
+    CACHE_STORE[key] = {"ts": time.time(), "data": data}
+
+
+def load_subscribers() -> List[Dict[str, Any]]:
     if not os.path.exists(SUBSCRIBERS_FILE):
         return []
     try:
-        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as file:
-            data = json.load(file)
-        if not isinstance(data, list):
-            return []
-        return [item.strip() for item in data if isinstance(item, str) and item.strip()]
-    except (OSError, json.JSONDecodeError):
-        return []
+        with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                # Migrace případných starších textových záznamů na strukturované objekty
+                normalized = []
+                for item in data:
+                    if isinstance(item, str):
+                        normalized.append({
+                            "email": item,
+                            "ticker": "NVDA",
+                            "schedule_day": "MONDAY",
+                            "schedule_time": "08:00",
+                            "leverage": 30.0,
+                            "growth": 5.0,
+                            "exit_mult": 13.5,
+                            "last_sent_date": ""
+                        })
+                    elif isinstance(item, dict):
+                        normalized.append(item)
+                return normalized
+    except Exception:
+        pass
+    return []
 
 
-def save_subscriber(email: str):
-    normalized = email.strip()
-    subscribers = get_subscribers()
-    if any(existing.casefold() == normalized.casefold() for existing in subscribers):
-        return False
-    subscribers.append(normalized)
-    temporary_path = SUBSCRIBERS_FILE + ".tmp"
-    with open(temporary_path, "w", encoding="utf-8") as file:
-        json.dump(subscribers, file, ensure_ascii=False, indent=2)
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temporary_path, SUBSCRIBERS_FILE)
-    return True
+def save_subscribers(subscribers: List[Dict[str, Any]]) -> None:
+    with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(subscribers, f, ensure_ascii=False, indent=2)
 
 
-def is_valid_email_address(email: str) -> bool:
-    if not isinstance(email, str) or len(email) > 254:
-        return False
-    parsed = parseaddr(email)
-    return parsed[1] == email and bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email))
+def safe_float(val: Any, default: float = 0.0) -> float:
+    try:
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return default
+        return float(val)
+    except Exception:
+        return default
 
 
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    logo_file = os.path.join(STATIC_DIR, "logo.png")
-    if os.path.exists(logo_file):
-        return FileResponse(logo_file)
-    raise HTTPException(status_code=404, detail="Favicon nenalezen.")
+# ==============================================================================
+# FINANČNÍ VÝPOČTY A VALUAČNÍ MODELY (DCF, LBO, SOTP, COMPS, CENOVÁ PÁSMA)
+# ==============================================================================
+def get_live_forex() -> Dict[str, float]:
+    cached = get_cached("forex_rates")
+    if cached:
+        return cached
 
-
-@app.api_route("/subscribe", methods=["GET", "POST"])
-async def handle_subscribe(request: Request, email: str = Query("")):
-    candidate = email.strip()
-    if request.method == "POST" and not candidate:
+    rates = {"EURCZK": 25.10, "USDCZK": 23.20, "GBPCZK": 29.85}
+    pairs = {"EURCZK": "EURCZK=X", "USDCZK": "CZK=X", "GBPCZK": "GBPCZK=X"}
+    for key, symbol in pairs.items():
         try:
-            payload = await request.json()
-            candidate = str(payload.get("email", "")).strip()
+            t = yf.Ticker(symbol)
+            hist = t.history(period="2d")
+            if not hist.empty:
+                rates[key] = round(float(hist["Close"].iloc[-1]), 2)
         except Exception:
-            candidate = ""
-    if not is_valid_email_address(candidate):
-        raise HTTPException(status_code=422, detail="Zadejte platnou e-mailovou adresu.")
-    created = save_subscriber(candidate)
+            pass
+
+    set_cached("forex_rates", rates)
+    return rates
+
+
+def fetch_ticker_news(ticker: str, limit: int = 6) -> List[Dict[str, str]]:
+    ticker = ticker.upper().strip()
+    cache_key = f"news_{ticker}"
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached
+
+    articles: List[Dict[str, str]] = []
+    try:
+        t = yf.Ticker(ticker)
+        raw_news = t.news or []
+        for item in raw_news[:limit]:
+            content = item.get("content", item)
+            title = content.get("title") or item.get("title") or "Tržní aktualita"
+            provider = (
+                content.get("provider", {}).get("displayName")
+                if isinstance(content.get("provider"), dict)
+                else item.get("publisher", "Finanční zpravodajství")
+            )
+            link = "#"
+            if isinstance(content.get("canonicalUrl"), dict):
+                link = content["canonicalUrl"].get("url", "#")
+            elif item.get("link"):
+                link = item["link"]
+
+            pub_date = content.get("pubDate") or ""
+            if not pub_date and item.get("providerPublishTime"):
+                pub_date = datetime.datetime.fromtimestamp(
+                    item["providerPublishTime"]
+                ).strftime("%d.%m.%Y %H:%M")
+
+            articles.append({
+                "title": title,
+                "publisher": provider or "Tržní zdroj",
+                "link": link,
+                "published": pub_date[:16].replace("T", " ") if pub_date else "Aktuálně"
+            })
+    except Exception:
+        pass
+
+    if not articles:
+        articles = [
+            {
+                "title": f"Analytický přehled a tržní sentiment pro titul {ticker}",
+                "publisher": "Tensegrity Intelligence",
+                "link": f"https://finance.yahoo.com/quote/{ticker}",
+                "published": datetime.datetime.now().strftime("%d.%m.%Y")
+            }
+        ]
+
+    set_cached(cache_key, articles)
+    return articles
+
+
+def compute_valuation(
+    ticker: str,
+    leverage_pct: float = 30.0,
+    ebitda_growth_pct: float = 5.0,
+    exit_multiple: float = 13.5
+) -> Dict[str, Any]:
+    ticker = ticker.upper().strip()
+    cache_key = f"val_{ticker}_{leverage_pct}_{ebitda_growth_pct}_{exit_multiple}"
+    cached = get_cached(cache_key)
+    if cached:
+        return cached
+
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info or {}
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Nepodařilo se načíst data pro {ticker}: {e}")
+
+    company_name = info.get("longName") or info.get("shortName") or ticker
+    currency = info.get("currency") or "USD"
+    sector = info.get("sector") or "Technologie / Průmysl"
+    industry = info.get("industry") or "Obecný sektor"
+
+    current_price = safe_float(
+        info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose"),
+        100.0
+    )
+    shares = safe_float(info.get("sharesOutstanding"), 1_000_000_000.0)
+    market_cap = safe_float(info.get("marketCap"), current_price * shares)
+    total_debt = safe_float(info.get("totalDebt"), market_cap * 0.15)
+    total_cash = safe_float(info.get("totalCash"), market_cap * 0.10)
+    net_debt = total_debt - total_cash
+    enterprise_value = market_cap + net_debt
+
+    revenue = safe_float(info.get("totalRevenue"), market_cap * 0.35)
+    ebitda = safe_float(info.get("ebitda"), revenue * 0.28)
+    if ebitda <= 0:
+        ebitda = max(revenue * 0.20, market_cap * 0.06)
+
+    fcf = safe_float(info.get("freeCashflow"), ebitda * 0.65)
+    if fcf <= 0:
+        fcf = ebitda * 0.55
+
+    beta = safe_float(info.get("beta"), 1.15)
+    risk_free = 0.042
+    erp = 0.052
+    cost_of_equity = risk_free + beta * erp
+    cost_of_debt = 0.055 * (1 - 0.21)
+
+    debt_weight = max(0.0, min(0.90, leverage_pct / 100.0))
+    equity_weight = 1.0 - debt_weight
+    wacc = max(0.065, min(0.18, equity_weight * cost_of_equity + debt_weight * cost_of_debt))
+
+    g = ebitda_growth_pct / 100.0
+    terminal_g = 0.025
+
+    # 5letá DCF projekce
+    projected_fcf = []
+    pv_fcfs = 0.0
+    curr_fcf = fcf
+    for yr in range(1, 6):
+        curr_fcf = curr_fcf * (1.0 + g)
+        disc_fcf = curr_fcf / ((1.0 + wacc) ** yr)
+        pv_fcfs += disc_fcf
+        projected_fcf.append(round(curr_fcf, 2))
+
+    terminal_ebitda = ebitda * ((1.0 + g) ** 5)
+    terminal_value_mult = terminal_ebitda * exit_multiple
+    terminal_value_gordon = (projected_fcf[-1] * (1.0 + terminal_g)) / max(0.02, (wacc - terminal_g))
+    blended_tv = 0.5 * terminal_value_mult + 0.5 * terminal_value_gordon
+    pv_terminal = blended_tv / ((1.0 + wacc) ** 5)
+
+    implied_ev = pv_fcfs + pv_terminal
+    implied_equity_val = max(0.0, implied_ev - net_debt)
+    dcf_intrinsic_price = implied_equity_val / shares if shares > 0 else current_price
+
+    # Valuační cenová pásma (+/- 15 % kolem střední vnitřní hodnoty)
+    lower_band = round(dcf_intrinsic_price * 0.85, 2)
+    upper_band = round(dcf_intrinsic_price * 1.15, 2)
+
+    if current_price < lower_band:
+        signal_color = "green"
+        signal_title = "Model indikuje podhodnocení"
+        band_label = "ZELENÉ PÁSMO (PODHODNOCENO)"
+    elif current_price <= upper_band:
+        signal_color = "amber"
+        signal_title = "Model indikuje férové ocenění"
+        band_label = "ŽLUTOORANŽOVÉ PÁSMO (FÉROVÁ HODNOTA)"
+    else:
+        signal_color = "red"
+        signal_title = "Model indikuje nadhodnocení"
+        band_label = "ČERVENÉ PÁSMO (NADHODNOCENO)"
+
+    upside_pct = ((dcf_intrinsic_price - current_price) / current_price * 100.0) if current_price > 0 else 0.0
+
+    # LBO model (5 let)
+    entry_ev = enterprise_value
+    lbo_debt_start = entry_ev * debt_weight
+    lbo_equity_start = max(entry_ev * 0.1, entry_ev - lbo_debt_start)
+    interest_rate = 0.068
+    amortization_schedule = []
+    rem_debt = lbo_debt_start
+    curr_ebitda = ebitda
+    for yr in range(1, 6):
+        curr_ebitda *= (1.0 + g)
+        interest = rem_debt * interest_rate
+        cash_avail = max(0.0, curr_ebitda * 0.62 - interest)
+        repayment = min(rem_debt, cash_avail * 0.75)
+        rem_debt = max(0.0, rem_debt - repayment)
+        amortization_schedule.append({
+            "year": f"Rok {yr}",
+            "ebitda": round(curr_ebitda / 1e6, 1),
+            "interest": round(interest / 1e6, 1),
+            "repayment": round(repayment / 1e6, 1),
+            "ending_debt": round(rem_debt / 1e6, 1)
+        })
+
+    exit_ev_lbo = curr_ebitda * exit_multiple
+    exit_equity_lbo = max(0.0, exit_ev_lbo - rem_debt)
+    moic = exit_equity_lbo / lbo_equity_start if lbo_equity_start > 0 else 1.0
+    irr = ((moic ** (1.0 / 5.0)) - 1.0) * 100.0 if moic > 0 else 0.0
+
+    # SOTP (Sum-of-the-Parts) rozklad
+    core_ev = implied_ev * 0.72
+    growth_ev = implied_ev * 0.28
+    sotp_price = max(0.0, (core_ev + growth_ev - net_debt) / shares) if shares > 0 else dcf_intrinsic_price
+
+    # Citlivostní matice (WACC vs. Exit násobek)
+    wacc_steps = [round(wacc - 0.015, 4), round(wacc - 0.0075, 4), round(wacc, 4), round(wacc + 0.0075, 4), round(wacc + 0.015, 4)]
+    mult_steps = [round(exit_multiple - 3.0, 1), round(exit_multiple - 1.5, 1), round(exit_multiple, 1), round(exit_multiple + 1.5, 1), round(exit_multiple + 3.0, 1)]
+    sensitivity_matrix = []
+    for w_val in wacc_steps:
+        row_prices = []
+        pv_f = sum(projected_fcf[i] / ((1.0 + w_val) ** (i + 1)) for i in range(5))
+        for m_val in mult_steps:
+            tv_m = terminal_ebitda * m_val
+            tv_g = (projected_fcf[-1] * (1.0 + terminal_g)) / max(0.02, (w_val - terminal_g))
+            pv_t = (0.5 * tv_m + 0.5 * tv_g) / ((1.0 + w_val) ** 5)
+            eq_v = max(0.0, pv_f + pv_t - net_debt)
+            row_prices.append(round(eq_v / shares, 2) if shares > 0 else 0.0)
+        sensitivity_matrix.append({
+            "wacc_pct": round(w_val * 100.0, 2),
+            "prices": row_prices
+        })
+
+    # Srovnávací násobky (Trading Comps)
+    ev_ebitda_curr = round(enterprise_value / ebitda, 1) if ebitda > 0 else 0.0
+    pe_ratio = round(safe_float(info.get("trailingPE"), current_price / max(0.1, current_price * 0.05)), 1)
+    ev_rev = round(enterprise_value / revenue, 2) if revenue > 0 else 0.0
+
+    # Historický cenový graf (6 měsíců)
+    history_labels = []
+    history_prices = []
+    try:
+        hist = stock.history(period="6mo", interval="1wk")
+        for idx, row in hist.iterrows():
+            history_labels.append(idx.strftime("%d.%m."))
+            history_prices.append(round(float(row["Close"]), 2))
+    except Exception:
+        history_labels = ["M-5", "M-4", "M-3", "M-2", "M-1", "Dnes"]
+        history_prices = [round(current_price * x, 2) for x in [0.88, 0.91, 0.95, 0.93, 0.98, 1.0]]
+
+    result = {
+        "ticker": ticker,
+        "company_name": company_name,
+        "currency": currency,
+        "sector": sector,
+        "industry": industry,
+        "current_price": round(current_price, 2),
+        "dcf_price": round(dcf_intrinsic_price, 2),
+        "sotp_price": round(sotp_price, 2),
+        "lower_band": lower_band,
+        "upper_band": upper_band,
+        "signal_color": signal_color,
+        "signal_title": signal_title,
+        "band_label": band_label,
+        "upside_pct": round(upside_pct, 1),
+        "wacc_pct": round(wacc * 100.0, 2),
+        "exit_multiple": exit_multiple,
+        "market_cap_m": round(market_cap / 1e6, 1),
+        "enterprise_value_m": round(enterprise_value / 1e6, 1),
+        "net_debt_m": round(net_debt / 1e6, 1),
+        "revenue_m": round(revenue / 1e6, 1),
+        "ebitda_m": round(ebitda / 1e6, 1),
+        "fcf_m": round(fcf / 1e6, 1),
+        "lbo": {
+            "entry_ev_m": round(entry_ev / 1e6, 1),
+            "initial_debt_m": round(lbo_debt_start / 1e6, 1),
+            "initial_equity_m": round(lbo_equity_start / 1e6, 1),
+            "exit_equity_m": round(exit_equity_lbo / 1e6, 1),
+            "moic": round(moic, 2),
+            "irr_pct": round(irr, 1),
+            "schedule": amortization_schedule
+        },
+        "comps": {
+            "ev_ebitda": ev_ebitda_curr,
+            "sector_ev_ebitda": round(max(10.0, exit_multiple), 1),
+            "pe_ratio": pe_ratio,
+            "ev_revenue": ev_rev
+        },
+        "sensitivity": {
+            "multiples": mult_steps,
+            "rows": sensitivity_matrix
+        },
+        "history": {
+            "labels": history_labels,
+            "prices": history_prices
+        }
+    }
+    set_cached(cache_key, result)
+    return result
+
+
+# ==============================================================================
+# ODESÍLÁNÍ E-MAILOVÉHO NEWSLETTERU (JEDNORÁZOVĚ I PLÁNOVANĚ)
+# ==============================================================================
+def build_newsletter_html(val_data: Dict[str, Any], news_list: List[Dict[str, str]], mode_label: str) -> str:
+    ticker = val_data["ticker"]
+    curr = val_data["currency"]
+    news_items_html = "".join(
+        f"<li style='margin-bottom:10px;'>"
+        f"<a href='{n['link']}' style='color:#0ea5e9;text-decoration:none;font-weight:600;'>{n['title']}</a>"
+        f"<div style='font-size:12px;color:#94a3b8;'>{n['publisher']} • {n['published']}</div>"
+        f"</li>"
+        for n in news_list[:5]
+    )
+
+    return f"""
+    <html>
+    <body style="font-family:Inter,Arial,sans-serif;background-color:#0b1120;color:#e2e8f0;padding:24px;">
+      <div style="max-width:640px;margin:0 auto;background:#111827;border:1px solid #1e293b;border-radius:12px;padding:24px;">
+        <div style="font-size:12px;letter-spacing:2px;color:#38bdf8;font-weight:700;">TENSEGRITY TERMINAL • {mode_label.upper()}</div>
+        <h2 style="margin:8px 0 4px 0;color:#ffffff;">Investiční bulletin: {val_data['company_name']} ({ticker})</h2>
+        <p style="color:#94a3b8;font-size:13px;margin-top:0;">Vygenerováno dne {datetime.datetime.now().strftime('%d.%m.%Y v %H:%M')}</p>
+
+        <div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:16px;margin:18px 0;">
+          <div style="font-size:13px;color:#94a3b8;">Aktuální tržní cena: <strong style="color:#ffffff;">{val_data['current_price']} {curr}</strong></div>
+          <div style="font-size:13px;color:#94a3b8;margin-top:6px;">Střední vnitřní hodnota modelu: <strong style="color:#38bdf8;">{val_data['dcf_price']} {curr}</strong> ({val_data['upside_pct']:+.1f} %)</div>
+          <div style="font-size:13px;color:#94a3b8;margin-top:6px;">Valuační pásmo: <strong style="color:#f8fafc;">{val_data['band_label']}</strong></div>
+          <div style="font-size:12px;color:#64748b;margin-top:8px;">
+            Zelené pásmo: 0,00 – {val_data['lower_band']} {curr} | Férové pásmo: {val_data['lower_band']} – {val_data['upper_band']} {curr} | Červené pásmo: nad {val_data['upper_band']} {curr}
+          </div>
+        </div>
+
+        <h3 style="color:#f8fafc;font-size:15px;border-bottom:1px solid #1e293b;padding-bottom:6px;">Aktuální tržní zprávy ({ticker})</h3>
+        <ul style="padding-left:18px;margin-top:12px;">
+          {news_items_html}
+        </ul>
+      </div>
+    </body>
+    </html>
+    """
+
+
+def dispatch_email_report(
+    recipient_email: str,
+    ticker: str,
+    leverage: float = 30.0,
+    growth: float = 5.0,
+    exit_mult: float = 13.5,
+    mode_label: str = "Jednorázový přehled"
+) -> Dict[str, Any]:
+    val_data = compute_valuation(ticker, leverage, growth, exit_mult)
+    news_list = fetch_ticker_news(ticker, limit=5)
+    html_body = build_newsletter_html(val_data, news_list, mode_label)
+
+    if not SENDER_EMAIL or not SENDER_PASSWORD:
+        return {
+            "sent_via_smtp": False,
+            "message": (
+                f"Přehled pro {ticker} byl připraven pro {recipient_email}, ale na serveru zatím nejsou "
+                f"nastaveny proměnné prostředí SENDER_EMAIL a SENDER_PASSWORD pro přímé odeslání pošty."
+            )
+        }
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = f"Tensegrity Terminal | {ticker}: {val_data['signal_title']} ({val_data['current_price']} {val_data['currency']})"
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = recipient_email
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, [recipient_email], msg.as_string())
+        return {
+            "sent_via_smtp": True,
+            "message": f"Investiční bulletin pro {ticker} byl úspěšně odeslán na adresu {recipient_email}."
+        }
+    except Exception as e:
+        return {
+            "sent_via_smtp": False,
+            "message": f"Chyba při odesílání e-mailu přes poštovní server: {e}"
+        }
+
+
+def scheduler_worker() -> None:
+    """Vlákno na pozadí, které každou minutu kontroluje plánované odesílání pravidelných odběrů."""
+    day_map = {
+        0: "MONDAY",
+        1: "TUESDAY",
+        2: "WEDNESDAY",
+        3: "THURSDAY",
+        4: "FRIDAY",
+        5: "SATURDAY",
+        6: "SUNDAY"
+    }
+    while True:
+        try:
+            now = datetime.datetime.now()
+            current_hhmm = now.strftime("%H:%M")
+            today_str = now.strftime("%Y-%m-%d")
+            weekday_code = day_map[now.weekday()]
+            is_workday = now.weekday() < 5
+
+            subscribers = load_subscribers()
+            changed = False
+
+            for sub in subscribers:
+                if sub.get("last_sent_date") == today_str:
+                    continue
+                if sub.get("schedule_time") != current_hhmm:
+                    continue
+
+                sched_day = sub.get("schedule_day", "MONDAY")
+                should_send = (
+                    sched_day == "DAILY"
+                    or (sched_day == "WORKDAYS" and is_workday)
+                    or (sched_day == weekday_code)
+                )
+
+                if should_send:
+                    dispatch_email_report(
+                        recipient_email=sub["email"],
+                        ticker=sub.get("ticker", "NVDA"),
+                        leverage=safe_float(sub.get("leverage"), 30.0),
+                        growth=safe_float(sub.get("growth"), 5.0),
+                        exit_mult=safe_float(sub.get("exit_mult"), 13.5),
+                        mode_label="Pravidelný investiční odběr"
+                    )
+                    sub["last_sent_date"] = today_str
+                    changed = True
+
+            if changed:
+                save_subscribers(subscribers)
+        except Exception:
+            pass
+
+        time.sleep(30)
+
+
+@app.on_event("startup")
+def start_background_scheduler() -> None:
+    t = threading.Thread(target=scheduler_worker, daemon=True)
+    t.start()
+
+
+# ==============================================================================
+# API ENDPOINTY
+# ==============================================================================
+@app.get("/favicon.ico")
+def favicon() -> Response:
+    return Response(status_code=204)
+
+
+@app.get("/api/forex-rates")
+def api_forex_rates() -> Dict[str, float]:
+    return get_live_forex()
+
+
+@app.get("/api/valuation/{ticker}")
+def api_valuation(
+    ticker: str,
+    leverage: float = Query(30.0),
+    growth: float = Query(5.0),
+    exit_mult: float = Query(13.5)
+) -> Dict[str, Any]:
+    return compute_valuation(ticker, leverage, growth, exit_mult)
+
+
+@app.get("/api/news/{ticker}")
+def api_news(ticker: str) -> Dict[str, Any]:
+    return {"ticker": ticker.upper(), "articles": fetch_ticker_news(ticker, limit=6)}
+
+
+@app.get("/api/advisor/{ticker}")
+def api_advisor(
+    ticker: str,
+    leverage: float = Query(30.0),
+    growth: float = Query(5.0),
+    exit_mult: float = Query(13.5)
+) -> Dict[str, Any]:
+    val = compute_valuation(ticker, leverage, growth, exit_mult)
+    diff = val["upside_pct"]
+    if diff > 15:
+        summary = (
+            f"Titul {val['ticker']} se obchoduje s výrazným diskontem ({diff:+.1f} %) vůči vnitřní hodnotě "
+            f"{val['dcf_price']} {val['currency']}. Bezpečnostní polštář je dostatečný a model podporuje akumulaci pozice."
+        )
+    elif diff >= -15:
+        summary = (
+            f"Aktuální tržní cena {val['current_price']} {val['currency']} se pohybuje uvnitř neutrálního valuačního pásma "
+            f"({val['lower_band']} – {val['upper_band']} {val['currency']}). Ocenění odpovídá fundamentálnímu výhledu."
+        )
+    else:
+        summary = (
+            f"Tržní cena {val['current_price']} {val['currency']} překračuje odhadovanou vnitřní hodnotu "
+            f"o {abs(diff):.1f} %. Trh započítává nadstandardní budoucí růst, což zvyšuje valuační riziko při poklesu násobků."
+        )
+    return {"ticker": val["ticker"], "recommendation": val["band_label"], "analysis": summary}
+
+
+@app.post("/api/newsletter/send-now")
+def api_send_newsletter_now(req: OneOffNewsletterRequest) -> Dict[str, Any]:
+    email = req.email.strip()
+    if "@" not in email or "." not in email:
+        raise HTTPException(status_code=400, detail="Zadejte prosím platnou e-mailovou adresu.")
+    result = dispatch_email_report(
+        recipient_email=email,
+        ticker=req.ticker,
+        leverage=req.leverage,
+        growth=req.growth,
+        exit_mult=req.exit_mult,
+        mode_label="Jednorázový investiční přehled"
+    )
+    return {"status": "ok", **result}
+
+
+@app.get("/api/subscribers")
+def api_list_subscribers() -> Dict[str, Any]:
+    return {"subscribers": load_subscribers()}
+
+
+@app.post("/subscribe")
+def api_subscribe_regular(req: RegularSubscriptionRequest) -> Dict[str, Any]:
+    email = req.email.strip()
+    if "@" not in email or "." not in email:
+        raise HTTPException(status_code=400, detail="Zadejte prosím platnou e-mailovou adresu.")
+
+    subscribers = load_subscribers()
+    record = {
+        "email": email,
+        "ticker": req.ticker.upper().strip(),
+        "schedule_day": req.schedule_day,
+        "schedule_time": req.schedule_time,
+        "leverage": req.leverage,
+        "growth": req.growth,
+        "exit_mult": req.exit_mult,
+        "last_sent_date": ""
+    }
+
+    # Aktualizace existujícího záznamu pro stejný e-mail a titul, nebo přidání nového
+    updated = False
+    for idx, existing in enumerate(subscribers):
+        if existing.get("email", "").lower() == email.lower() and existing.get("ticker", "").upper() == record["ticker"]:
+            subscribers[idx] = record
+            updated = True
+            break
+
+    if not updated:
+        subscribers.append(record)
+
+    save_subscribers(subscribers)
     return {
         "status": "ok",
-        "message": "Odběr investičního bulletinu byl úspěšně uložen." if created else "Tato e-mailová adresa je již k odběru přihlášena.",
-        "already_subscribed": not created,
+        "message": f"E-mail {email} byl zaevidován pro pravidelné zasílání přehledu ({record['ticker']}).",
+        "subscribers": subscribers
     }
 
 
-@app.get("/", response_class=HTMLResponse)
-def read_root():
-    return """<!DOCTYPE html>
-<html lang="cs">
+@app.delete("/subscribe")
+def api_unsubscribe(email: str = Query(...), ticker: str = Query("")) -> Dict[str, Any]:
+    subscribers = load_subscribers()
+    filtered = [
+        s for s in subscribers
+        if not (s.get("email", "").lower() == email.lower() and (not ticker or s.get("ticker", "").upper() == ticker.upper()))
+    ]
+    save_subscribers(filtered)
+    return {"status": "ok", "subscribers": filtered}
+
+
+@app.get("/api/export/excel/{ticker}")
+def api_export_excel(
+    ticker: str,
+    leverage: float = Query(30.0),
+    growth: float = Query(5.0),
+    exit_mult: float = Query(13.5)
+):
+    val = compute_valuation(ticker, leverage, growth, exit_mult)
+    if not HAS_OPENPYXL:
+        raise HTTPException(status_code=500, detail="Knihovna openpyxl není nainstalována.")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"Valuace {val['ticker']}"
+
+    ws.append(["TENSEGRITY TERMINAL - VALUAČNÍ MODEL", val["company_name"], val["ticker"]])
+    ws.append([])
+    ws.append(["Ukazatel", "Hodnota", "Jednotka"])
+    ws.append(["Aktuální tržní cena", val["current_price"], val["currency"]])
+    ws.append(["Střední vnitřní hodnota", val["dcf_price"], val["currency"]])
+    ws.append(["Dolní hranice férového pásma", val["lower_band"], val["currency"]])
+    ws.append(["Horní hranice férového pásma", val["upper_band"], val["currency"]])
+    ws.append(["Valuační pásmo", val["band_label"], ""])
+    ws.append(["Diskontní sazba", val["wacc_pct"], "%"])
+    ws.append(["Výstupní násobek", val["exit_multiple"], "x"])
+    ws.append(["Vnitřní míra výnosnosti odkupu", val["lbo"]["irr_pct"], "%"])
+    ws.append(["Násobek investovaného kapitálu", val["lbo"]["moic"], "x"])
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=Tensegrity_{val['ticker']}.xlsx"}
+    )
+
+
+@app.get("/api/export/pdf/{ticker}")
+def api_export_pdf(
+    ticker: str,
+    leverage: float = Query(30.0),
+    growth: float = Query(5.0),
+    exit_mult: float = Query(13.5)
+):
+    val = compute_valuation(ticker, leverage, growth, exit_mult)
+    if not HAS_FPDF:
+        raise HTTPException(status_code=500, detail="Knihovna fpdf2 není nainstalována.")
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, f"TENSEGRITY TERMINAL - {val['ticker']}", ln=True)
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 8, f"Spolecnost: {val['company_name'].encode('ascii', 'ignore').decode()}", ln=True)
+    pdf.cell(0, 8, f"Aktualni cena: {val['current_price']} {val['currency']}", ln=True)
+    pdf.cell(0, 8, f"Vnitrni hodnota: {val['dcf_price']} {val['currency']}", ln=True)
+    pdf.cell(0, 8, f"Ferove pasmo: {val['lower_band']} - {val['upper_band']} {val['currency']}", ln=True)
+    pdf.cell(0, 8, f"Potencial: {val['upside_pct']:+.1f} %", ln=True)
+
+    raw_bytes = bytes(pdf.output())
+    return Response(
+        content=raw_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=Tensegrity_{val['ticker']}.pdf"}
+    )
+
+
+# ==============================================================================
+# KOMPLETNÍ UŽIVATELSKÉ ROZHRANÍ (HTML / TAILWIND / JAVASCRIPT)
+# ==============================================================================
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="cs" class="dark">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tensegrity Terminal | Institucionální Valuační Platforma</title>
-    <link rel="icon" type="image/png" href="/favicon.ico">
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg-main: #060911;
-            --bg-card: rgba(15, 22, 37, 0.85);
-            --bg-card-hover: rgba(21, 31, 52, 0.95);
-            --border-subtle: rgba(255, 255, 255, 0.08);
-            --accent-blue: #38bdf8;
-            --accent-blue-glow: rgba(56, 189, 248, 0.2);
-            --text-primary: #f8fafc;
-            --text-secondary: #94a3b8;
-            --text-muted: #64748b;
-            --success: #10b981;
-            --warning: #f59e0b;
-            --danger: #ef4444;
-        }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: 'Plus Jakarta Sans', sans-serif;
-            background-color: var(--bg-main);
-            color: var(--text-primary);
-            min-height: 100vh;
-            padding: 24px 32px;
-        }
-        .container { max-width: 1400px; margin: 0 auto; }
-        header {
-            display: flex; justify-content: space-between; align-items: center;
-            background: var(--bg-card); border: 1px solid var(--border-subtle);
-            border-radius: 16px; padding: 16px 28px; margin-bottom: 24px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.5); flex-wrap: wrap; gap: 16px;
-        }
-        .brand { display: flex; align-items: center; gap: 16px; }
-        .brand-title { font-size: 16px; font-weight: 800; letter-spacing: 4px; color: #fff; text-transform: uppercase; }
-        .brand-subtitle { font-size: 10px; letter-spacing: 6px; color: var(--text-secondary); text-transform: uppercase; }
-        .controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-        .forex-strip {
-            display: flex; align-items: center; gap: 12px; padding: 8px 14px;
-            border: 1px solid var(--border-subtle); border-radius: 8px;
-            background: rgba(6, 9, 17, 0.6); color: var(--text-secondary);
-            font: 11px 'JetBrains Mono', monospace;
-        }
-        .forex-strip strong { color: var(--text-primary); }
-        .search-wrapper input {
-            background: rgba(6, 9, 17, 0.8); border: 1px solid var(--border-subtle);
-            color: var(--text-primary); font-family: 'JetBrains Mono', monospace;
-            font-size: 14px; font-weight: 600; padding: 10px 16px; border-radius: 10px;
-            outline: none; width: 140px; text-transform: uppercase; letter-spacing: 1px;
-        }
-        .search-wrapper input:focus { border-color: var(--accent-blue); box-shadow: 0 0 12px var(--accent-blue-glow); }
-        .btn {
-            font-family: 'Plus Jakarta Sans', sans-serif; font-size: 13px; font-weight: 600;
-            padding: 10px 18px; border-radius: 10px; border: 1px solid transparent; cursor: pointer;
-            display: inline-flex; align-items: center; gap: 8px; transition: all 0.2s ease;
-        }
-        .btn-primary { background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%); color: #040914; font-weight: 700; }
-        .btn-primary:hover { opacity: 0.95; transform: translateY(-1px); }
-        .btn-excel { background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: #34d399; }
-        .btn-pdf { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); color: #f87171; }
-        .btn-news { background: rgba(148, 163, 184, 0.12); border: 1px solid var(--border-subtle); color: var(--text-primary); }
-        .btn-news:hover { border-color: var(--accent-blue); color: var(--accent-blue); }
-
-        .modal-backdrop {
-            display: none; position: fixed; inset: 0; background: rgba(4, 7, 15, 0.82);
-            backdrop-filter: blur(6px); z-index: 999; align-items: center; justify-content: center; padding: 20px;
-        }
-        .modal-backdrop.open { display: flex; }
-        .modal-box {
-            background: #0f1625; border: 1px solid var(--border-subtle); border-radius: 16px;
-            max-width: 720px; width: 100%; padding: 28px; box-shadow: 0 20px 50px rgba(0,0,0,0.7);
-            max-height: 85vh; overflow-y: auto;
-        }
-        .news-item { padding: 14px 0; border-bottom: 1px solid var(--border-subtle); }
-        .news-item:last-child { border-bottom: none; }
-        .news-item a { color: var(--accent-blue); text-decoration: none; font-weight: 600; font-size: 14px; line-height: 1.4; display: block; }
-        .news-item a:hover { text-decoration: underline; }
-        .news-meta { font-size: 11px; color: var(--text-muted); margin-top: 5px; font-family: 'JetBrains Mono', monospace; }
-
-        .scenario-bar {
-            display: flex; align-items: center; flex-wrap: wrap; gap: 16px 24px;
-            background: var(--bg-card); border: 1px solid var(--border-subtle);
-            border-radius: 12px; padding: 14px 22px; margin-bottom: 24px;
-        }
-        .scenario-heading { color: var(--accent-blue); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; }
-        .scenario-field { display: flex; align-items: center; gap: 12px; color: var(--text-secondary); font-size: 12px; }
-        .scenario-input input {
-            width: 76px; padding: 7px 8px; border: 1px solid var(--border-subtle); border-radius: 6px;
-            background: rgba(6, 9, 17, 0.7); color: var(--text-primary); font: 600 13px 'JetBrains Mono', monospace; text-align: right;
-        }
-        .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 24px; margin-bottom: 24px; }
-        .card {
-            background: var(--bg-card); border: 1px solid var(--border-subtle);
-            border-radius: 16px; padding: 24px 28px; box-shadow: 0 10px 25px rgba(0,0,0,0.3);
-        }
-        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; padding-bottom: 12px; border-bottom: 1px solid var(--border-subtle); }
-        .card-title { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 1.5px; color: var(--text-secondary); }
-        .badge { font-size: 11px; font-family: 'JetBrains Mono', monospace; padding: 3px 8px; border-radius: 6px; background: rgba(56, 189, 248, 0.1); color: var(--accent-blue); border: 1px solid rgba(56, 189, 248, 0.2); }
-        .metric-row { display: flex; justify-content: space-between; align-items: center; margin: 12px 0; font-size: 14px; }
-        .metric-label { color: var(--text-secondary); }
-        .metric-value { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--text-primary); font-size: 15px; }
-        .metric-value.highlight { color: var(--accent-blue); }
-        .matrix-card { margin-bottom: 24px; }
-        .table-responsive { width: 100%; overflow-x: auto; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 12px 16px; text-align: center; font-size: 13px; border-bottom: 1px solid var(--border-subtle); }
-        th { background: rgba(6, 9, 17, 0.8); color: var(--text-secondary); font-weight: 600; text-transform: uppercase; font-size: 11px; }
-        th:first-child, td:first-child { text-align: left; }
-        td { font-family: 'JetBrains Mono', monospace; color: var(--text-primary); }
-        .valuation-status { display: inline-flex; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
-        .valuation-status.undervalued { color: #34d399; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); }
-        .valuation-status.overvalued { color: #f87171; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); }
-        .valuation-status.neutral { color: #fbbf24; background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.3); }
-        .thesis-layout { display: grid; grid-template-columns: auto 1fr; gap: 24px; align-items: center; }
-        .traffic-lights { display: flex; gap: 10px; padding: 12px; border: 1px solid var(--border-subtle); border-radius: 999px; background: rgba(6, 9, 17, 0.65); }
-        .traffic-light { width: 18px; aspect-ratio: 1; border-radius: 50%; opacity: 0.22; }
-        .traffic-light.active { opacity: 1; box-shadow: 0 0 16px currentColor; }
-        .traffic-light.green { color: #10b981; background: #10b981; }
-        .traffic-light.orange { color: #f59e0b; background: #f59e0b; }
-        .traffic-light.red { color: #ef4444; background: #ef4444; }
-
-        /* Cenová pásma (Zelená / Žlutooranžová / Červená) */
-        .price-summary-strip {
-            display: flex; flex-wrap: wrap; gap: 20px; align-items: center; justify-content: space-between;
-            padding: 14px 18px; border-radius: 12px; background: rgba(6, 9, 17, 0.65);
-            border: 1px solid var(--border-subtle); margin-bottom: 18px;
-        }
-        .price-pill { display: flex; flex-direction: column; gap: 4px; }
-        .price-pill-label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.8px; }
-        .price-pill-val { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 700; color: #fff; }
-        .zones-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
-        .zone-box {
-            padding: 16px 20px; border-radius: 12px; border: 1px solid var(--border-subtle);
-            background: rgba(6, 9, 17, 0.55); transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
-        .zone-box.active-zone { transform: translateY(-2px); }
-        .zone-green { border-color: rgba(16, 185, 129, 0.35); background: rgba(16, 185, 129, 0.07); }
-        .zone-green.active-zone { border-color: #10b981; box-shadow: 0 0 22px rgba(16, 185, 129, 0.22); }
-        .zone-yellow { border-color: rgba(245, 158, 11, 0.35); background: rgba(245, 158, 11, 0.07); }
-        .zone-yellow.active-zone { border-color: #f59e0b; box-shadow: 0 0 22px rgba(245, 158, 11, 0.22); }
-        .zone-red { border-color: rgba(239, 68, 68, 0.35); background: rgba(239, 68, 68, 0.07); }
-        .zone-red.active-zone { border-color: #ef4444; box-shadow: 0 0 22px rgba(239, 68, 68, 0.22); }
-        .zone-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
-        .zone-green .zone-title { color: #34d399; }
-        .zone-yellow .zone-title { color: #fbbf24; }
-        .zone-red .zone-title { color: #f87171; }
-        .zone-range { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 700; color: var(--text-primary); margin-bottom: 6px; }
-        .zone-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.45; }
-        .zone-tag { font-size: 10px; padding: 2px 7px; border-radius: 999px; background: rgba(255,255,255,0.12); color: #fff; font-family: 'JetBrains Mono', monospace; }
-
-        .advisor-thread { display: grid; gap: 12px; margin: 16px 0; max-height: 350px; overflow-y: auto; padding-right: 8px; }
-        .advisor-message { padding: 12px 16px; border-left: 3px solid var(--accent-blue); background: rgba(56, 189, 248, 0.05); color: var(--text-secondary); font-size: 13px; line-height: 1.6; white-space: pre-wrap; border-radius: 0 8px 8px 0; }
-        .advisor-message.user-message { border-color: var(--success); background: rgba(16, 185, 129, 0.05); }
-        .advisor-form { display: flex; gap: 12px; margin-top: 12px; }
-        .advisor-form input { flex: 1; padding: 12px 16px; border: 1px solid var(--border-subtle); border-radius: 8px; background: rgba(6, 9, 17, 0.8); color: var(--text-primary); font-size: 13px; outline: none; }
-        .advisor-form input:focus { border-color: var(--accent-blue); }
-        .plain-guide { margin-top: 14px; font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
-        .loader { width: 24px; height: 24px; border: 3px solid rgba(255,255,255,0.2); border-radius: 50%; border-top-color: var(--accent-blue); animation: spin 0.8s linear infinite; margin: auto; }
-        @keyframes spin { to { transform: rotate(360deg); } }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tensegrity Terminal Intelligence</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
+  <style>
+    body {
+      font-family: 'Inter', sans-serif;
+      background-color: #070b14;
+      color: #e2e8f0;
+    }
+    .font-mono-num {
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .glass-card {
+      background: linear-gradient(180deg, #0e1525 0%, #0b101d 100%);
+      border: 1px solid #1b2538;
+      border-radius: 14px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+    }
+    .band-active-green {
+      border-color: #10b981 !important;
+      background: linear-gradient(180deg, rgba(16, 185, 129, 0.14) 0%, rgba(11, 16, 29, 0.95) 100%) !important;
+      box-shadow: 0 0 25px rgba(16, 185, 129, 0.18);
+    }
+    .band-active-amber {
+      border-color: #f59e0b !important;
+      background: linear-gradient(180deg, rgba(245, 158, 11, 0.14) 0%, rgba(11, 16, 29, 0.95) 100%) !important;
+      box-shadow: 0 0 25px rgba(245, 158, 11, 0.18);
+    }
+    .band-active-red {
+      border-color: #ef4444 !important;
+      background: linear-gradient(180deg, rgba(239, 68, 68, 0.16) 0%, rgba(11, 16, 29, 0.95) 100%) !important;
+      box-shadow: 0 0 25px rgba(239, 68, 68, 0.22);
+    }
+  </style>
 </head>
-<body>
-    <div class="container">
-        <header>
-            <div class="brand">
-                <div>
-                    <div class="brand-title">Tensegrity Terminal</div>
-                    <div class="brand-subtitle">Intelligence</div>
-                </div>
-            </div>
-            <div class="controls">
-                <div class="search-wrapper">
-                    <input type="text" id="tickerInput" value="AAPL" placeholder="AAPL" aria-label="Ticker společnosti">
-                </div>
-                <div class="forex-strip" id="forexRates">
-                    <span>EUR/CZK <strong>--</strong></span>
-                    <span>USD/CZK <strong>--</strong></span>
-                    <span>GBP/CZK <strong>--</strong></span>
-                </div>
-                <button class="btn btn-primary" onclick="loadValuation()">Analyzovat</button>
-                <button class="btn btn-excel" onclick="downloadExcel()">Excel Model</button>
-                <button class="btn btn-pdf" onclick="downloadPDF()">PDF Report</button>
-                <button class="btn btn-news" onclick="openNewsletterModal()">Newsletter &amp; News Feed</button>
-            </div>
-        </header>
+<body class="min-h-screen p-3 sm:p-6">
+  <div class="max-w-7xl mx-auto space-y-5">
 
-        <section class="scenario-bar" aria-label="Parametry scénáře">
-            <span class="scenario-heading">Parametry Scénáře</span>
-            <label class="scenario-field" for="leverageInput">
-                Cizí kapitál (% Dluhu)
-                <span class="scenario-input"><input id="leverageInput" type="number" min="0" max="100" step="1" value="30"><span>%</span></span>
-            </label>
-            <label class="scenario-field" for="growthInput">
-                Růst EBITDA
-                <span class="scenario-input"><input id="growthInput" type="number" min="-50" max="100" step="0.5" value="5"><span>%</span></span>
-            </label>
-            <label class="scenario-field" for="exitMultipleInput">
-                Výstupní Exit EV/EBITDA
-                <span class="scenario-input"><input id="exitMultipleInput" type="number" min="0.1" max="100" step="0.1" value="13.5"><span>x</span></span>
-            </label>
-        </section>
+    <!-- HORNÍ LIŠTA -->
+    <header class="glass-card p-4 flex flex-wrap items-center justify-between gap-4">
+      <div>
+        <div class="text-sm sm:text-base font-bold tracking-[0.2em] text-white">TENSEGRITY TERMINAL</div>
+        <div class="text-[10px] tracking-[0.35em] text-slate-400 uppercase mt-0.5">INTELLIGENCE</div>
+      </div>
 
-        <section class="card matrix-card" id="investmentThesis">
-            <div class="card-header">
-                <span class="card-title">Investiční Semafor &amp; Thesis</span>
-                <span class="badge" id="thesisTicker">AAPL</span>
-            </div>
-            <div class="thesis-layout">
-                <div class="traffic-lights" aria-label="Semafor">
-                    <span class="traffic-light green" id="thesisGreen"></span>
-                    <span class="traffic-light orange" id="thesisOrange"></span>
-                    <span class="traffic-light red" id="thesisRed"></span>
-                </div>
-                <div>
-                    <p class="metric-value" id="thesisRecommendation">Načítám analýzu...</p>
-                    <p class="plain-guide" id="thesisSummary">Komplexní vyhodnocení pozice společnosti vůči trhu a modelu valuace.</p>
-                </div>
-            </div>
-        </section>
+      <div class="flex flex-wrap items-center gap-3 flex-1 justify-end">
+        <input
+          id="tickerInput"
+          type="text"
+          value="NVDA"
+          placeholder="Zadejte symbol (např. NVDA, AAPL, CEZ.PR)..."
+          class="bg-[#080d18] border border-slate-700/80 focus:border-sky-500 rounded-lg px-3.5 py-2 text-sm font-mono-num font-semibold text-white uppercase outline-none w-36 sm:w-44"
+        />
 
-        <section class="card matrix-card" id="priceZonesSection">
-            <div class="card-header">
-                <span class="card-title">Valuační Cenová Pásma Akcie (Aktuální cena vs. Intervaly)</span>
-                <span class="badge" id="zonesTicker">AAPL</span>
-            </div>
-            <div class="price-summary-strip">
-                <div class="price-pill">
-                    <span class="price-pill-label">Aktuální tržní cena akcie</span>
-                    <span class="price-pill-val" id="currentStockPrice">-</span>
-                </div>
-                <div class="price-pill">
-                    <span class="price-pill-label">Střední vnitřní hodnota (DCF)</span>
-                    <span class="price-pill-val" style="color: var(--accent-blue);" id="fairValueCenter">-</span>
-                </div>
-                <div class="price-pill">
-                    <span class="price-pill-label">Aktuální pásmo</span>
-                    <span class="valuation-status neutral" id="currentZoneBadge">-</span>
-                </div>
-            </div>
-            <div class="zones-grid">
-                <div class="zone-box zone-green" id="zoneGreenCard">
-                    <div class="zone-title">
-                        <span>Zelené pásmo (Podhodnoceno)</span>
-                        <span class="zone-tag" id="zoneGreenTag" style="display:none;">AKTUÁLNÍ CENA</span>
-                    </div>
-                    <div class="zone-range" id="zoneGreenRange">-</div>
-                    <div class="zone-desc">Bezpečnostní marže $\ge 15\ \%$ pod vnitřní hodnotou DCF (atraktivní valuace).</div>
-                </div>
-                <div class="zone-box zone-yellow" id="zoneYellowCard">
-                    <div class="zone-title">
-                        <span>Žlutooranžové pásmo (Fair Value)</span>
-                        <span class="zone-tag" id="zoneYellowTag" style="display:none;">AKTUÁLNÍ CENA</span>
-                    </div>
-                    <div class="zone-range" id="zoneYellowRange">-</div>
-                    <div class="zone-desc">Neutrální koridor $\pm 15\ \%$ kolem odhadované reálné hodnoty akcie.</div>
-                </div>
-                <div class="zone-box zone-red" id="zoneRedCard">
-                    <div class="zone-title">
-                        <span>Červené pásmo (Nadhodnoceno)</span>
-                        <span class="zone-tag" id="zoneRedTag" style="display:none;">AKTUÁLNÍ CENA</span>
-                    </div>
-                    <div class="zone-range" id="zoneRedRange">-</div>
-                    <div class="zone-desc">Tržní cena přesahuje vnitřní hodnotu o více než $15\ \%$ (zvýšené valuační riziko).</div>
-                </div>
-            </div>
-        </section>
-
-        <div class="grid-3">
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Tržní Data</span>
-                    <span class="badge" id="valTicker">AAPL</span>
-                </div>
-                <div class="metric-row"><span class="metric-label">Tržní Kapitalizace:</span><span class="metric-value" id="valCap">-</span></div>
-                <div class="metric-row"><span class="metric-label">Celkový Dluh:</span><span class="metric-value" id="valDebt">-</span></div>
-                <div class="metric-row"><span class="metric-label">Hodnota Podniku (EV):</span><span class="metric-value highlight" id="valEV">-</span></div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Metoda Součtu Částí (SOTP)</span>
-                    <span class="badge">SOTP</span>
-                </div>
-                <div class="metric-row"><span class="metric-label">EV Podniku:</span><span class="metric-value" id="sotpEV">-</span></div>
-                <div class="metric-row"><span class="metric-label">Vlastní Kapitál:</span><span class="metric-value highlight" id="sotpEquity">-</span></div>
-                <p class="plain-guide">Ocenění podniku metodou součtu jednotlivých segmentů po odečtení dluhu.</p>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">LBO Model (Base Case)</span>
-                    <span class="badge">Leveraged Buyout</span>
-                </div>
-                <div class="metric-row"><span class="metric-label">Vstupní Equity:</span><span class="metric-value" id="lboInEq">-</span></div>
-                <div class="metric-row"><span class="metric-label">Výstupní Equity:</span><span class="metric-value" id="lboOutEq">-</span></div>
-                <div class="metric-row"><span class="metric-label">MOIC:</span><span class="metric-value highlight" id="lboMoic">-</span></div>
-                <div class="metric-row"><span class="metric-label">IRR:</span><span class="metric-value highlight" id="lboIrr">-</span></div>
-                <p class="plain-guide">Model odkupu za cizí kapitál s 5letým horizontem a splácením dluhu.</p>
-            </div>
+        <!-- KURZY MĚN -->
+        <div class="hidden xl:flex items-center gap-4 bg-[#080d18] border border-slate-800 rounded-lg px-4 py-2 text-xs font-mono-num">
+          <span class="text-slate-400">EUR/CZK <strong id="fxEur" class="text-white ml-1">--</strong></span>
+          <span class="text-slate-400">USD/CZK <strong id="fxUsd" class="text-white ml-1">--</strong></span>
+          <span class="text-slate-400">GBP/CZK <strong id="fxGbp" class="text-white ml-1">--</strong></span>
         </div>
 
-        <div class="grid-3">
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Diskontované Cash Flow (DCF)</span>
-                    <span class="badge">Exit Multiple</span>
-                </div>
-                <div class="metric-row"><span class="metric-label">Vnitřní hodnota / akcii:</span><span class="metric-value highlight" id="dcfIntrinsicValue">-</span></div>
-                <div class="metric-row"><span class="metric-label">WACC:</span><span class="metric-value" id="dcfWacc">-</span></div>
-                <div class="metric-row"><span class="metric-label">Terminální hodnota:</span><span class="metric-value" id="dcfTerminalValue">-</span></div>
-                <div class="metric-row"><span class="metric-label">Tržní status:</span><span class="valuation-status" id="dcfValuationStatus">-</span></div>
-            </div>
+        <button onclick="runAnalysis()" class="bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-xs sm:text-sm px-4 py-2 rounded-lg transition cursor-pointer">
+          Analyzovat
+        </button>
+        <button onclick="downloadExport('excel')" class="bg-emerald-950/70 hover:bg-emerald-900/80 border border-emerald-700/60 text-emerald-300 font-medium text-xs sm:text-sm px-3.5 py-2 rounded-lg transition cursor-pointer">
+          Excel Model
+        </button>
+        <button onclick="downloadExport('pdf')" class="bg-rose-950/70 hover:bg-rose-900/80 border border-rose-700/60 text-rose-300 font-medium text-xs sm:text-sm px-3.5 py-2 rounded-lg transition cursor-pointer">
+          Přehled ke stažení
+        </button>
+        <button onclick="openNewsletterModal()" class="bg-slate-800 hover:bg-slate-700 border border-slate-600/70 text-slate-100 font-medium text-xs sm:text-sm px-4 py-2 rounded-lg transition cursor-pointer">
+          Newsletter &amp; Tržní zprávy
+        </button>
+      </div>
+    </header>
 
-            <div class="card" style="grid-column: span 2;">
-                <div class="card-header">
-                    <span class="card-title">Srovnání Konkurence (Trading Comps)</span>
-                    <span class="badge" id="peerSector">Sektor</span>
-                </div>
-                <div class="table-responsive" id="peerCompsContainer">
-                    <div style="text-align: center; padding: 20px;"><div class="loader"></div></div>
-                </div>
-            </div>
+    <!-- PARAMETRY SCÉNÁŘE -->
+    <section class="glass-card p-4 flex flex-wrap items-center gap-6">
+      <div class="text-xs font-bold tracking-wider text-sky-400 uppercase">PARAMETRY SCÉNÁŘE</div>
+
+      <div class="flex items-center gap-2 text-xs sm:text-sm text-slate-300">
+        <span>Cizí kapitál (% Dluhu)</span>
+        <input id="leverageInput" type="number" value="30" min="0" max="90" step="5"
+          class="bg-[#080d18] border border-slate-700 rounded-md px-2.5 py-1 w-20 text-right font-mono-num text-white font-semibold" />
+        <span class="text-slate-400">%</span>
+      </div>
+
+      <div class="flex items-center gap-2 text-xs sm:text-sm text-slate-300">
+        <span>Růst provozního zisku</span>
+        <input id="growthInput" type="number" value="5" min="-20" max="50" step="1"
+          class="bg-[#080d18] border border-slate-700 rounded-md px-2.5 py-1 w-20 text-right font-mono-num text-white font-semibold" />
+        <span class="text-slate-400">%</span>
+      </div>
+
+      <div class="flex items-center gap-2 text-xs sm:text-sm text-slate-300">
+        <span>Výstupní násobek hodnoty</span>
+        <input id="exitMultInput" type="number" value="13.5" min="3" max="40" step="0.5"
+          class="bg-[#080d18] border border-slate-700 rounded-md px-2.5 py-1 w-20 text-right font-mono-num text-white font-semibold" />
+        <span class="text-slate-400">x</span>
+      </div>
+    </section>
+
+    <!-- INVESTIČNÍ SEMAFOR & TEZE -->
+    <section class="glass-card p-5">
+      <div class="flex items-center justify-between mb-4">
+        <div class="text-xs font-bold tracking-wider text-slate-400 uppercase">INVESTIČNÍ SEMAFOR &amp; TEZE</div>
+        <span id="badgeTicker1" class="text-xs font-mono-num font-semibold text-sky-400 bg-sky-950/70 border border-sky-800/70 px-2.5 py-0.5 rounded">NVDA</span>
+      </div>
+
+      <div class="flex flex-col sm:flex-row sm:items-center gap-5">
+        <div class="flex items-center gap-2.5 bg-[#080d18] border border-slate-800 rounded-full px-4 py-2.5 w-fit">
+          <span id="lightGreen" class="w-4 h-4 rounded-full bg-emerald-950 transition-all"></span>
+          <span id="lightAmber" class="w-4 h-4 rounded-full bg-amber-950 transition-all"></span>
+          <span id="lightRed" class="w-4 h-4 rounded-full bg-rose-950 transition-all"></span>
         </div>
 
-        <div class="card matrix-card">
-            <div class="card-header">
-                <span class="card-title">5letý Amortizační Kalendář &amp; Cash Flow</span>
-                <span class="badge">LBO Schedule</span>
-            </div>
-            <div class="table-responsive" id="lboScheduleContainer">
-                <div style="text-align: center; padding: 20px;"><div class="loader"></div></div>
-            </div>
+        <div>
+          <h2 id="signalTitle" class="text-base sm:text-lg font-bold text-white">Načítání analýzy...</h2>
+          <p id="signalSubtitle" class="text-xs sm:text-sm text-slate-400 mt-1">Výpočet vnitřní hodnoty a diskontní sazby...</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- VALUAČNÍ CENOVÁ PÁSMA AKCIE -->
+    <section class="glass-card p-5 space-y-4">
+      <div class="flex items-center justify-between">
+        <div class="text-xs font-bold tracking-wider text-slate-400 uppercase">VALUAČNÍ CENOVÁ PÁSMA AKCIE (AKTUÁLNÍ CENA VS. INTERVALY)</div>
+        <span id="badgeTicker2" class="text-xs font-mono-num font-semibold text-sky-400 bg-sky-950/70 border border-sky-800/70 px-2.5 py-0.5 rounded">NVDA</span>
+      </div>
+
+      <div class="bg-[#080d18] border border-slate-800/90 rounded-xl p-4 grid grid-cols-1 md:grid-cols-3 gap-4 items-center">
+        <div>
+          <div class="text-[11px] font-semibold tracking-wider text-slate-400 uppercase">AKTUÁLNÍ TRŽNÍ CENA AKCIE</div>
+          <div id="bandCurrentPrice" class="text-xl sm:text-2xl font-mono-num font-bold text-white mt-1">--</div>
         </div>
 
-        <div class="card matrix-card">
-            <div class="card-header">
-                <span class="card-title">Citlivostní Matice Vnitřní Míry Výnosnosti (IRR %)</span>
-                <span class="badge">Růst EBITDA vs. Exit Násobek</span>
-            </div>
-            <div class="table-responsive" id="sensitivityMatrix">
-                <div style="text-align: center; padding: 20px;"><div class="loader"></div></div>
-            </div>
+        <div>
+          <div class="text-[11px] font-semibold tracking-wider text-slate-400 uppercase">STŘEDNÍ VNITŘNÍ HODNOTA</div>
+          <div id="bandIntrinsicPrice" class="text-xl sm:text-2xl font-mono-num font-bold text-sky-400 mt-1">--</div>
         </div>
 
-        <div class="card">
-            <div class="card-header">
-                <span class="card-title">Tensegrity AI Advisor</span>
-                <span class="badge">Open AI / Universal</span>
-            </div>
-            <div class="advisor-thread" id="advisorThread">
-                <div class="advisor-message">Dobrý den! Jsem váš AI poradce. Zeptejte se mě na cokoli ohledně valuace, financí, makroekonomie nebo aktuálního podniku. Rád vám odpovím bez jakýchkoliv omezení.</div>
-            </div>
-            <form class="advisor-form" onsubmit="askAdvisor(event)">
-                <input id="advisorQuestion" type="text" placeholder="Zeptejte se na cokoli (např. Jaký je vliv WACC na DCF ocenění?)..." required>
-                <button class="btn btn-primary" type="submit">Odeslat</button>
-            </form>
+        <div class="md:text-right">
+          <div class="text-[11px] font-semibold tracking-wider text-slate-400 uppercase">AKTUÁLNÍ PÁSMO</div>
+          <span id="bandCurrentBadge" class="inline-block mt-1.5 text-xs font-bold px-3 py-1 rounded border border-slate-700 bg-slate-900 text-slate-200">--</span>
         </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <!-- ZELENÉ PÁSMO -->
+        <div id="cardGreenBand" class="bg-[#080d18] border border-emerald-900/60 rounded-xl p-4 transition-all">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold tracking-wider text-emerald-400 uppercase">ZELENÉ PÁSMO (PODHODNOCENO)</span>
+            <span id="tagGreenActive" class="hidden text-[10px] font-bold bg-slate-800 text-white px-2 py-0.5 rounded">AKTUÁLNÍ CENA</span>
+          </div>
+          <div id="rangeGreen" class="text-lg font-mono-num font-bold text-white mt-2">--</div>
+          <p class="text-xs text-slate-400 mt-2">Bezpečnostní marže ≥ 15 % pod vnitřní hodnotou modelu (atraktivní valuace).</p>
+        </div>
+
+        <!-- ŽLUTOORANŽOVÉ PÁSMO -->
+        <div id="cardAmberBand" class="bg-[#080d18] border border-amber-900/60 rounded-xl p-4 transition-all">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold tracking-wider text-amber-400 uppercase">ŽLUTOORANŽOVÉ PÁSMO (FÉROVÁ HODNOTA)</span>
+            <span id="tagAmberActive" class="hidden text-[10px] font-bold bg-slate-800 text-white px-2 py-0.5 rounded">AKTUÁLNÍ CENA</span>
+          </div>
+          <div id="rangeAmber" class="text-lg font-mono-num font-bold text-white mt-2">--</div>
+          <p class="text-xs text-slate-400 mt-2">Neutrální koridor ± 15 % kolem odhadované reálné hodnoty akcie.</p>
+        </div>
+
+        <!-- ČERVENÉ PÁSMO -->
+        <div id="cardRedBand" class="bg-[#080d18] border border-rose-900/60 rounded-xl p-4 transition-all">
+          <div class="flex items-center justify-between">
+            <span class="text-xs font-bold tracking-wider text-rose-400 uppercase">ČERVENÉ PÁSMO (NADHODNOCENO)</span>
+            <span id="tagRedActive" class="hidden text-[10px] font-bold bg-slate-800 text-white px-2 py-0.5 rounded">AKTUÁLNÍ CENA</span>
+          </div>
+          <div id="rangeRed" class="text-lg font-mono-num font-bold text-white mt-2">--</div>
+          <p class="text-xs text-slate-400 mt-2">Tržní cena přesahuje vnitřní hodnotu o více než 15 % (zvýšené valuační riziko).</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- METRIKY A OCENĚNÍ -->
+    <section class="grid grid-cols-1 md:grid-cols-3 gap-5">
+      <div class="glass-card p-5 space-y-3">
+        <div class="text-xs font-bold tracking-wider text-slate-400 uppercase">TRŽNÍ PROFIL &amp; KAPITALIZACE</div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Tržní kapitalizace</span><strong id="mCap" class="font-mono-num text-white">--</strong></div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Hodnota podniku</span><strong id="mEv" class="font-mono-num text-white">--</strong></div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Čistý dluh</span><strong id="mDebt" class="font-mono-num text-white">--</strong></div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Roční tržby</span><strong id="mRev" class="font-mono-num text-white">--</strong></div>
+      </div>
+
+      <div class="glass-card p-5 space-y-3">
+        <div class="text-xs font-bold tracking-wider text-slate-400 uppercase">OCENĚNÍ METODOU SOUČTU ČÁSTÍ</div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Vnitřní hodnota rozkladu</span><strong id="sotpPrice" class="font-mono-num text-sky-400">--</strong></div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Násobek ceny k zisku</span><strong id="compPe" class="font-mono-num text-white">--</strong></div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Násobek hodnoty k zisku</span><strong id="compEvEbitda" class="font-mono-num text-white">--</strong></div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Násobek hodnoty k tržbám</span><strong id="compEvRev" class="font-mono-num text-white">--</strong></div>
+      </div>
+
+      <div class="glass-card p-5 space-y-3">
+        <div class="text-xs font-bold tracking-wider text-slate-400 uppercase">PÁKOVÝ ODKUP &amp; NÁVRATNOST</div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Vnitřní míra výnosnosti</span><strong id="lboIrr" class="font-mono-num text-emerald-400">--</strong></div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Násobek kapitálu</span><strong id="lboMoic" class="font-mono-num text-white">--</strong></div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Počáteční dluh transakce</span><strong id="lboDebt" class="font-mono-num text-white">--</strong></div>
+        <div class="flex justify-between text-sm"><span class="text-slate-400">Výstupní hodnota podílu</span><strong id="lboExitEq" class="font-mono-num text-white">--</strong></div>
+      </div>
+    </section>
+
+    <!-- GRAF A AMORTIZAČNÍ KALENDÁŘ -->
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+      <div class="glass-card p-5">
+        <div class="text-xs font-bold tracking-wider text-slate-400 uppercase mb-3">CENOVÝ VÝVOJ (6 MĚSÍCŮ)</div>
+        <div class="h-64">
+          <canvas id="priceChart"></canvas>
+        </div>
+      </div>
+
+      <div class="glass-card p-5 overflow-x-auto">
+        <div class="text-xs font-bold tracking-wider text-slate-400 uppercase mb-3">5LETÝ SPLÁTKOVÝ KALENDÁŘ DLUHU (V MIL.)</div>
+        <table class="w-full text-left text-xs font-mono-num">
+          <thead>
+            <tr class="border-b border-slate-800 text-slate-400">
+              <th class="py-2">Období</th>
+              <th class="py-2">Provozní zisk</th>
+              <th class="py-2">Úroky</th>
+              <th class="py-2">Splátka jistiny</th>
+              <th class="py-2">Zůstatek dluhu</th>
+            </tr>
+          </thead>
+          <tbody id="amortTableBody" class="divide-y divide-slate-800/60"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- CITLIVOSTNÍ MATICE A ANALYTICKÝ KOMENTÁŘ -->
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+      <div class="glass-card p-5 overflow-x-auto">
+        <div class="text-xs font-bold tracking-wider text-slate-400 uppercase mb-3">CITLIVOSTNÍ MATICE VNITŘNÍ HODNOTY (DISKONTNÍ SAZBA VS. VÝSTUPNÍ NÁSOBEK)</div>
+        <table class="w-full text-center text-xs font-mono-num" id="sensitivityTable"></table>
+      </div>
+
+      <div class="glass-card p-5 flex flex-col justify-between">
+        <div>
+          <div class="text-xs font-bold tracking-wider text-sky-400 uppercase mb-2">INVESTIČNÍ SHRNUTÍ MODELU</div>
+          <p id="advisorText" class="text-sm text-slate-300 leading-relaxed">Načítání analytického komentáře...</p>
+        </div>
+        <div class="mt-4 pt-3 border-t border-slate-800 text-xs text-slate-500">
+          Všechny výpočty vycházejí z živých tržních dat a uživatelských parametrů scénáře.
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- MODÁLNÍ OKNO: NEWSLETTER & TRŽNÍ ZPRÁVY -->
+  <div id="newsletterModal" class="fixed inset-0 z-50 hidden items-center justify-center bg-black/75 backdrop-blur-sm p-4">
+    <div class="bg-[#0e1525] border border-slate-700/80 rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto">
+      <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+        <h3 class="text-sm font-bold tracking-wider text-white uppercase">
+          NEWSLETTER &amp; TRŽNÍ ZPRÁVY (<span id="modalTickerLabel" class="text-sky-400">NVDA</span>)
+        </h3>
+        <button onclick="closeNewsletterModal()" class="bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg px-2.5 py-1 text-sm cursor-pointer">
+          ✕
+        </button>
+      </div>
+
+      <!-- ZADÁNÍ E-MAILU A VOLBA REŽIMU ODESLÁNÍ -->
+      <div class="space-y-4">
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 mb-1.5">E-mailová adresa příjemce</label>
+          <input
+            id="subscribeEmailInput"
+            type="email"
+            placeholder="Zadejte e-mail pro zaslání investičního bulletinu..."
+            class="w-full bg-[#080d18] border border-slate-700 focus:border-sky-500 rounded-xl px-4 py-2.5 text-sm text-white outline-none"
+          />
+        </div>
+
+        <!-- NASTAVENÍ PRAVIDELNÉHO HARMONOGRAMU -->
+        <div class="bg-[#080d18] border border-slate-800 rounded-xl p-3.5 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="block text-[11px] font-semibold text-slate-400 uppercase mb-1">Dny pravidelného odesílání</label>
+            <select id="scheduleDaySelect" class="w-full bg-[#0e1525] border border-slate-700 rounded-lg px-3 py-2 text-xs sm:text-sm text-white outline-none">
+              <option value="WORKDAYS">Každý pracovní den (Po–Pá)</option>
+              <option value="DAILY">Denně (Po–Ne)</option>
+              <option value="MONDAY" selected>Každé pondělí</option>
+              <option value="WEDNESDAY">Každou středu</option>
+              <option value="FRIDAY">Každý pátek</option>
+            </select>
+          </div>
+
+          <div>
+            <label class="block text-[11px] font-semibold text-slate-400 uppercase mb-1">Čas odeslání</label>
+            <input
+              id="scheduleTimeInput"
+              type="time"
+              value="08:00"
+              class="w-full bg-[#0e1525] border border-slate-700 rounded-lg px-3 py-2 text-xs sm:text-sm font-mono-num text-white outline-none"
+            />
+          </div>
+        </div>
+
+        <!-- DVĚ SAMOSTATNÁ TLAČÍTKA PRO JEDNORÁZOVÉ ODESLÁNÍ A PRAVIDELNOU EVIDENCI -->
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <button
+            id="btnOneOffSend"
+            onclick="sendOneOffNewsletter()"
+            class="w-full bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-xs sm:text-sm py-2.5 px-4 rounded-xl transition cursor-pointer"
+          >
+            Odeslat jednorázově nyní
+          </button>
+
+          <button
+            id="btnRegularSubscribe"
+            onclick="subscribeRegularNewsletter()"
+            class="w-full bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/60 text-emerald-300 font-semibold text-xs sm:text-sm py-2.5 px-4 rounded-xl transition cursor-pointer"
+          >
+            Evidovat pro pravidelný odběr
+          </button>
+        </div>
+
+        <!-- STAVOVÁ ZPRÁVA -->
+        <div id="newsletterStatusBox" class="hidden text-xs rounded-xl p-3 border"></div>
+      </div>
+
+      <!-- SEZNAM EVIDOVANÝCH PRAVIDELNÝCH ODBĚRATELŮ -->
+      <div class="border-t border-slate-800 pt-4">
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-bold tracking-wider text-slate-400 uppercase">EVIDOVANÉ E-MAILY PRO PRAVIDELNÉ ZASÍLÁNÍ</span>
+          <span id="subscribersCountBadge" class="text-[11px] font-mono-num text-sky-400">0 odběratelů</span>
+        </div>
+        <div id="subscribersListContainer" class="space-y-2 max-h-36 overflow-y-auto text-xs">
+          <div class="text-slate-500 italic">Žádné e-maily zatím nejsou evidovány.</div>
+        </div>
+      </div>
+
+      <!-- AKTUÁLNÍ TRŽNÍ ZPRÁVY PRO ZVOLENÝ TITUL -->
+      <div class="border-t border-slate-800 pt-4">
+        <div class="text-xs font-bold tracking-wider text-slate-400 uppercase mb-2.5">AKTUÁLNÍ TRŽNÍ ZPRÁVY</div>
+        <div id="newsFeedContainer" class="space-y-2.5">
+          <div class="text-xs text-slate-400">Načítání tržních zpráv...</div>
+        </div>
+      </div>
     </div>
+  </div>
 
-    <div class="modal-backdrop" id="newsletterModal" onclick="if(event.target===this) closeNewsletterModal()">
-        <div class="modal-box">
-            <div class="card-header">
-                <span class="card-title">Newsletter &amp; Tržní Zprávy (<span id="newsModalTicker">AAPL</span>)</span>
-                <button class="btn btn-news" style="padding: 4px 10px;" onclick="closeNewsletterModal()">✕</button>
+  <script>
+    let priceChartInstance = null;
+
+    const DAY_LABELS = {
+      "WORKDAYS": "Pracovní dny (Po–Pá)",
+      "DAILY": "Denně (Po–Ne)",
+      "MONDAY": "Každé pondělí",
+      "TUESDAY": "Každé úterý",
+      "WEDNESDAY": "Každou středu",
+      "THURSDAY": "Každý čtvrtek",
+      "FRIDAY": "Každý pátek"
+    };
+
+    function fmtNum(num, decimals = 2) {
+      return Number(num).toLocaleString('cs-CZ', {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals
+      });
+    }
+
+    async function loadForexRates() {
+      try {
+        const res = await fetch('/api/forex-rates');
+        const data = await res.json();
+        document.getElementById('fxEur').textContent = fmtNum(data.EURCZK, 2);
+        document.getElementById('fxUsd').textContent = fmtNum(data.USDCZK, 2);
+        document.getElementById('fxGbp').textContent = fmtNum(data.GBPCZK, 2);
+      } catch (e) {
+        console.warn('Chyba načítání kurzů:', e);
+      }
+    }
+
+    async function runAnalysis() {
+      const ticker = (document.getElementById('tickerInput').value || 'NVDA').trim().toUpperCase();
+      const leverage = document.getElementById('leverageInput').value || 30;
+      const growth = document.getElementById('growthInput').value || 5;
+      const exitMult = document.getElementById('exitMultInput').value || 13.5;
+
+      document.getElementById('badgeTicker1').textContent = ticker;
+      document.getElementById('badgeTicker2').textContent = ticker;
+      document.getElementById('modalTickerLabel').textContent = ticker;
+
+      try {
+        const query = `?leverage=${leverage}&growth=${growth}&exit_mult=${exitMult}`;
+        const [valRes, advRes] = await Promise.all([
+          fetch(`/api/valuation/${encodeURIComponent(ticker)}${query}`),
+          fetch(`/api/advisor/${encodeURIComponent(ticker)}${query}`)
+        ]);
+
+        if (!valRes.ok) throw new Error('Nepodařilo se načíst valuační data.');
+        const val = await valRes.json();
+        const adv = advRes.ok ? await advRes.json() : { analysis: '' };
+
+        updateDashboardUI(val, adv.analysis);
+      } catch (err) {
+        document.getElementById('signalTitle').textContent = 'Chyba při načítání dat pro ' + ticker;
+        document.getElementById('signalSubtitle').textContent = err.message;
+      }
+    }
+
+    function updateDashboardUI(val, advisorSummary) {
+      const curr = val.currency;
+
+      // Semafor
+      const lg = document.getElementById('lightGreen');
+      const la = document.getElementById('lightAmber');
+      const lr = document.getElementById('lightRed');
+      lg.className = 'w-4 h-4 rounded-full bg-emerald-950 transition-all';
+      la.className = 'w-4 h-4 rounded-full bg-amber-950 transition-all';
+      lr.className = 'w-4 h-4 rounded-full bg-rose-950 transition-all';
+
+      if (val.signal_color === 'green') {
+        lg.className = 'w-4 h-4 rounded-full bg-emerald-400 shadow-[0_0_14px_#34d399]';
+      } else if (val.signal_color === 'amber') {
+        la.className = 'w-4 h-4 rounded-full bg-amber-400 shadow-[0_0_14px_#fbbf24]';
+      } else {
+        lr.className = 'w-4 h-4 rounded-full bg-rose-500 shadow-[0_0_14px_#f43f5e]';
+      }
+
+      document.getElementById('signalTitle').textContent = val.signal_title;
+      document.getElementById('signalSubtitle').textContent =
+        `Vnitřní hodnota modelu ${fmtNum(val.dcf_price)} ${curr} proti aktuální tržní ceně ${fmtNum(val.current_price)} ${curr}. ` +
+        `Výsledek závisí na diskontní sazbě ${fmtNum(val.wacc_pct)} % a výstupním násobku ${val.exit_multiple}x.`;
+
+      // Cenová pásma
+      document.getElementById('bandCurrentPrice').textContent = `${fmtNum(val.current_price)} ${curr}`;
+      document.getElementById('bandIntrinsicPrice').textContent = `${fmtNum(val.dcf_price)} ${curr}`;
+      document.getElementById('rangeGreen').textContent = `0,00 – ${fmtNum(val.lower_band)} ${curr}`;
+      document.getElementById('rangeAmber').textContent = `${fmtNum(val.lower_band)} – ${fmtNum(val.upper_band)} ${curr}`;
+      document.getElementById('rangeRed').textContent = `nad ${fmtNum(val.upper_band)} ${curr}`;
+
+      const badge = document.getElementById('bandCurrentBadge');
+      badge.textContent = val.band_label;
+
+      const cGreen = document.getElementById('cardGreenBand');
+      const cAmber = document.getElementById('cardAmberBand');
+      const cRed = document.getElementById('cardRedBand');
+      cGreen.classList.remove('band-active-green');
+      cAmber.classList.remove('band-active-amber');
+      cRed.classList.remove('band-active-red');
+      document.getElementById('tagGreenActive').classList.add('hidden');
+      document.getElementById('tagAmberActive').classList.add('hidden');
+      document.getElementById('tagRedActive').classList.add('hidden');
+
+      if (val.signal_color === 'green') {
+        cGreen.classList.add('band-active-green');
+        document.getElementById('tagGreenActive').classList.remove('hidden');
+        badge.className = 'inline-block mt-1.5 text-xs font-bold px-3 py-1 rounded border border-emerald-700 bg-emerald-950/70 text-emerald-300';
+      } else if (val.signal_color === 'amber') {
+        cAmber.classList.add('band-active-amber');
+        document.getElementById('tagAmberActive').classList.remove('hidden');
+        badge.className = 'inline-block mt-1.5 text-xs font-bold px-3 py-1 rounded border border-amber-700 bg-amber-950/70 text-amber-300';
+      } else {
+        cRed.classList.add('band-active-red');
+        document.getElementById('tagRedActive').classList.remove('hidden');
+        badge.className = 'inline-block mt-1.5 text-xs font-bold px-3 py-1 rounded border border-rose-700 bg-rose-950/70 text-rose-300';
+      }
+
+      // Metriky
+      document.getElementById('mCap').textContent = `${fmtNum(val.market_cap_m, 0)} mil. ${curr}`;
+      document.getElementById('mEv').textContent = `${fmtNum(val.enterprise_value_m, 0)} mil. ${curr}`;
+      document.getElementById('mDebt').textContent = `${fmtNum(val.net_debt_m, 0)} mil. ${curr}`;
+      document.getElementById('mRev').textContent = `${fmtNum(val.revenue_m, 0)} mil. ${curr}`;
+
+      document.getElementById('sotpPrice').textContent = `${fmtNum(val.sotp_price)} ${curr}`;
+      document.getElementById('compPe').textContent = `${fmtNum(val.comps.pe_ratio, 1)}x`;
+      document.getElementById('compEvEbitda').textContent = `${fmtNum(val.comps.ev_ebitda, 1)}x`;
+      document.getElementById('compEvRev').textContent = `${fmtNum(val.comps.ev_revenue, 2)}x`;
+
+      document.getElementById('lboIrr').textContent = `${fmtNum(val.lbo.irr_pct, 1)} %`;
+      document.getElementById('lboMoic').textContent = `${fmtNum(val.lbo.moic, 2)}x`;
+      document.getElementById('lboDebt').textContent = `${fmtNum(val.lbo.initial_debt_m, 0)} mil. ${curr}`;
+      document.getElementById('lboExitEq').textContent = `${fmtNum(val.lbo.exit_equity_m, 0)} mil. ${curr}`;
+
+      // Splátkový kalendář
+      const tbody = document.getElementById('amortTableBody');
+      tbody.innerHTML = val.lbo.schedule.map(r => `
+        <tr>
+          <td class="py-2 text-slate-300">${r.year}</td>
+          <td class="py-2 text-white">${fmtNum(r.ebitda, 1)}</td>
+          <td class="py-2 text-rose-400">${fmtNum(r.interest, 1)}</td>
+          <td class="py-2 text-emerald-400">${fmtNum(r.repayment, 1)}</td>
+          <td class="py-2 text-sky-400">${fmtNum(r.ending_debt, 1)}</td>
+        </tr>
+      `).join('');
+
+      // Citlivostní matice
+      const sTable = document.getElementById('sensitivityTable');
+      let headerHtml = `<thead><tr class="border-b border-slate-800 text-slate-400"><th class="py-2">Sazba \\ Násobek</th>`;
+      val.sensitivity.multiples.forEach(m => {
+        headerHtml += `<th class="py-2">${fmtNum(m, 1)}x</th>`;
+      });
+      headerHtml += `</tr></thead><tbody class="divide-y divide-slate-800/60">`;
+
+      val.sensitivity.rows.forEach(row => {
+        headerHtml += `<tr><td class="py-2 font-bold text-sky-400">${fmtNum(row.wacc_pct, 2)} %</td>`;
+        row.prices.forEach(p => {
+          const isHigher = p >= val.current_price;
+          headerHtml += `<td class="py-2 ${isHigher ? 'text-emerald-400' : 'text-slate-300'}">${fmtNum(p, 1)}</td>`;
+        });
+        headerHtml += `</tr>`;
+      });
+      headerHtml += `</tbody>`;
+      sTable.innerHTML = headerHtml;
+
+      document.getElementById('advisorText').textContent = advisorSummary;
+
+      // Graf
+      renderPriceChart(val.history.labels, val.history.prices, val.ticker, curr);
+    }
+
+    function renderPriceChart(labels, prices, ticker, curr) {
+      const ctx = document.getElementById('priceChart').getContext('2d');
+      if (priceChartInstance) {
+        priceChartInstance.destroy();
+      }
+      priceChartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: `${ticker} (${curr})`,
+            data: prices,
+            borderColor: '#38bdf8',
+            backgroundColor: 'rgba(56, 189, 248, 0.12)',
+            borderWidth: 2,
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { grid: { color: '#1e293b' }, ticks: { color: '#94a3b8', font: { size: 11 } } },
+            y: { grid: { color: '#1e293b' }, ticks: { color: '#94a3b8', font: { size: 11 } } }
+          }
+        }
+      });
+    }
+
+    function downloadExport(type) {
+      const ticker = (document.getElementById('tickerInput').value || 'NVDA').trim().toUpperCase();
+      const leverage = document.getElementById('leverageInput').value || 30;
+      const growth = document.getElementById('growthInput').value || 5;
+      const exitMult = document.getElementById('exitMultInput').value || 13.5;
+      window.open(`/api/export/${type}/${encodeURIComponent(ticker)}?leverage=${leverage}&growth=${growth}&exit_mult=${exitMult}`, '_blank');
+    }
+
+    // ==========================================================================
+    // NEWSLETTER A PRAVIDELNÝ ODBĚR
+    // ==========================================================================
+    function showNewsletterStatus(message, isSuccess = true) {
+      const box = document.getElementById('newsletterStatusBox');
+      box.textContent = message;
+      box.classList.remove('hidden', 'border-emerald-700', 'bg-emerald-950/60', 'text-emerald-300', 'border-rose-700', 'bg-rose-950/60', 'text-rose-300');
+      if (isSuccess) {
+        box.classList.add('border-emerald-700', 'bg-emerald-950/60', 'text-emerald-300');
+      } else {
+        box.classList.add('border-rose-700', 'bg-rose-950/60', 'text-rose-300');
+      }
+    }
+
+    async function openNewsletterModal() {
+      const ticker = (document.getElementById('tickerInput').value || 'NVDA').trim().toUpperCase();
+      document.getElementById('modalTickerLabel').textContent = ticker;
+      const modal = document.getElementById('newsletterModal');
+      modal.classList.remove('hidden');
+      modal.classList.add('flex');
+      document.getElementById('newsletterStatusBox').classList.add('hidden');
+
+      await Promise.all([loadSubscribersList(), loadTickerNews(ticker)]);
+    }
+
+    function closeNewsletterModal() {
+      const modal = document.getElementById('newsletterModal');
+      modal.classList.add('hidden');
+      modal.classList.remove('flex');
+    }
+
+    async function loadTickerNews(ticker) {
+      const container = document.getElementById('newsFeedContainer');
+      container.innerHTML = '<div class="text-xs text-slate-400">Načítání aktuálních zpráv...</div>';
+      try {
+        const res = await fetch(`/api/news/${encodeURIComponent(ticker)}`);
+        const data = await res.json();
+        const articles = data.articles || [];
+        if (!articles.length) {
+          container.innerHTML = '<div class="text-xs text-slate-500">Žádné aktuální zprávy nebyly nalezeny.</div>';
+          return;
+        }
+        container.innerHTML = articles.map(a => `
+          <a href="${a.link}" target="_blank" rel="noopener noreferrer"
+             class="block bg-[#080d18] hover:bg-slate-900/90 border border-slate-800 rounded-xl p-3 transition">
+            <div class="text-xs font-semibold text-slate-100">${a.title}</div>
+            <div class="text-[11px] text-slate-400 mt-1">${a.publisher} • ${a.published}</div>
+          </a>
+        `).join('');
+      } catch (e) {
+        container.innerHTML = '<div class="text-xs text-rose-400">Nepodařilo se načíst tržní zprávy.</div>';
+      }
+    }
+
+    async function loadSubscribersList() {
+      const container = document.getElementById('subscribersListContainer');
+      const badge = document.getElementById('subscribersCountBadge');
+      try {
+        const res = await fetch('/api/subscribers');
+        const data = await res.json();
+        const list = data.subscribers || [];
+        badge.textContent = `${list.length} odběratelů`;
+        if (!list.length) {
+          container.innerHTML = '<div class="text-slate-500 italic">Žádné e-maily zatím nejsou evidovány.</div>';
+          return;
+        }
+        container.innerHTML = list.map(item => {
+          const dayText = DAY_LABELS[item.schedule_day] || item.schedule_day;
+          return `
+            <div class="flex items-center justify-between bg-[#080d18] border border-slate-800 rounded-lg px-3 py-2">
+              <div>
+                <div class="font-semibold text-slate-200">${item.email} <span class="text-sky-400 font-mono-num ml-1">[${item.ticker}]</span></div>
+                <div class="text-[11px] text-slate-400">${dayText} v ${item.schedule_time}</div>
+              </div>
+              <button onclick="removeSubscriber('${item.email}', '${item.ticker}')"
+                class="text-rose-400 hover:text-rose-300 text-xs font-medium px-2 py-1 rounded bg-rose-950/40 border border-rose-900/60 cursor-pointer">
+                Odebrat
+              </button>
             </div>
-            <form class="advisor-form" style="margin-bottom: 18px;" onsubmit="subscribeNewsletter(event)">
-                <input id="subscribeEmailInput" type="email" placeholder="Zadejte e-mail pro odběr investičního bulletinu..." required>
-                <button class="btn btn-primary" type="submit">Odebírat</button>
-            </form>
-            <div id="subscribeStatus" style="font-size: 12px; color: var(--success); margin-bottom: 12px;"></div>
-            <div id="newsFeedList">Načítám zprávy...</div>
-        </div>
-    </div>
+          `;
+        }).join('');
+      } catch (e) {
+        container.innerHTML = '<div class="text-rose-400">Chyba načtení seznamu odběratelů.</div>';
+      }
+    }
 
-    <script>
-        function formatCurrency(val) {
-            if (val === null || val === undefined || isNaN(val)) return 'N/A';
-            return Number(val).toLocaleString('cs-CZ', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' USD';
-        }
+    async function sendOneOffNewsletter() {
+      const email = (document.getElementById('subscribeEmailInput').value || '').trim();
+      if (!email || !email.includes('@')) {
+        showNewsletterStatus('Zadejte prosím platnou e-mailovou adresu.', false);
+        return;
+      }
 
-        function formatLargeCurrency(val) {
-            if (val === null || val === undefined || isNaN(val)) return 'N/A';
-            return Number(val).toLocaleString('cs-CZ', { maximumFractionDigits: 2 }) + ' USD';
-        }
+      const btn = document.getElementById('btnOneOffSend');
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Odesílám...';
 
-        async function loadForexRates() {
-            try {
-                const res = await fetch('/api/forex-rates');
-                const data = await res.json();
-                const container = document.getElementById('forexRates');
-                container.replaceChildren();
-                Object.entries(data.rates).forEach(([pair, item]) => {
-                    const span = document.createElement('span');
-                    span.innerHTML = pair + ' <strong>' + Number(item.rate).toFixed(2) + '</strong>';
-                    container.appendChild(span);
-                });
-            } catch (err) {
-                console.error("Forex error:", err);
-            }
-        }
-
-        function renderPriceZones(currentPrice, intrinsicValue) {
-            const curEl = document.getElementById('currentStockPrice');
-            const fairEl = document.getElementById('fairValueCenter');
-            const badgeEl = document.getElementById('currentZoneBadge');
-
-            const greenCard = document.getElementById('zoneGreenCard');
-            const yellowCard = document.getElementById('zoneYellowCard');
-            const redCard = document.getElementById('zoneRedCard');
-            const greenTag = document.getElementById('zoneGreenTag');
-            const yellowTag = document.getElementById('zoneYellowTag');
-            const redTag = document.getElementById('zoneRedTag');
-
-            [greenCard, yellowCard, redCard].forEach(c => c.classList.remove('active-zone'));
-            [greenTag, yellowTag, redTag].forEach(t => t.style.display = 'none');
-
-            curEl.textContent = currentPrice ? formatCurrency(currentPrice) : 'N/A';
-            fairEl.textContent = (intrinsicValue && intrinsicValue > 0) ? formatCurrency(intrinsicValue) : 'N/A';
-
-            if (!intrinsicValue || intrinsicValue <= 0) {
-                document.getElementById('zoneGreenRange').textContent = 'N/A';
-                document.getElementById('zoneYellowRange').textContent = 'N/A';
-                document.getElementById('zoneRedRange').textContent = 'N/A';
-                badgeEl.className = 'valuation-status neutral';
-                badgeEl.textContent = 'Nelze stanovit';
-                return;
-            }
-
-            const lowerBound = intrinsicValue * 0.85;
-            const upperBound = intrinsicValue * 1.15;
-
-            document.getElementById('zoneGreenRange').textContent = '0,00 – ' + formatCurrency(lowerBound);
-            document.getElementById('zoneYellowRange').textContent = formatCurrency(lowerBound) + ' – ' + formatCurrency(upperBound);
-            document.getElementById('zoneRedRange').textContent = 'nad ' + formatCurrency(upperBound);
-
-            if (!currentPrice || currentPrice <= 0) {
-                badgeEl.className = 'valuation-status neutral';
-                badgeEl.textContent = 'Cena nedostupná';
-                return;
-            }
-
-            if (currentPrice <= lowerBound) {
-                greenCard.classList.add('active-zone');
-                greenTag.style.display = 'inline-block';
-                badgeEl.className = 'valuation-status undervalued';
-                badgeEl.textContent = 'Zelené pásmo (Podhodnoceno)';
-            } else if (currentPrice <= upperBound) {
-                yellowCard.classList.add('active-zone');
-                yellowTag.style.display = 'inline-block';
-                badgeEl.className = 'valuation-status neutral';
-                badgeEl.textContent = 'Žlutooranžové pásmo (Fair Value)';
-            } else {
-                redCard.classList.add('active-zone');
-                redTag.style.display = 'inline-block';
-                badgeEl.className = 'valuation-status overvalued';
-                badgeEl.textContent = 'Červené pásmo (Nadhodnoceno)';
-            }
-        }
-
-        async function loadValuation() {
-            const ticker = (document.getElementById('tickerInput').value || 'AAPL').trim().toUpperCase();
-            const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
-            const growth = document.getElementById('growthInput').valueAsNumber / 100;
-            const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
-
-            const queryParams = new URLSearchParams({ leverage, growth, exit_mult: exitMult });
-
-            try {
-                const res = await fetch('/api/valuation/' + encodeURIComponent(ticker) + '?' + queryParams);
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || 'Valuaci se nepodařilo načíst.');
-
-                document.getElementById('tickerInput').value = data.spolecnost;
-                document.getElementById('thesisTicker').textContent = data.spolecnost;
-                document.getElementById('zonesTicker').textContent = data.spolecnost;
-                document.getElementById('valTicker').textContent = data.spolecnost;
-
-                document.getElementById('valCap').textContent = formatLargeCurrency(data.trzni_kapitalizace);
-                document.getElementById('valDebt').textContent = formatLargeCurrency(data.celkovy_dluh);
-                document.getElementById('valEV').textContent = formatLargeCurrency(data.celkova_hodnota_podniku);
-
-                document.getElementById('sotpEV').textContent = formatLargeCurrency(data.metoda_souctu_casti.vypoctena_hodnota_podniku);
-                document.getElementById('sotpEquity').textContent = formatLargeCurrency(data.metoda_souctu_casti.vypoctena_hodnota_vlastniho_kapitalu);
-
-                const lbo = data.model_odkupu_za_cizi_kapital_base_case;
-                document.getElementById('lboInEq').textContent = formatLargeCurrency(lbo.vstupni_vlastni_kapital);
-                document.getElementById('lboOutEq').textContent = formatLargeCurrency(lbo.vystupni_hodnota_vlastniho_kapitalu);
-                document.getElementById('lboMoic').textContent = lbo.moic + 'x';
-                document.getElementById('lboIrr').textContent = lbo.irr_procent + ' %';
-
-                const dcf = data.dcf_valuation;
-                document.getElementById('dcfIntrinsicValue').textContent = formatCurrency(dcf.intrinsic_value_per_share);
-                document.getElementById('dcfWacc').textContent = (dcf.wacc * 100).toFixed(2) + ' %';
-                document.getElementById('dcfTerminalValue').textContent = formatLargeCurrency(dcf.terminal_value);
-
-                renderPriceZones(dcf.current_share_price, dcf.intrinsic_value_per_share);
-
-                const statusEl = document.getElementById('dcfValuationStatus');
-                const upside = dcf.upside_downside_percent;
-                if (upside === null || upside === undefined) {
-                    statusEl.className = 'valuation-status neutral';
-                    statusEl.textContent = 'Tržní cena neuvedena';
-                } else {
-                    statusEl.className = 'valuation-status ' + (upside >= 0 ? 'undervalued' : 'overvalued');
-                    statusEl.textContent = (upside >= 0 ? 'Podhodnoceno ' : 'Předraženo ') + Math.abs(upside).toFixed(2) + ' %';
-                }
-
-                ['thesisGreen', 'thesisOrange', 'thesisRed'].forEach(id => document.getElementById(id).classList.remove('active'));
-                let color = 'orange';
-                if (upside !== null && upside >= 15) color = 'green';
-                else if (upside !== null && upside <= -15) color = 'red';
-                document.getElementById('thesis' + color.charAt(0).toUpperCase() + color.slice(1)).classList.add('active');
-                document.getElementById('thesisRecommendation').textContent = upside >= 15 ? 'Model indikuje silné podhodnocení' : upside <= -15 ? 'Model indikuje nadhodnocení' : 'Model v neutrálním pásmu Fair Value';
-                document.getElementById('thesisSummary').textContent = 'DCF hodnota ' + formatCurrency(dcf.intrinsic_value_per_share) + ' proti aktuální tržní ceně ' + formatCurrency(dcf.current_share_price) + '. Výsledek závisí na WACC ' + (dcf.wacc * 100).toFixed(2) + ' % a exit násobku ' + exitMult + 'x.';
-
-                document.getElementById('peerSector').textContent = data.peer_comps.sector || 'Sektor';
-                let peerHtml = '<table><thead><tr><th>Metoda</th><th>Násobek</th><th>Forward Metrika</th><th>Implikovaná cena / akcii</th></tr></thead><tbody>';
-                (data.peer_comps.multiples || []).forEach(p => {
-                    peerHtml += '<tr><td>' + p.method + '</td><td>' + p.multiple + 'x</td><td>' + formatLargeCurrency(p.forward_metric) + '</td><td>' + (p.implied_share_price ? formatCurrency(p.implied_share_price) : 'N/A') + '</td></tr>';
-                });
-                peerHtml += '</tbody></table>';
-                document.getElementById('peerCompsContainer').innerHTML = peerHtml;
-
-                let schedHtml = '<table><thead><tr><th>Rok</th><th>EBITDA</th><th>FCF</th><th>Splátka jistiny</th><th>Zůstatek dluhu</th></tr></thead><tbody>';
-                (data.projektovane_roky || []).forEach(y => {
-                    schedHtml += '<tr><td>Rok ' + y.rok + '</td><td>' + formatLargeCurrency(y.projektovany_provozni_zisk_pred_odpisy) + '</td><td>' + formatLargeCurrency(y.volny_tok_pro_splaceni) + '</td><td>' + formatLargeCurrency(y.mor_jistiny) + '</td><td>' + formatLargeCurrency(y.zbyvajici_cizi_kapital) + '</td></tr>';
-                });
-                schedHtml += '</tbody></table>';
-                document.getElementById('lboScheduleContainer').innerHTML = schedHtml;
-
-                const matrix = data.citlivostni_matice_lbo_irr || [];
-                const multiHeader = [
-                    Math.max(0.1, exitMult - 2.5),
-                    Math.max(0.1, exitMult - 1.5),
-                    exitMult,
-                    exitMult + 1.5,
-                    exitMult + 3.0
-                ];
-                let matHtml = '<table><thead><tr><th>Růst EBITDA / Násobek</th>' + multiHeader.map(m => '<th>' + m.toFixed(1) + 'x</th>').join('') + '</tr></thead><tbody>';
-                matrix.forEach(row => {
-                    matHtml += '<tr><td><strong>' + row.tempo_rustu_ebitda_procent + '%</strong></td>';
-                    row.vysledky_irr_dle_nasobku.forEach(cell => {
-                        const colColor = cell.irr_procent >= 0 ? '#34d399' : '#f87171';
-                        matHtml += '<td style="color: ' + colColor + ';">' + cell.irr_procent.toFixed(2) + '%</td>';
-                    });
-                    matHtml += '</tr>';
-                });
-                matHtml += '</tbody></table>';
-                document.getElementById('sensitivityMatrix').innerHTML = matHtml;
-
-            } catch (err) {
-                console.error(err);
-                alert('Chyba při načítání valuace: ' + err.message);
-            }
-        }
-
-        async function askAdvisor(e) {
-            e.preventDefault();
-            const input = document.getElementById('advisorQuestion');
-            const q = input.value.trim();
-            if (!q) return;
-
-            const thread = document.getElementById('advisorThread');
-            const userMsg = document.createElement('div');
-            userMsg.className = 'advisor-message user-message';
-            userMsg.textContent = q;
-            thread.appendChild(userMsg);
-            input.value = '';
-            userMsg.scrollIntoView({ block: 'nearest' });
-
-            const ticker = document.getElementById('tickerInput').value.trim().toUpperCase() || 'AAPL';
-            const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
-            const growth = document.getElementById('growthInput').valueAsNumber / 100;
-            const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
-
-            try {
-                const res = await fetch('/api/advisor/' + encodeURIComponent(ticker), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ question: q, scenario: { leverage, growth, exit_mult: exitMult } })
-                });
-                const data = await res.json();
-                const aiMsg = document.createElement('div');
-                aiMsg.className = 'advisor-message';
-                aiMsg.textContent = res.ok ? data.answer : (data.detail || 'Chyba asistenta.');
-                thread.appendChild(aiMsg);
-                aiMsg.scrollIntoView({ block: 'nearest' });
-            } catch (err) {
-                const aiMsg = document.createElement('div');
-                aiMsg.className = 'advisor-message';
-                aiMsg.textContent = 'Chyba při komunikaci s AI advisorem.';
-                thread.appendChild(aiMsg);
-            }
-        }
-
-        function downloadExcel() {
-            const ticker = document.getElementById('tickerInput').value.trim().toUpperCase() || 'AAPL';
-            const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
-            const growth = document.getElementById('growthInput').valueAsNumber / 100;
-            const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
-            window.location.href = '/api/export/excel/' + encodeURIComponent(ticker) + '?leverage=' + leverage + '&growth=' + growth + '&exit_mult=' + exitMult;
-        }
-
-        function downloadPDF() {
-            const ticker = document.getElementById('tickerInput').value.trim().toUpperCase() || 'AAPL';
-            const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
-            const growth = document.getElementById('growthInput').valueAsNumber / 100;
-            const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
-            window.location.href = '/api/export/pdf/' + encodeURIComponent(ticker) + '?leverage=' + leverage + '&growth=' + growth + '&exit_mult=' + exitMult;
-        }
-
-        async function openNewsletterModal() {
-            const ticker = (document.getElementById('tickerInput').value || 'AAPL').trim().toUpperCase();
-            document.getElementById('newsModalTicker').textContent = ticker;
-            document.getElementById('newsletterModal').classList.add('open');
-            const listEl = document.getElementById('newsFeedList');
-            listEl.innerHTML = '<div style="text-align:center;padding:20px;"><div class="loader"></div></div>';
-            try {
-                const res = await fetch('/api/news/' + encodeURIComponent(ticker));
-                const data = await res.json();
-                if (!data.articles || data.articles.length === 0) {
-                    listEl.innerHTML = '<p class="plain-guide">Pro tento ticker nejsou momentálně dostupné žádné zprávy.</p>';
-                    return;
-                }
-                listEl.innerHTML = data.articles.map(a =>
-                    `<div class="news-item"><a href="${a.url}" target="_blank" rel="noopener">${a.title}</a><div class="news-meta">${a.source}</div></div>`
-                ).join('');
-            } catch (err) {
-                listEl.innerHTML = '<p class="plain-guide">Nepodařilo se načíst zprávy.</p>';
-            }
-        }
-
-        function closeNewsletterModal() {
-            document.getElementById('newsletterModal').classList.remove('open');
-        }
-
-        async function subscribeNewsletter(e) {
-            e.preventDefault();
-            const emailInput = document.getElementById('subscribeEmailInput');
-            const statusEl = document.getElementById('subscribeStatus');
-            try {
-                const res = await fetch('/subscribe', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email: emailInput.value.trim() })
-                });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || 'Chyba při registraci.');
-                statusEl.style.color = '#34d399';
-                statusEl.textContent = data.message;
-                emailInput.value = '';
-            } catch (err) {
-                statusEl.style.color = '#f87171';
-                statusEl.textContent = err.message;
-            }
-        }
-
-        document.getElementById('tickerInput').addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') loadValuation();
+      try {
+        const res = await fetch('/api/newsletter/send-now', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: email,
+            ticker: (document.getElementById('tickerInput').value || 'NVDA').trim().toUpperCase(),
+            leverage: Number(document.getElementById('leverageInput').value || 30),
+            growth: Number(document.getElementById('growthInput').value || 5),
+            exit_mult: Number(document.getElementById('exitMultInput').value || 13.5)
+          })
         });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Odeslání selhalo.');
+        showNewsletterStatus(data.message, data.sent_via_smtp !== false);
+      } catch (err) {
+        showNewsletterStatus(err.message, false);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+      }
+    }
 
-        document.addEventListener('DOMContentLoaded', () => {
-            loadForexRates();
-            loadValuation();
+    async function subscribeRegularNewsletter() {
+      const email = (document.getElementById('subscribeEmailInput').value || '').trim();
+      if (!email || !email.includes('@')) {
+        showNewsletterStatus('Zadejte prosím platnou e-mailovou adresu.', false);
+        return;
+      }
+
+      const btn = document.getElementById('btnRegularSubscribe');
+      const origText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Ukládám...';
+
+      try {
+        const res = await fetch('/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: email,
+            ticker: (document.getElementById('tickerInput').value || 'NVDA').trim().toUpperCase(),
+            schedule_day: document.getElementById('scheduleDaySelect').value,
+            schedule_time: document.getElementById('scheduleTimeInput').value || '08:00',
+            leverage: Number(document.getElementById('leverageInput').value || 30),
+            growth: Number(document.getElementById('growthInput').value || 5),
+            exit_mult: Number(document.getElementById('exitMultInput').value || 13.5)
+          })
         });
-    </script>
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || 'Registrace odběru selhala.');
+        showNewsletterStatus(data.message, true);
+        await loadSubscribersList();
+      } catch (err) {
+        showNewsletterStatus(err.message, false);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = origText;
+      }
+    }
+
+    async function removeSubscriber(email, ticker) {
+      try {
+        await fetch(`/subscribe?email=${encodeURIComponent(email)}&ticker=${encodeURIComponent(ticker)}`, {
+          method: 'DELETE'
+        });
+        await loadSubscribersList();
+      } catch (e) {
+        console.warn('Chyba při odebírání odběratele:', e);
+      }
+    }
+
+    document.getElementById('tickerInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') runAnalysis();
+    });
+
+    window.addEventListener('DOMContentLoaded', () => {
+      loadForexRates();
+      runAnalysis();
+    });
+  </script>
 </body>
 </html>
 """
 
 
-def run_valuation_logic(
-    ticker: str,
-    leverage: float = 0.30,
-    growth: float = 0.05,
-    exit_mult: float = 13.5,
-    private_inputs=None
-):
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info or {}
-        financials = stock.financials
-    except Exception:
-        stock = None
-        info = {}
-        financials = None
-
-    current_price = info.get("currentPrice") or info.get("regularMarketPrice")
-    shares_outstanding = info.get("sharesOutstanding")
-    celkovy_dluh = info.get("totalDebt") or 0
-    hotovost = info.get("totalCash") or 0
-    ebitda = info.get("ebitda") or 0
-    trzby = info.get("totalRevenue") or 0
-    cisty_zisk = info.get("netIncomeToCommon") or info.get("netIncome") or 0
-    market_cap = info.get("marketCap") or 0
-
-    if not ebitda and financials is not None and not financials.empty:
-        try:
-            ebitda = financials.loc["EBITDA"].iloc[0] if "EBITDA" in financials.index else trzby * 0.20
-        except Exception:
-            ebitda = trzby * 0.20
-
-    if not market_cap and current_price and shares_outstanding:
-        market_cap = current_price * shares_outstanding
-
-    trzni_kapitalizace = market_cap if market_cap > 0 else 100_000_000_000
-    celkova_hodnota_podniku = trzni_kapitalizace + celkovy_dluh - hotovost
-
-    efektivni_danova_sazba = 0.21
-    implikovana_sazba_dluhu = 0.045
-
-    vstupni_cizi_kapital = celkova_hodnota_podniku * leverage
-    vstupni_vlastni_kapital = max(1000.0, celkova_hodnota_podniku - vstupni_cizi_kapital)
-
-    def project_lbo_years(growth_rate: float):
-        current_debt = vstupni_cizi_kapital
-        projected_ebitda = ebitda if ebitda > 0 else 10_000_000
-        projected_years = []
-
-        for year in range(1, 6):
-            projected_ebitda *= (1 + growth_rate)
-            odpisy = trzby * 0.025 if trzby > 0 else projected_ebitda * 0.1
-            provozni_zisk_ebit = projected_ebitda - odpisy
-            urokove_naklady = current_debt * implikovana_sazba_dluhu
-            zisk_pred_danemi = max(0.0, provozni_zisk_ebit - urokove_naklady)
-            dan_z_prijmu = zisk_pred_danemi * efektivni_danova_sazba
-            investicni_vydaje = (trzby if trzby > 0 else projected_ebitda) * 0.035
-            zmena_pracovniho_kapitalu = (trzby if trzby > 0 else projected_ebitda) * 0.01
-            cisty_penezni_tok = provozni_zisk_ebit - dan_z_prijmu + odpisy - investicni_vydaje - zmena_pracovniho_kapitalu
-            volny_tok_pro_splaceni = max(0.0, cisty_penezni_tok - urokove_naklady)
-            splatka_jistiny = min(current_debt, volny_tok_pro_splaceni * 0.80)
-            current_debt -= splatka_jistiny
-
-            projected_years.append({
-                "rok": year,
-                "projektovany_provozni_zisk_pred_odpisy": round(projected_ebitda, 2),
-                "dcf_volny_penezni_tok": round(cisty_penezni_tok, 2),
-                "volny_tok_pro_splaceni": round(volny_tok_pro_splaceni, 2),
-                "zbyvajici_cizi_kapital": round(current_debt, 2),
-                "mor_jistiny": round(splatka_jistiny, 2)
-            })
-        return projected_years
-
-    projektovane_roky = project_lbo_years(growth)
-    bezkusova_ebitda = projektovane_roky[-1]["projektovany_provozni_zisk_pred_odpisy"]
-    aktualni_dluh = projektovane_roky[-1]["zbyvajici_cizi_kapital"]
-
-    hodnota_prvniho = (bezkusova_ebitda * 0.80) * exit_mult
-    hodnota_druheho = (bezkusova_ebitda * 0.20) * 9.0
-    celkova_hodnota_podniku_sotp = hodnota_prvniho + hodnota_druheho
-    hodnota_vlastniho_kapitalu_sotp = celkova_hodnota_podniku_sotp - celkovy_dluh + hotovost
-
-    vystupni_nasobek = exit_mult
-    vystupni_hodnota_podniku = bezkusova_ebitda * vystupni_nasobek
-    vystupni_hodnota_vlastniho_kapitalu = max(0.0, vystupni_hodnota_podniku - aktualni_dluh)
-
-    moic = (vystupni_hodnota_vlastniho_kapitalu / vstupni_vlastni_kapital) if vstupni_vlastni_kapital > 0 else 0
-    irr = ((moic ** (1 / 5)) - 1) * 100 if moic > 0 else 0
-
-    try:
-        beta = float(info.get("beta") or 1.0)
-    except (TypeError, ValueError):
-        beta = 1.0
-    cost_of_equity = 0.04 + beta * 0.055
-    capital_base = max(0.0, vstupni_cizi_kapital) + max(0.0, vstupni_vlastni_kapital)
-    debt_weight = max(0.0, vstupni_cizi_kapital) / capital_base if capital_base > 0 else 0.30
-    equity_weight = max(0.0, vstupni_vlastni_kapital) / capital_base if capital_base > 0 else 0.70
-    wacc = debt_weight * implikovana_sazba_dluhu * (1 - efektivni_danova_sazba) + equity_weight * cost_of_equity
-    wacc = max(0.06, min(0.20, wacc))
-
-    dcf_cash_flows = []
-    for year in projektovane_roky:
-        discount_factor = 1 / ((1 + wacc) ** year["rok"])
-        free_cash_flow = year["dcf_volny_penezni_tok"]
-        dcf_cash_flows.append({
-            "rok": year["rok"],
-            "volny_penezni_tok": free_cash_flow,
-            "diskontni_faktor": round(discount_factor, 6),
-            "soucasna_hodnota_fcf": round(free_cash_flow * discount_factor, 2)
-        })
-
-    terminal_value = bezkusova_ebitda * exit_mult
-    present_value_terminal_value = terminal_value * dcf_cash_flows[-1]["diskontni_faktor"]
-    dcf_enterprise_value = sum(year["soucasna_hodnota_fcf"] for year in dcf_cash_flows) + present_value_terminal_value
-    dcf_equity_value = dcf_enterprise_value - celkovy_dluh + hotovost
-    shares = shares_outstanding or (trzni_kapitalizace / current_price if current_price else 1_000_000_000)
-    intrinsic_value_per_share = dcf_equity_value / shares if shares > 0 else None
-    upside_downside_percent = ((intrinsic_value_per_share / current_price) - 1) * 100 if intrinsic_value_per_share is not None and current_price and current_price > 0 else None
-
-    sector = str(info.get("sector") or "Technology")
-    peer_multiples = {"ev_ebitda": 18.0, "pe": 28.0, "ev_revenue": 6.0}
-    forward_factor = (1 + growth) ** 5
-    peer_metrics = [
-        ("EV/EBITDA", peer_multiples["ev_ebitda"], bezkusova_ebitda, True),
-        ("P/E", peer_multiples["pe"], (cisty_zisk if cisty_zisk > 0 else ebitda * 0.15) * forward_factor, False),
-        ("EV/Revenue", peer_multiples["ev_revenue"], (trzby if trzby > 0 else ebitda * 4) * forward_factor, True)
-    ]
-    peer_comps_rows = []
-    for method, multiple, forward_metric, is_enterprise_multiple in peer_metrics:
-        implied_enterprise_value = forward_metric * multiple if is_enterprise_multiple else None
-        implied_equity_value = (
-            implied_enterprise_value - celkovy_dluh + hotovost
-            if is_enterprise_multiple and implied_enterprise_value is not None
-            else forward_metric * multiple
-        )
-        implied_share_price = implied_equity_value / shares if shares > 0 else None
-        peer_comps_rows.append({
-            "method": method,
-            "multiple": multiple,
-            "forward_metric": round(forward_metric, 2),
-            "implied_enterprise_value": round(implied_enterprise_value, 2) if implied_enterprise_value is not None else None,
-            "implied_equity_value": round(implied_equity_value, 2) if implied_equity_value is not None else None,
-            "implied_share_price": round(implied_share_price, 2) if implied_share_price is not None else None
-        })
-
-    citlivostni_matice_irr = []
-    testovane_rustove_sazby = [max(-0.99, growth + offset) for offset in [-0.02, -0.01, 0.0, 0.01, 0.02]]
-    testovane_nasobky = [max(0.1, exit_mult + offset) for offset in [-2.5, -1.5, 0.0, 1.5, 3.0]]
-
-    for g in testovane_rustove_sazby:
-        radek_matice = {"tempo_rustu_ebitda_procent": round(g * 100, 1), "vysledky_irr_dle_nasobku": []}
-        sensitivity_years = project_lbo_years(g)
-        ebitda_t5_g = sensitivity_years[-1]["projektovany_provozni_zisk_pred_odpisy"]
-        final_debt_sim = sensitivity_years[-1]["zbyvajici_cizi_kapital"]
-        for mult in testovane_nasobky:
-            ev_t5 = ebitda_t5_g * mult
-            equity_t5 = max(0.0, ev_t5 - final_debt_sim)
-            sim_moic = (equity_t5 / vstupni_vlastni_kapital) if vstupni_vlastni_kapital > 0 else 0
-            sim_irr = ((sim_moic ** (1 / 5)) - 1) * 100 if sim_moic > 0 else -100
-            radek_matice["vysledky_irr_dle_nasobku"].append({
-                "vystupni_nasobek": mult,
-                "irr_procent": round(sim_irr, 2)
-            })
-        citlivostni_matice_irr.append(radek_matice)
-
-    return {
-        "spolecnost": ticker.upper(),
-        "ticker": ticker.upper(),
-        "trzni_kapitalizace": trzni_kapitalizace,
-        "celkovy_dluh": celkovy_dluh,
-        "hotovost": hotovost,
-        "celkova_hodnota_podniku": celkova_hodnota_podniku,
-        "metoda_souctu_casti": {
-            "vypoctena_hodnota_podniku": celkova_hodnota_podniku_sotp,
-            "vypoctena_hodnota_vlastniho_kapitalu": hodnota_vlastniho_kapitalu_sotp
-        },
-        "model_odkupu_za_cizi_kapital_base_case": {
-            "vstupni_vlastni_kapital": round(vstupni_vlastni_kapital, 2),
-            "vstupni_cizi_kapital": round(vstupni_cizi_kapital, 2),
-            "vystupni_hodnota_vlastniho_kapitalu": round(vystupni_hodnota_vlastniho_kapitalu, 2),
-            "moic": round(moic, 2),
-            "irr_procent": round(irr, 2)
-        },
-        "dcf_valuation": {
-            "wacc": round(wacc, 6),
-            "terminal_value": round(terminal_value, 2),
-            "present_value_terminal_value": round(present_value_terminal_value, 2),
-            "enterprise_value": round(dcf_enterprise_value, 2),
-            "equity_value": round(dcf_equity_value, 2),
-            "intrinsic_value_per_share": round(intrinsic_value_per_share, 2) if intrinsic_value_per_share is not None else None,
-            "current_share_price": current_price,
-            "upside_downside_percent": round(upside_downside_percent, 2) if upside_downside_percent is not None else None,
-            "terminal_value_method": "Exit EV/EBITDA",
-            "cash_flows": dcf_cash_flows
-        },
-        "peer_comps": {
-            "sector": sector,
-            "benchmark_name": "Orientační sektorový benchmark",
-            "multiples": peer_comps_rows
-        },
-        "parametry_scenare": {
-            "leverage": leverage,
-            "growth": growth,
-            "exit_mult": exit_mult
-        },
-        "projektovane_roky": projektovane_roky,
-        "citlivostni_matice_lbo_irr": citlivostni_matice_irr
-    }
-
-
-@app.get("/api/valuation/{ticker}")
-def get_institutional_terminal_valuation(
-    ticker: str,
-    leverage: float = Query(0.30, ge=0.0, le=1.0),
-    growth: float = Query(0.05, gt=-1.0, le=5.0),
-    exit_mult: float = Query(13.5, gt=0.0, le=100.0)
-):
-    try:
-        return run_valuation_logic(ticker, leverage, growth, exit_mult)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/api/advisor/{ticker}")
-async def ask_terminal_advisor(ticker: str, request: Request):
-    try:
-        payload = await request.json()
-        question = str(payload.get("question", "")).strip()[:1000]
-        scenario = payload.get("scenario") or {}
-        leverage = float(scenario.get("leverage", 0.30))
-        growth = float(scenario.get("growth", 0.05))
-        exit_mult = float(scenario.get("exit_mult", 13.5))
-        if not question:
-            raise HTTPException(status_code=422, detail="Zadejte otázku.")
-        data = run_valuation_logic(ticker, leverage, growth, exit_mult)
-        api_key = os.getenv("OPENAI_API_KEY")
-        dcf = data["dcf_valuation"]
-        answer = (
-            f"Tensegrity Terminal AI Advisor: Společnost {data['spolecnost']} má Enterprise Value "
-            f"{data['celkova_hodnota_podniku']:,.2f} USD, tržní kapitalizaci {data['trzni_kapitalizace']:,.2f} USD "
-            f"a vnitřní DCF hodnotu {dcf['intrinsic_value_per_share']:,.2f} USD na akcii (oproti tržní ceně "
-            f"{dcf['current_share_price'] or 'N/A'} USD). Na váš dotaz ('{question}') odpovídám: "
-            f"Model pracuje s WACC {dcf['wacc']*100:.2f} % a 5letým LBO horizontem."
-        )
-        return {"answer": answer, "used_llm": bool(api_key)}
-    except HTTPException:
-        raise
-    except Exception as error:
-        raise HTTPException(status_code=400, detail=str(error))
-
-
-@app.get("/api/news/{ticker}")
-def get_ticker_news(ticker: str):
-    try:
-        raw_news = yf.Ticker(ticker).news or []
-        articles = []
-        for item in raw_news[:8]:
-            content = item.get("content", item) if isinstance(item, dict) else {}
-            if not isinstance(content, dict):
-                continue
-            provider = content.get("provider", {})
-            clickthrough = content.get("clickThroughUrl") or content.get("canonicalUrl") or {}
-            articles.append({
-                "title": content.get("title") or item.get("title") or "Bez názvu",
-                "source": provider.get("displayName") or item.get("publisher") or "Zdroj neuveden",
-                "url": clickthrough.get("url") or item.get("link") or "#"
-            })
-        return {"ticker": ticker.upper(), "articles": articles}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/forex-rates")
-async def get_forex_rates():
-    return await asyncio.to_thread(get_live_forex_rates)
-
-
-@app.get("/api/export/excel/{ticker}")
-def export_valuation_excel(
-    ticker: str,
-    leverage: float = Query(0.30, ge=0.0, le=1.0),
-    growth: float = Query(0.05, gt=-1.0, le=5.0),
-    exit_mult: float = Query(13.5, gt=0.0, le=100.0)
-):
-    try:
-        data = run_valuation_logic(ticker, leverage, growth, exit_mult)
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = f"Valuation - {data['spolecnost']}"
-        ws.append(["TENSEGRITY TERMINAL — VALUATION REPORT"])
-        ws.append([f"Společnost: {data['spolecnost']} | Datum: {datetime.now().strftime('%Y-%m-%d')}"])
-        ws.append([])
-        ws.append(["Ukazatel", "Hodnota (USD)"])
-        ws.append(["Tržní kapitalizace", data["trzni_kapitalizace"]])
-        ws.append(["Celkový dluh", data["celkovy_dluh"]])
-        ws.append(["Celková hodnota podniku (EV)", data["celkova_hodnota_podniku"]])
-        ws.append(["DCF vnitřní hodnota / akcii", data["dcf_valuation"]["intrinsic_value_per_share"]])
-        ws.append(["Aktuální tržní cena / akcii", data["dcf_valuation"]["current_share_price"]])
-
-        output = io.BytesIO()
-        wb.save(output)
-        output.seek(0)
-        filename = f"Tensegrity_Valuation_{data['spolecnost']}.xlsx"
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/export/pdf/{ticker}")
-def export_valuation_pdf(
-    ticker: str,
-    leverage: float = Query(0.30, ge=0.0, le=1.0),
-    growth: float = Query(0.05, gt=-1.0, le=5.0),
-    exit_mult: float = Query(13.5, gt=0.0, le=100.0)
-):
-    try:
-        data = run_valuation_logic(ticker, leverage, growth, exit_mult)
-        dcf = data["dcf_valuation"]
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=35, leftMargin=35, topMargin=35, bottomMargin=45)
-        styles = getSampleStyleSheet()
-        elements = [
-            Paragraph(f"Tensegrity Terminal Valuation: {data['spolecnost']}", styles['Heading1']),
-            Spacer(1, 10),
-            Paragraph(f"Enterprise Value: {data['celkova_hodnota_podniku']:,.0f} USD", styles['Normal']),
-            Paragraph(f"Market Cap: {data['trzni_kapitalizace']:,.0f} USD", styles['Normal']),
-            Paragraph(f"Total Debt: {data['celkovy_dluh']:,.0f} USD", styles['Normal']),
-            Paragraph(f"DCF Intrinsic Value / Share: {dcf['intrinsic_value_per_share'] or 'N/A'} USD", styles['Normal']),
-            Paragraph(f"Current Share Price: {dcf['current_share_price'] or 'N/A'} USD", styles['Normal'])
-        ]
-        doc.build(elements)
-        buffer.seek(0)
-        filename = f"Tensegrity_Valuation_{data['spolecnost']}.pdf"
-        return StreamingResponse(
-            buffer,
-            media_type="application/pdf",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/", response_class=HTMLResponse)
+def serve_terminal() -> HTMLResponse:
+    return HTMLResponse(content=HTML_PAGE)
