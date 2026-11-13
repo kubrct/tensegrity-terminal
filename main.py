@@ -1,46 +1,24 @@
 # -*- coding: utf-8 -*-
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
-import asyncio
-from typing import Optional
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-import base64
-import logging
-from PIL import Image
-from concurrent.futures import ThreadPoolExecutor
-from html import escape, unescape
-from html.parser import HTMLParser
+import asyncio
+import io
 import json
+import logging
+import os
 import re
 import yfinance as yf
 import openpyxl
 
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.graphics.shapes import Drawing, Path
-from reportlab.pdfgen import canvas
-
-import io
-import os
-import smtplib
-import ssl
-from datetime import datetime, time, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.image import MIMEImage
-from email.mime.base import MIMEBase
-from email import encoders
+from datetime import datetime
 from email.utils import parseaddr
-from urllib import request as urllib_request
-from urllib.parse import quote, urlsplit
-from xml.etree import ElementTree
+from PIL import Image
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 
-app = FastAPI(title="Tensegrity Terminal API", version="12.3")
+app = FastAPI(title="Tensegrity Terminal API", version="12.5")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -54,6 +32,7 @@ FOREX_PAIRS = {
 FOREX_FALLBACK_RATES = {"EUR/CZK": 25.0, "USD/CZK": 23.0, "GBP/CZK": 29.0}
 LOGO_PATH = os.path.join(STATIC_DIR, "logo.png")
 
+
 def get_logo_bytes():
     if not os.path.exists(LOGO_PATH):
         return None
@@ -63,6 +42,7 @@ def get_logo_bytes():
         output = io.BytesIO()
         mark.save(output, format="PNG")
         return output.getvalue()
+
 
 def get_live_forex_rates():
     rates = {}
@@ -83,22 +63,11 @@ def get_live_forex_rates():
         "updated_at": datetime.now().astimezone().isoformat(timespec="minutes")
     }
 
-def format_exchange_rate(value):
-    try:
-        return f"{float(value):.2f}"
-    except (TypeError, ValueError):
-        return escape(str(value))
 
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", os.getenv("SMTP_USER", "kubenkamatyas@gmail.com"))
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD", os.getenv("SMTP_PASSWORD", ""))
 SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.json")
 
-def get_smtp_config():
-    username = (os.getenv("SENDER_EMAIL") or os.getenv("SMTP_USER") or SENDER_EMAIL).strip()
-    password = (os.getenv("SENDER_PASSWORD") or os.getenv("SMTP_PASSWORD") or SENDER_PASSWORD).replace(" ", "")
-    if not username or not password:
-        return None
-    return {"host": "smtp.gmail.com", "port": 465, "username": username, "password": password}
 
 def get_subscribers():
     if not os.path.exists(SUBSCRIBERS_FILE):
@@ -111,6 +80,7 @@ def get_subscribers():
         return [item.strip() for item in data if isinstance(item, str) and item.strip()]
     except (OSError, json.JSONDecodeError):
         return []
+
 
 def save_subscriber(email: str):
     normalized = email.strip()
@@ -126,15 +96,21 @@ def save_subscriber(email: str):
     os.replace(temporary_path, SUBSCRIBERS_FILE)
     return True
 
+
 def is_valid_email_address(email: str) -> bool:
     if not isinstance(email, str) or len(email) > 254:
         return False
     parsed = parseaddr(email)
     return parsed[1] == email and bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email))
 
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
-    return FileResponse(os.path.join(STATIC_DIR, "logo.png"))
+    logo_file = os.path.join(STATIC_DIR, "logo.png")
+    if os.path.exists(logo_file):
+        return FileResponse(logo_file)
+    raise HTTPException(status_code=404, detail="Favicon nenalezen.")
+
 
 @app.api_route("/subscribe", methods=["GET", "POST"])
 async def handle_subscribe(request: Request, email: str = Query("")):
@@ -150,11 +126,12 @@ async def handle_subscribe(request: Request, email: str = Query("")):
     created = save_subscriber(candidate)
     return {
         "status": "ok",
-        "message": "Odběr byl uložen." if created else "Tato adresa je již přihlášena.",
+        "message": "Odběr investičního bulletinu byl úspěšně uložen." if created else "Tato e-mailová adresa je již k odběru přihlášena.",
         "already_subscribed": not created,
     }
 
-@app.get("/", response_class=HTMLResponse) 
+
+@app.get("/", response_class=HTMLResponse)
 def read_root():
     return """<!DOCTYPE html>
 <html lang="cs">
@@ -163,7 +140,7 @@ def read_root():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tensegrity Terminal | Institucionální Valuační Platforma</title>
     <link rel="icon" type="image/png" href="/favicon.ico">
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
             --bg-main: #060911;
@@ -176,6 +153,7 @@ def read_root():
             --text-secondary: #94a3b8;
             --text-muted: #64748b;
             --success: #10b981;
+            --warning: #f59e0b;
             --danger: #ef4444;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -220,6 +198,25 @@ def read_root():
         .btn-primary:hover { opacity: 0.95; transform: translateY(-1px); }
         .btn-excel { background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: #34d399; }
         .btn-pdf { background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); color: #f87171; }
+        .btn-news { background: rgba(148, 163, 184, 0.12); border: 1px solid var(--border-subtle); color: var(--text-primary); }
+        .btn-news:hover { border-color: var(--accent-blue); color: var(--accent-blue); }
+
+        .modal-backdrop {
+            display: none; position: fixed; inset: 0; background: rgba(4, 7, 15, 0.82);
+            backdrop-filter: blur(6px); z-index: 999; align-items: center; justify-content: center; padding: 20px;
+        }
+        .modal-backdrop.open { display: flex; }
+        .modal-box {
+            background: #0f1625; border: 1px solid var(--border-subtle); border-radius: 16px;
+            max-width: 720px; width: 100%; padding: 28px; box-shadow: 0 20px 50px rgba(0,0,0,0.7);
+            max-height: 85vh; overflow-y: auto;
+        }
+        .news-item { padding: 14px 0; border-bottom: 1px solid var(--border-subtle); }
+        .news-item:last-child { border-bottom: none; }
+        .news-item a { color: var(--accent-blue); text-decoration: none; font-weight: 600; font-size: 14px; line-height: 1.4; display: block; }
+        .news-item a:hover { text-decoration: underline; }
+        .news-meta { font-size: 11px; color: var(--text-muted); margin-top: 5px; font-family: 'JetBrains Mono', monospace; }
+
         .scenario-bar {
             display: flex; align-items: center; flex-wrap: wrap; gap: 16px 24px;
             background: var(--bg-card); border: 1px solid var(--border-subtle);
@@ -253,7 +250,7 @@ def read_root():
         .valuation-status { display: inline-flex; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
         .valuation-status.undervalued { color: #34d399; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); }
         .valuation-status.overvalued { color: #f87171; background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); }
-        .valuation-status.neutral { color: var(--text-secondary); background: rgba(148, 163, 184, 0.1); border: 1px solid var(--border-subtle); }
+        .valuation-status.neutral { color: #fbbf24; background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.3); }
         .thesis-layout { display: grid; grid-template-columns: auto 1fr; gap: 24px; align-items: center; }
         .traffic-lights { display: flex; gap: 10px; padding: 12px; border: 1px solid var(--border-subtle); border-radius: 999px; background: rgba(6, 9, 17, 0.65); }
         .traffic-light { width: 18px; aspect-ratio: 1; border-radius: 50%; opacity: 0.22; }
@@ -261,6 +258,36 @@ def read_root():
         .traffic-light.green { color: #10b981; background: #10b981; }
         .traffic-light.orange { color: #f59e0b; background: #f59e0b; }
         .traffic-light.red { color: #ef4444; background: #ef4444; }
+
+        /* Cenová pásma (Zelená / Žlutooranžová / Červená) */
+        .price-summary-strip {
+            display: flex; flex-wrap: wrap; gap: 20px; align-items: center; justify-content: space-between;
+            padding: 14px 18px; border-radius: 12px; background: rgba(6, 9, 17, 0.65);
+            border: 1px solid var(--border-subtle); margin-bottom: 18px;
+        }
+        .price-pill { display: flex; flex-direction: column; gap: 4px; }
+        .price-pill-label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.8px; }
+        .price-pill-val { font-family: 'JetBrains Mono', monospace; font-size: 18px; font-weight: 700; color: #fff; }
+        .zones-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+        .zone-box {
+            padding: 16px 20px; border-radius: 12px; border: 1px solid var(--border-subtle);
+            background: rgba(6, 9, 17, 0.55); transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .zone-box.active-zone { transform: translateY(-2px); }
+        .zone-green { border-color: rgba(16, 185, 129, 0.35); background: rgba(16, 185, 129, 0.07); }
+        .zone-green.active-zone { border-color: #10b981; box-shadow: 0 0 22px rgba(16, 185, 129, 0.22); }
+        .zone-yellow { border-color: rgba(245, 158, 11, 0.35); background: rgba(245, 158, 11, 0.07); }
+        .zone-yellow.active-zone { border-color: #f59e0b; box-shadow: 0 0 22px rgba(245, 158, 11, 0.22); }
+        .zone-red { border-color: rgba(239, 68, 68, 0.35); background: rgba(239, 68, 68, 0.07); }
+        .zone-red.active-zone { border-color: #ef4444; box-shadow: 0 0 22px rgba(239, 68, 68, 0.22); }
+        .zone-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+        .zone-green .zone-title { color: #34d399; }
+        .zone-yellow .zone-title { color: #fbbf24; }
+        .zone-red .zone-title { color: #f87171; }
+        .zone-range { font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 700; color: var(--text-primary); margin-bottom: 6px; }
+        .zone-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.45; }
+        .zone-tag { font-size: 10px; padding: 2px 7px; border-radius: 999px; background: rgba(255,255,255,0.12); color: #fff; font-family: 'JetBrains Mono', monospace; }
+
         .advisor-thread { display: grid; gap: 12px; margin: 16px 0; max-height: 350px; overflow-y: auto; padding-right: 8px; }
         .advisor-message { padding: 12px 16px; border-left: 3px solid var(--accent-blue); background: rgba(56, 189, 248, 0.05); color: var(--text-secondary); font-size: 13px; line-height: 1.6; white-space: pre-wrap; border-radius: 0 8px 8px 0; }
         .advisor-message.user-message { border-color: var(--success); background: rgba(16, 185, 129, 0.05); }
@@ -293,6 +320,7 @@ def read_root():
                 <button class="btn btn-primary" onclick="loadValuation()">Analyzovat</button>
                 <button class="btn btn-excel" onclick="downloadExcel()">Excel Model</button>
                 <button class="btn btn-pdf" onclick="downloadPDF()">PDF Report</button>
+                <button class="btn btn-news" onclick="openNewsletterModal()">Newsletter &amp; News Feed</button>
             </div>
         </header>
 
@@ -314,7 +342,7 @@ def read_root():
 
         <section class="card matrix-card" id="investmentThesis">
             <div class="card-header">
-                <span class="card-title">Investiční Semafor & Thesis</span>
+                <span class="card-title">Investiční Semafor &amp; Thesis</span>
                 <span class="badge" id="thesisTicker">AAPL</span>
             </div>
             <div class="thesis-layout">
@@ -326,6 +354,53 @@ def read_root():
                 <div>
                     <p class="metric-value" id="thesisRecommendation">Načítám analýzu...</p>
                     <p class="plain-guide" id="thesisSummary">Komplexní vyhodnocení pozice společnosti vůči trhu a modelu valuace.</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="card matrix-card" id="priceZonesSection">
+            <div class="card-header">
+                <span class="card-title">Valuační Cenová Pásma Akcie (Aktuální cena vs. Intervaly)</span>
+                <span class="badge" id="zonesTicker">AAPL</span>
+            </div>
+            <div class="price-summary-strip">
+                <div class="price-pill">
+                    <span class="price-pill-label">Aktuální tržní cena akcie</span>
+                    <span class="price-pill-val" id="currentStockPrice">-</span>
+                </div>
+                <div class="price-pill">
+                    <span class="price-pill-label">Střední vnitřní hodnota (DCF)</span>
+                    <span class="price-pill-val" style="color: var(--accent-blue);" id="fairValueCenter">-</span>
+                </div>
+                <div class="price-pill">
+                    <span class="price-pill-label">Aktuální pásmo</span>
+                    <span class="valuation-status neutral" id="currentZoneBadge">-</span>
+                </div>
+            </div>
+            <div class="zones-grid">
+                <div class="zone-box zone-green" id="zoneGreenCard">
+                    <div class="zone-title">
+                        <span>Zelené pásmo (Podhodnoceno)</span>
+                        <span class="zone-tag" id="zoneGreenTag" style="display:none;">AKTUÁLNÍ CENA</span>
+                    </div>
+                    <div class="zone-range" id="zoneGreenRange">-</div>
+                    <div class="zone-desc">Bezpečnostní marže $\ge 15\ \%$ pod vnitřní hodnotou DCF (atraktivní valuace).</div>
+                </div>
+                <div class="zone-box zone-yellow" id="zoneYellowCard">
+                    <div class="zone-title">
+                        <span>Žlutooranžové pásmo (Fair Value)</span>
+                        <span class="zone-tag" id="zoneYellowTag" style="display:none;">AKTUÁLNÍ CENA</span>
+                    </div>
+                    <div class="zone-range" id="zoneYellowRange">-</div>
+                    <div class="zone-desc">Neutrální koridor $\pm 15\ \%$ kolem odhadované reálné hodnoty akcie.</div>
+                </div>
+                <div class="zone-box zone-red" id="zoneRedCard">
+                    <div class="zone-title">
+                        <span>Červené pásmo (Nadhodnoceno)</span>
+                        <span class="zone-tag" id="zoneRedTag" style="display:none;">AKTUÁLNÍ CENA</span>
+                    </div>
+                    <div class="zone-range" id="zoneRedRange">-</div>
+                    <div class="zone-desc">Tržní cena přesahuje vnitřní hodnotu o více než $15\ \%$ (zvýšené valuační riziko).</div>
                 </div>
             </div>
         </section>
@@ -360,7 +435,7 @@ def read_root():
                 <div class="metric-row"><span class="metric-label">Výstupní Equity:</span><span class="metric-value" id="lboOutEq">-</span></div>
                 <div class="metric-row"><span class="metric-label">MOIC:</span><span class="metric-value highlight" id="lboMoic">-</span></div>
                 <div class="metric-row"><span class="metric-label">IRR:</span><span class="metric-value highlight" id="lboIrr">-</span></div>
-                <p class="plain-guide">Model odkupu za cizi kapitál s 5letým horizontem a splácením dluhu.</p>
+                <p class="plain-guide">Model odkupu za cizí kapitál s 5letým horizontem a splácením dluhu.</p>
             </div>
         </div>
 
@@ -422,10 +497,30 @@ def read_root():
         </div>
     </div>
 
+    <div class="modal-backdrop" id="newsletterModal" onclick="if(event.target===this) closeNewsletterModal()">
+        <div class="modal-box">
+            <div class="card-header">
+                <span class="card-title">Newsletter &amp; Tržní Zprávy (<span id="newsModalTicker">AAPL</span>)</span>
+                <button class="btn btn-news" style="padding: 4px 10px;" onclick="closeNewsletterModal()">✕</button>
+            </div>
+            <form class="advisor-form" style="margin-bottom: 18px;" onsubmit="subscribeNewsletter(event)">
+                <input id="subscribeEmailInput" type="email" placeholder="Zadejte e-mail pro odběr investičního bulletinu..." required>
+                <button class="btn btn-primary" type="submit">Odebírat</button>
+            </form>
+            <div id="subscribeStatus" style="font-size: 12px; color: var(--success); margin-bottom: 12px;"></div>
+            <div id="newsFeedList">Načítám zprávy...</div>
+        </div>
+    </div>
+
     <script>
         function formatCurrency(val) {
             if (val === null || val === undefined || isNaN(val)) return 'N/A';
-            return Number(val).toLocaleString(undefined, {maximumFractionDigits: 2}) + ' USD';
+            return Number(val).toLocaleString('cs-CZ', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' USD';
+        }
+
+        function formatLargeCurrency(val) {
+            if (val === null || val === undefined || isNaN(val)) return 'N/A';
+            return Number(val).toLocaleString('cs-CZ', { maximumFractionDigits: 2 }) + ' USD';
         }
 
         async function loadForexRates() {
@@ -444,6 +539,64 @@ def read_root():
             }
         }
 
+        function renderPriceZones(currentPrice, intrinsicValue) {
+            const curEl = document.getElementById('currentStockPrice');
+            const fairEl = document.getElementById('fairValueCenter');
+            const badgeEl = document.getElementById('currentZoneBadge');
+
+            const greenCard = document.getElementById('zoneGreenCard');
+            const yellowCard = document.getElementById('zoneYellowCard');
+            const redCard = document.getElementById('zoneRedCard');
+            const greenTag = document.getElementById('zoneGreenTag');
+            const yellowTag = document.getElementById('zoneYellowTag');
+            const redTag = document.getElementById('zoneRedTag');
+
+            [greenCard, yellowCard, redCard].forEach(c => c.classList.remove('active-zone'));
+            [greenTag, yellowTag, redTag].forEach(t => t.style.display = 'none');
+
+            curEl.textContent = currentPrice ? formatCurrency(currentPrice) : 'N/A';
+            fairEl.textContent = (intrinsicValue && intrinsicValue > 0) ? formatCurrency(intrinsicValue) : 'N/A';
+
+            if (!intrinsicValue || intrinsicValue <= 0) {
+                document.getElementById('zoneGreenRange').textContent = 'N/A';
+                document.getElementById('zoneYellowRange').textContent = 'N/A';
+                document.getElementById('zoneRedRange').textContent = 'N/A';
+                badgeEl.className = 'valuation-status neutral';
+                badgeEl.textContent = 'Nelze stanovit';
+                return;
+            }
+
+            const lowerBound = intrinsicValue * 0.85;
+            const upperBound = intrinsicValue * 1.15;
+
+            document.getElementById('zoneGreenRange').textContent = '0,00 – ' + formatCurrency(lowerBound);
+            document.getElementById('zoneYellowRange').textContent = formatCurrency(lowerBound) + ' – ' + formatCurrency(upperBound);
+            document.getElementById('zoneRedRange').textContent = 'nad ' + formatCurrency(upperBound);
+
+            if (!currentPrice || currentPrice <= 0) {
+                badgeEl.className = 'valuation-status neutral';
+                badgeEl.textContent = 'Cena nedostupná';
+                return;
+            }
+
+            if (currentPrice <= lowerBound) {
+                greenCard.classList.add('active-zone');
+                greenTag.style.display = 'inline-block';
+                badgeEl.className = 'valuation-status undervalued';
+                badgeEl.textContent = 'Zelené pásmo (Podhodnoceno)';
+            } else if (currentPrice <= upperBound) {
+                yellowCard.classList.add('active-zone');
+                yellowTag.style.display = 'inline-block';
+                badgeEl.className = 'valuation-status neutral';
+                badgeEl.textContent = 'Žlutooranžové pásmo (Fair Value)';
+            } else {
+                redCard.classList.add('active-zone');
+                redTag.style.display = 'inline-block';
+                badgeEl.className = 'valuation-status overvalued';
+                badgeEl.textContent = 'Červené pásmo (Nadhodnoceno)';
+            }
+        }
+
         async function loadValuation() {
             const ticker = (document.getElementById('tickerInput').value || 'AAPL').trim().toUpperCase();
             const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
@@ -459,25 +612,28 @@ def read_root():
 
                 document.getElementById('tickerInput').value = data.spolecnost;
                 document.getElementById('thesisTicker').textContent = data.spolecnost;
+                document.getElementById('zonesTicker').textContent = data.spolecnost;
                 document.getElementById('valTicker').textContent = data.spolecnost;
 
-                document.getElementById('valCap').textContent = formatCurrency(data.trzni_kapitalizace);
-                document.getElementById('valDebt').textContent = formatCurrency(data.celkovy_dluh);
-                document.getElementById('valEV').textContent = formatCurrency(data.celkova_hodnota_podniku);
+                document.getElementById('valCap').textContent = formatLargeCurrency(data.trzni_kapitalizace);
+                document.getElementById('valDebt').textContent = formatLargeCurrency(data.celkovy_dluh);
+                document.getElementById('valEV').textContent = formatLargeCurrency(data.celkova_hodnota_podniku);
 
-                document.getElementById('sotpEV').textContent = formatCurrency(data.metoda_souctu_casti.vypoctena_hodnota_podniku);
-                document.getElementById('sotpEquity').textContent = formatCurrency(data.metoda_souctu_casti.vypoctena_hodnota_vlastniho_kapitalu);
+                document.getElementById('sotpEV').textContent = formatLargeCurrency(data.metoda_souctu_casti.vypoctena_hodnota_podniku);
+                document.getElementById('sotpEquity').textContent = formatLargeCurrency(data.metoda_souctu_casti.vypoctena_hodnota_vlastniho_kapitalu);
 
                 const lbo = data.model_odkupu_za_cizi_kapital_base_case;
-                document.getElementById('lboInEq').textContent = formatCurrency(lbo.vstupni_vlastni_kapital);
-                document.getElementById('lboOutEq').textContent = formatCurrency(lbo.vystupni_hodnota_vlastniho_kapitalu);
+                document.getElementById('lboInEq').textContent = formatLargeCurrency(lbo.vstupni_vlastni_kapital);
+                document.getElementById('lboOutEq').textContent = formatLargeCurrency(lbo.vystupni_hodnota_vlastniho_kapitalu);
                 document.getElementById('lboMoic').textContent = lbo.moic + 'x';
                 document.getElementById('lboIrr').textContent = lbo.irr_procent + ' %';
 
                 const dcf = data.dcf_valuation;
                 document.getElementById('dcfIntrinsicValue').textContent = formatCurrency(dcf.intrinsic_value_per_share);
                 document.getElementById('dcfWacc').textContent = (dcf.wacc * 100).toFixed(2) + ' %';
-                document.getElementById('dcfTerminalValue').textContent = formatCurrency(dcf.terminal_value);
+                document.getElementById('dcfTerminalValue').textContent = formatLargeCurrency(dcf.terminal_value);
+
+                renderPriceZones(dcf.current_share_price, dcf.intrinsic_value_per_share);
 
                 const statusEl = document.getElementById('dcfValuationStatus');
                 const upside = dcf.upside_downside_percent;
@@ -495,25 +651,31 @@ def read_root():
                 else if (upside !== null && upside <= -15) color = 'red';
                 document.getElementById('thesis' + color.charAt(0).toUpperCase() + color.slice(1)).classList.add('active');
                 document.getElementById('thesisRecommendation').textContent = upside >= 15 ? 'Model indikuje silné podhodnocení' : upside <= -15 ? 'Model indikuje nadhodnocení' : 'Model v neutrálním pásmu Fair Value';
-                document.getElementById('thesisSummary').textContent = 'DCF hodnota ' + formatCurrency(dcf.intrinsic_value_per_share) + ' proti trhu. Výsledek závisí na WACC ' + (dcf.wacc*100).toFixed(2) + '% a exit násobku ' + exitMult + 'x.';
+                document.getElementById('thesisSummary').textContent = 'DCF hodnota ' + formatCurrency(dcf.intrinsic_value_per_share) + ' proti aktuální tržní ceně ' + formatCurrency(dcf.current_share_price) + '. Výsledek závisí na WACC ' + (dcf.wacc * 100).toFixed(2) + ' % a exit násobku ' + exitMult + 'x.';
 
                 document.getElementById('peerSector').textContent = data.peer_comps.sector || 'Sektor';
                 let peerHtml = '<table><thead><tr><th>Metoda</th><th>Násobek</th><th>Forward Metrika</th><th>Implikovaná cena / akcii</th></tr></thead><tbody>';
                 (data.peer_comps.multiples || []).forEach(p => {
-                    peerHtml += '<tr><td>' + p.method + '</td><td>' + p.multiple + 'x</td><td>' + formatCurrency(p.forward_metric) + '</td><td>' + (p.implied_share_price ? formatCurrency(p.implied_share_price) : 'N/A') + '</td></tr>';
+                    peerHtml += '<tr><td>' + p.method + '</td><td>' + p.multiple + 'x</td><td>' + formatLargeCurrency(p.forward_metric) + '</td><td>' + (p.implied_share_price ? formatCurrency(p.implied_share_price) : 'N/A') + '</td></tr>';
                 });
                 peerHtml += '</tbody></table>';
                 document.getElementById('peerCompsContainer').innerHTML = peerHtml;
 
                 let schedHtml = '<table><thead><tr><th>Rok</th><th>EBITDA</th><th>FCF</th><th>Splátka jistiny</th><th>Zůstatek dluhu</th></tr></thead><tbody>';
                 (data.projektovane_roky || []).forEach(y => {
-                    schedHtml += '<tr><td>Rok ' + y.rok + '</td><td>' + formatCurrency(y.projektovany_provozni_zisk_pred_odpisy) + '</td><td>' + formatCurrency(y.volny_tok_pro_splaceni) + '</td><td>' + formatCurrency(y.mor_jistiny) + '</td><td>' + formatCurrency(y.zbyvajici_cizi_kapital) + '</td></tr>';
+                    schedHtml += '<tr><td>Rok ' + y.rok + '</td><td>' + formatLargeCurrency(y.projektovany_provozni_zisk_pred_odpisy) + '</td><td>' + formatLargeCurrency(y.volny_tok_pro_splaceni) + '</td><td>' + formatLargeCurrency(y.mor_jistiny) + '</td><td>' + formatLargeCurrency(y.zbyvajici_cizi_kapital) + '</td></tr>';
                 });
                 schedHtml += '</tbody></table>';
                 document.getElementById('lboScheduleContainer').innerHTML = schedHtml;
 
                 const matrix = data.citlivostni_matice_lbo_irr || [];
-                const multiHeader = [11.0, 12.0, 13.5, 15.0, 16.5];
+                const multiHeader = [
+                    Math.max(0.1, exitMult - 2.5),
+                    Math.max(0.1, exitMult - 1.5),
+                    exitMult,
+                    exitMult + 1.5,
+                    exitMult + 3.0
+                ];
                 let matHtml = '<table><thead><tr><th>Růst EBITDA / Násobek</th>' + multiHeader.map(m => '<th>' + m.toFixed(1) + 'x</th>').join('') + '</tr></thead><tbody>';
                 matrix.forEach(row => {
                     matHtml += '<tr><td><strong>' + row.tempo_rustu_ebitda_procent + '%</strong></td>';
@@ -587,6 +749,56 @@ def read_root():
             window.location.href = '/api/export/pdf/' + encodeURIComponent(ticker) + '?leverage=' + leverage + '&growth=' + growth + '&exit_mult=' + exitMult;
         }
 
+        async function openNewsletterModal() {
+            const ticker = (document.getElementById('tickerInput').value || 'AAPL').trim().toUpperCase();
+            document.getElementById('newsModalTicker').textContent = ticker;
+            document.getElementById('newsletterModal').classList.add('open');
+            const listEl = document.getElementById('newsFeedList');
+            listEl.innerHTML = '<div style="text-align:center;padding:20px;"><div class="loader"></div></div>';
+            try {
+                const res = await fetch('/api/news/' + encodeURIComponent(ticker));
+                const data = await res.json();
+                if (!data.articles || data.articles.length === 0) {
+                    listEl.innerHTML = '<p class="plain-guide">Pro tento ticker nejsou momentálně dostupné žádné zprávy.</p>';
+                    return;
+                }
+                listEl.innerHTML = data.articles.map(a =>
+                    `<div class="news-item"><a href="${a.url}" target="_blank" rel="noopener">${a.title}</a><div class="news-meta">${a.source}</div></div>`
+                ).join('');
+            } catch (err) {
+                listEl.innerHTML = '<p class="plain-guide">Nepodařilo se načíst zprávy.</p>';
+            }
+        }
+
+        function closeNewsletterModal() {
+            document.getElementById('newsletterModal').classList.remove('open');
+        }
+
+        async function subscribeNewsletter(e) {
+            e.preventDefault();
+            const emailInput = document.getElementById('subscribeEmailInput');
+            const statusEl = document.getElementById('subscribeStatus');
+            try {
+                const res = await fetch('/subscribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email: emailInput.value.trim() })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Chyba při registraci.');
+                statusEl.style.color = '#34d399';
+                statusEl.textContent = data.message;
+                emailInput.value = '';
+            } catch (err) {
+                statusEl.style.color = '#f87171';
+                statusEl.textContent = err.message;
+            }
+        }
+
+        document.getElementById('tickerInput').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') loadValuation();
+        });
+
         document.addEventListener('DOMContentLoaded', () => {
             loadForexRates();
             loadValuation();
@@ -595,6 +807,7 @@ def read_root():
 </body>
 </html>
 """
+
 
 def run_valuation_logic(
     ticker: str,
@@ -804,6 +1017,7 @@ def run_valuation_logic(
         "citlivostni_matice_lbo_irr": citlivostni_matice_irr
     }
 
+
 @app.get("/api/valuation/{ticker}")
 def get_institutional_terminal_valuation(
     ticker: str,
@@ -815,6 +1029,7 @@ def get_institutional_terminal_valuation(
         return run_valuation_logic(ticker, leverage, growth, exit_mult)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/advisor/{ticker}")
 async def ask_terminal_advisor(ticker: str, request: Request):
@@ -829,16 +1044,46 @@ async def ask_terminal_advisor(ticker: str, request: Request):
             raise HTTPException(status_code=422, detail="Zadejte otázku.")
         data = run_valuation_logic(ticker, leverage, growth, exit_mult)
         api_key = os.getenv("OPENAI_API_KEY")
-        answer = f"Tensegrity Terminal AI Advisor: Společnost {data['spolecnost']} má Enterprise Value {data['celkova_hodnota_podniku']:,.2f} USD a tržní kapitalizaci {data['trzni_kapitalizace']:,.2f} USD. Na váš dotaz ('{question}') odpovídám: Model zohledňuje WACC {data['dcf_valuation']['wacc']*100:.2f}% a 5letý LBO horizont."
+        dcf = data["dcf_valuation"]
+        answer = (
+            f"Tensegrity Terminal AI Advisor: Společnost {data['spolecnost']} má Enterprise Value "
+            f"{data['celkova_hodnota_podniku']:,.2f} USD, tržní kapitalizaci {data['trzni_kapitalizace']:,.2f} USD "
+            f"a vnitřní DCF hodnotu {dcf['intrinsic_value_per_share']:,.2f} USD na akcii (oproti tržní ceně "
+            f"{dcf['current_share_price'] or 'N/A'} USD). Na váš dotaz ('{question}') odpovídám: "
+            f"Model pracuje s WACC {dcf['wacc']*100:.2f} % a 5letým LBO horizontem."
+        )
         return {"answer": answer, "used_llm": bool(api_key)}
     except HTTPException:
         raise
     except Exception as error:
         raise HTTPException(status_code=400, detail=str(error))
 
+
+@app.get("/api/news/{ticker}")
+def get_ticker_news(ticker: str):
+    try:
+        raw_news = yf.Ticker(ticker).news or []
+        articles = []
+        for item in raw_news[:8]:
+            content = item.get("content", item) if isinstance(item, dict) else {}
+            if not isinstance(content, dict):
+                continue
+            provider = content.get("provider", {})
+            clickthrough = content.get("clickThroughUrl") or content.get("canonicalUrl") or {}
+            articles.append({
+                "title": content.get("title") or item.get("title") or "Bez názvu",
+                "source": provider.get("displayName") or item.get("publisher") or "Zdroj neuveden",
+                "url": clickthrough.get("url") or item.get("link") or "#"
+            })
+        return {"ticker": ticker.upper(), "articles": articles}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/forex-rates")
 async def get_forex_rates():
     return await asyncio.to_thread(get_live_forex_rates)
+
 
 @app.get("/api/export/excel/{ticker}")
 def export_valuation_excel(
@@ -858,19 +1103,22 @@ def export_valuation_excel(
         ws.append(["Ukazatel", "Hodnota (USD)"])
         ws.append(["Tržní kapitalizace", data["trzni_kapitalizace"]])
         ws.append(["Celkový dluh", data["celkovy_dluh"]])
-        ws.append(["Celková hodnota podniku", data["celkova_hodnota_podniku"]])
-        
+        ws.append(["Celková hodnota podniku (EV)", data["celkova_hodnota_podniku"]])
+        ws.append(["DCF vnitřní hodnota / akcii", data["dcf_valuation"]["intrinsic_value_per_share"]])
+        ws.append(["Aktuální tržní cena / akcii", data["dcf_valuation"]["current_share_price"]])
+
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
         filename = f"Tensegrity_Valuation_{data['spolecnost']}.xlsx"
         return StreamingResponse(
-            output, 
+            output,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             headers={"Content-Disposition": f"attachment; filename={filename}"}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/export/pdf/{ticker}")
 def export_valuation_pdf(
@@ -881,6 +1129,7 @@ def export_valuation_pdf(
 ):
     try:
         data = run_valuation_logic(ticker, leverage, growth, exit_mult)
+        dcf = data["dcf_valuation"]
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=35, leftMargin=35, topMargin=35, bottomMargin=45)
         styles = getSampleStyleSheet()
@@ -889,7 +1138,9 @@ def export_valuation_pdf(
             Spacer(1, 10),
             Paragraph(f"Enterprise Value: {data['celkova_hodnota_podniku']:,.0f} USD", styles['Normal']),
             Paragraph(f"Market Cap: {data['trzni_kapitalizace']:,.0f} USD", styles['Normal']),
-            Paragraph(f"Total Debt: {data['celkovy_dluh']:,.0f} USD", styles['Normal'])
+            Paragraph(f"Total Debt: {data['celkovy_dluh']:,.0f} USD", styles['Normal']),
+            Paragraph(f"DCF Intrinsic Value / Share: {dcf['intrinsic_value_per_share'] or 'N/A'} USD", styles['Normal']),
+            Paragraph(f"Current Share Price: {dcf['current_share_price'] or 'N/A'} USD", styles['Normal'])
         ]
         doc.build(elements)
         buffer.seek(0)
