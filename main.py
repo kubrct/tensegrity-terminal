@@ -140,19 +140,119 @@ def get_live_market_benchmarks() -> dict:
     return {"us10y_yield": us10y, "sp500_pe": sp500_pe}
 
 
+_CNB_CACHE: dict = {"expires_at": None, "data": None}
+
+
+def _format_cz_percent(val: float, decimals: int = 2) -> str:
+    return f"{val:.{decimals}f}".replace(".", ",") + " %"
+
+
 def get_cnb_macro_indicators() -> dict:
-    return {
-        "repo_rate": "3,50 %",
-        "discount_rate": "2,50 %",
-        "lombard_rate": "4,50 %",
-        "latest_inflation": "2,4 %",
+    from datetime import datetime, timedelta, timezone
+    import re
+    import urllib.request
+
+    now = datetime.now(timezone.utc)
+    if _CNB_CACHE["data"] is not None and _CNB_CACHE["expires_at"] is not None and now < _CNB_CACHE["expires_at"]:
+        return _CNB_CACHE["data"]
+
+    repo_val = 4.00
+    discount_val = 3.00
+    lombard_val = 5.00
+    inflation_val = 2.4
+
+    urls = [
+        "https://www.cnb.cz/cs/menova-politika/",
+        "https://www.cnb.cz/cs/",
+        "https://www.cnb.cz/cs/casto-kladene-otazky/Jak-se-vyvijela-dvoutydenni-repo-sazba-CNB/",
+    ]
+    combined_text = ""
+    for page_url in urls:
+        try:
+            req = urllib.request.Request(
+                page_url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; TensegrityTerminal/2.1)"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                raw_html = resp.read().decode("utf-8", errors="ignore")
+            plain_text = re.sub(r"<[^>]+>", " ", raw_html)
+            plain_text = re.sub(r"\s+", " ", plain_text)
+            combined_text += " " + plain_text
+        except Exception:
+            pass
+
+    if combined_text:
+        repo_match = re.search(
+            r"(?:2T\s+repo\s+sazba|dvoutýdenní\s+repo\s+sazba)[^\d]{0,90}(\d+[,.]\d+)\s*%",
+            combined_text,
+            flags=re.IGNORECASE,
+        )
+        if repo_match:
+            try:
+                parsed_repo = float(repo_match.group(1).replace(",", "."))
+                if 0.0 <= parsed_repo <= 25.0:
+                    repo_val = parsed_repo
+                    discount_val = max(0.0, round(repo_val - 1.0, 2))
+                    lombard_val = round(repo_val + 1.0, 2)
+            except ValueError:
+                pass
+
+        disc_match = re.search(
+            r"diskontní\s+sazba[^\d]{0,90}(\d+[,.]\d+)\s*%",
+            combined_text,
+            flags=re.IGNORECASE,
+        )
+        if disc_match:
+            try:
+                parsed_disc = float(disc_match.group(1).replace(",", "."))
+                if 0.0 <= parsed_disc <= 25.0:
+                    discount_val = parsed_disc
+            except ValueError:
+                pass
+
+        lomb_match = re.search(
+            r"lombardní\s+sazba[^\d]{0,90}(\d+[,.]\d+)\s*%",
+            combined_text,
+            flags=re.IGNORECASE,
+        )
+        if lomb_match:
+            try:
+                parsed_lomb = float(lomb_match.group(1).replace(",", "."))
+                if 0.0 <= parsed_lomb <= 25.0:
+                    lombard_val = parsed_lomb
+            except ValueError:
+                pass
+
+        for infl_match in re.finditer(
+            r"inflace[^\d%]{0,90}(\d+[,.]\d+)\s*%",
+            combined_text,
+            flags=re.IGNORECASE,
+        ):
+            context_around = combined_text[max(0, infl_match.start() - 25) : infl_match.end()].lower()
+            if "cíl" not in context_around:
+                try:
+                    parsed_infl = float(infl_match.group(1).replace(",", "."))
+                    if -5.0 <= parsed_infl <= 30.0:
+                        inflation_val = parsed_infl
+                        break
+                except ValueError:
+                    pass
+
+    result = {
+        "repo_rate": _format_cz_percent(repo_val, 2),
+        "discount_rate": _format_cz_percent(discount_val, 2),
+        "lombard_rate": _format_cz_percent(lombard_val, 2),
+        "latest_inflation": _format_cz_percent(inflation_val, 1),
         "inflation_target": "2,0 % (toleranční pásmo 1,0 % až 3,0 %)",
         "outlook": (
-            "Bankovní rada České národní banky vyhodnocuje proinflační rizika ve službách, mzdové dynamice "
-            "a vývoji cen nemovitostí jako důvod pro velmi obezřetné další kroky měnové politiky. "
-            "Tržní výhled naznačuje stabilitu základních sazeb v nejbližších čtvrtletích s důrazem na ukotvená inflační očekávání."
+            "Bankovní rada České národní banky průběžně vyhodnocuje proinflační rizika ve službách, mzdové dynamice "
+            "a vývoji cen nemovitostí při nastavování měnových podmínek. "
+            "Další kroky centrální banky se odvíjejí od nových makroekonomických prognóz a vývoje jádrové inflace."
         ),
     }
+    _CNB_CACHE["data"] = result
+    _CNB_CACHE["expires_at"] = now + timedelta(minutes=30)
+    return result
 
 
 def get_live_forex_rates() -> dict:
@@ -332,7 +432,7 @@ def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: d
         {
             "badge": "ČESKÁ NÁRODNÍ BANKA | MĚNOVÁ POLITIKA",
             "badge_color": "#f59e0b",
-            "title": "1. Česká národní banka drží repo sazbu na 3,50 % a sleduje inflaci na úrovni 2,4 %",
+            "title": f"1. Česká národní banka nastavila základní dvoutýdenní repo sazbu na {cnb['repo_rate']} při inflaci {cnb['latest_inflation']}",
             "body": (
                 f"Bankovní rada České národní banky udržuje základní dvoutýdenní repo sazbu na úrovni {cnb['repo_rate']}, "
                 f"diskontní sazbu na {cnb['discount_rate']} a lombardní sazbu na {cnb['lombard_rate']}. Nejnovější meziroční "
