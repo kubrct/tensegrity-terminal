@@ -147,8 +147,58 @@ def _format_cz_percent(val: float, decimals: int = 2) -> str:
     return f"{val:.{decimals}f}".replace(".", ",") + " %"
 
 
+def _extract_html_tables(raw_html: str) -> list[list[list[str]]]:
+    from html.parser import HTMLParser
+    import re
+
+    class TableParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.tables: list[list[list[str]]] = []
+            self._in_table = False
+            self._in_row = False
+            self._in_cell = False
+            self._current_table: list[list[str]] = []
+            self._current_row: list[str] = []
+            self._current_cell: list[str] = []
+
+        def handle_starttag(self, tag: str, attrs):
+            if tag == "table":
+                self._in_table = True
+                self._current_table = []
+            elif tag == "tr" and self._in_table:
+                self._in_row = True
+                self._current_row = []
+            elif tag in ("td", "th") and self._in_row:
+                self._in_cell = True
+                self._current_cell = []
+
+        def handle_data(self, data: str):
+            if self._in_cell:
+                self._current_cell.append(data)
+
+        def handle_endtag(self, tag: str):
+            if tag in ("td", "th") and self._in_cell:
+                self._in_cell = False
+                cell_text = re.sub(r"\s+", " ", "".join(self._current_cell)).strip()
+                self._current_row.append(cell_text)
+            elif tag == "tr" and self._in_row:
+                self._in_row = False
+                if self._current_row:
+                    self._current_table.append(self._current_row)
+            elif tag == "table" and self._in_table:
+                self._in_table = False
+                if self._current_table:
+                    self.tables.append(self._current_table)
+
+    parser = TableParser()
+    parser.feed(raw_html)
+    return parser.tables
+
+
 def get_cnb_macro_indicators() -> dict:
     from datetime import datetime, timedelta, timezone
+    import html
     import re
     import urllib.request
 
@@ -161,59 +211,75 @@ def get_cnb_macro_indicators() -> dict:
     lombard_val = 5.00
     inflation_val = 2.4
 
-    plain_text = ""
-    for page_url in ("https://www.cnb.cz/cs/", "https://www.cnb.cz/cs/menova-politika/"):
-        try:
-            req = urllib.request.Request(
-                page_url,
-                headers={"User-Agent": "Mozilla/5.0 (compatible; TensegrityTerminal/2.1)"},
-            )
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                raw_page = resp.read().decode("utf-8", errors="ignore")
-            cleaned = re.sub(r"<[^>]+>", " ", raw_page)
-            cleaned = re.sub(r"\s+", " ", cleaned)
-            plain_text += " " + cleaned
-        except Exception:
-            pass
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "cs-CZ,cs;q=0.9",
+    }
 
-    if plain_text:
-        repo_match = re.search(r"2T\s+repo\s+sazba\s*(\d+[,.]\d+)\s*%", plain_text, flags=re.IGNORECASE)
-        if repo_match:
-            try:
-                parsed_repo = float(repo_match.group(1).replace(",", "."))
-                if 0.0 <= parsed_repo <= 25.0:
-                    repo_val = parsed_repo
-                    discount_val = max(0.0, round(repo_val - 1.0, 2))
-                    lombard_val = round(repo_val + 1.0, 2)
-            except ValueError:
-                pass
+    try:
+        req = urllib.request.Request(
+            "https://www.cnb.cz/cs/casto-kladene-otazky/Jak-se-vyvijela-dvoutydenni-repo-sazba-CNB/",
+            headers=headers,
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            history_html = resp.read().decode("utf-8", errors="ignore")
 
-        disc_match = re.search(r"Diskontní\s+sazba\s*(\d+[,.]\d+)\s*%", plain_text, flags=re.IGNORECASE)
-        if disc_match:
-            try:
-                parsed_disc = float(disc_match.group(1).replace(",", "."))
-                if 0.0 <= parsed_disc <= 25.0:
-                    discount_val = parsed_disc
-            except ValueError:
-                pass
+        tables = _extract_html_tables(history_html)
+        best_date = (0, 0, 0)
+        for table in tables:
+            if len(table) < 2:
+                continue
+            header_cells = [c.lower() for c in table[0]]
+            repo_idx = next((i for i, c in enumerate(header_cells) if "repo" in c), None)
+            disc_idx = next((i for i, c in enumerate(header_cells) if "diskont" in c), None)
+            lomb_idx = next((i for i, c in enumerate(header_cells) if "lombard" in c), None)
+            if repo_idx is None:
+                continue
 
-        lomb_match = re.search(r"Lombardní\s+sazba\s*(\d+[,.]\d+)\s*%", plain_text, flags=re.IGNORECASE)
-        if lomb_match:
-            try:
-                parsed_lomb = float(lomb_match.group(1).replace(",", "."))
-                if 0.0 <= parsed_lomb <= 25.0:
-                    lombard_val = parsed_lomb
-            except ValueError:
-                pass
+            for row in table[1:]:
+                if len(row) <= repo_idx:
+                    continue
+                date_match = re.search(r"(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})", row[0])
+                if not date_match:
+                    continue
+                row_date = (int(date_match.group(3)), int(date_match.group(2)), int(date_match.group(1)))
+                if row_date >= best_date:
+                    num_match = re.search(r"(\d+[,.]\d+)", row[repo_idx])
+                    if num_match:
+                        best_date = row_date
+                        repo_val = float(num_match.group(1).replace(",", "."))
+                        if disc_idx is not None and len(row) > disc_idx:
+                            d_match = re.search(r"(\d+[,.]\d+)", row[disc_idx])
+                            if d_match:
+                                discount_val = float(d_match.group(1).replace(",", "."))
+                        else:
+                            discount_val = max(0.0, round(repo_val - 1.0, 2))
+                        if lomb_idx is not None and len(row) > lomb_idx:
+                            l_match = re.search(r"(\d+[,.]\d+)", row[lomb_idx])
+                            if l_match:
+                                lombard_val = float(l_match.group(1).replace(",", "."))
+                        else:
+                            lombard_val = round(repo_val + 1.0, 2)
+    except Exception:
+        pass
 
-        infl_match = re.search(r"(?:Míra\s+inflace|Inflace)\s*(\d+[,.]\d+)\s*%", plain_text, flags=re.IGNORECASE)
+    try:
+        req_home = urllib.request.Request("https://www.cnb.cz/cs/", headers=headers)
+        with urllib.request.urlopen(req_home, timeout=8) as resp_home:
+            home_html = resp_home.read().decode("utf-8", errors="ignore")
+        plain_home = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(home_html)))
+        infl_match = re.search(
+            r"(?:(\d+[,.]\d+)\s*%\s*(?:Míra\s+inflace|Inflace)|(?:Míra\s+inflace|Inflace)\s*(\d+[,.]\d+)\s*%)",
+            plain_home,
+            flags=re.IGNORECASE,
+        )
         if infl_match:
-            try:
-                parsed_infl = float(infl_match.group(1).replace(",", "."))
-                if -5.0 <= parsed_infl <= 30.0:
-                    inflation_val = parsed_infl
-            except ValueError:
-                pass
+            raw_infl = infl_match.group(1) or infl_match.group(2)
+            parsed_infl = float(raw_infl.replace(",", "."))
+            if -5.0 <= parsed_infl <= 30.0:
+                inflation_val = parsed_infl
+    except Exception:
+        pass
 
     result = {
         "repo_rate": _format_cz_percent(repo_val, 2),
