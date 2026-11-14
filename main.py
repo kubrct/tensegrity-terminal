@@ -1024,6 +1024,7 @@ import base64
 import asyncio
 import resend
 
+
 async def send_email_report(recipient: str, subject: str, html_content: str, pdf_bytes: bytes | None = None):
     resend.api_key = os.environ.get("RESEND_API_KEY")
     
@@ -1107,7 +1108,7 @@ async def trigger_newsletter_endpoint():
         return {"status": "ok", "message": "Žádní odběratelé k rozeslání.", "time": now.isoformat()}
     except Exception as err:
         logger.error("Chyba při externím spuštění zpravodaje: %s", err)
-        return {"status": "error", "detail": str(err)}, 500
+        return {"status": "error", "detail": str(err)}
 
 app = FastAPI(title="Tensegrity Terminal | Institutional Valuation Platform", version="2.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
