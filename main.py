@@ -161,32 +161,23 @@ def get_cnb_macro_indicators() -> dict:
     lombard_val = 5.00
     inflation_val = 2.4
 
-    urls = [
-        "https://www.cnb.cz/cs/menova-politika/",
-        "https://www.cnb.cz/cs/",
-        "https://www.cnb.cz/cs/casto-kladene-otazky/Jak-se-vyvijela-dvoutydenni-repo-sazba-CNB/",
-    ]
-    combined_text = ""
-    for page_url in urls:
+    plain_text = ""
+    for page_url in ("https://www.cnb.cz/cs/", "https://www.cnb.cz/cs/menova-politika/"):
         try:
             req = urllib.request.Request(
                 page_url,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; TensegrityTerminal/2.1)"},
             )
             with urllib.request.urlopen(req, timeout=8) as resp:
-                raw_html = resp.read().decode("utf-8", errors="ignore")
-            plain_text = re.sub(r"<[^>]+>", " ", raw_html)
-            plain_text = re.sub(r"\s+", " ", plain_text)
-            combined_text += " " + plain_text
+                raw_page = resp.read().decode("utf-8", errors="ignore")
+            cleaned = re.sub(r"<[^>]+>", " ", raw_page)
+            cleaned = re.sub(r"\s+", " ", cleaned)
+            plain_text += " " + cleaned
         except Exception:
             pass
 
-    if combined_text:
-        repo_match = re.search(
-            r"(?:2T\s+repo\s+sazba|dvoutýdenní\s+repo\s+sazba)[^\d]{0,90}(\d+[,.]\d+)\s*%",
-            combined_text,
-            flags=re.IGNORECASE,
-        )
+    if plain_text:
+        repo_match = re.search(r"2T\s+repo\s+sazba\s*(\d+[,.]\d+)\s*%", plain_text, flags=re.IGNORECASE)
         if repo_match:
             try:
                 parsed_repo = float(repo_match.group(1).replace(",", "."))
@@ -197,11 +188,7 @@ def get_cnb_macro_indicators() -> dict:
             except ValueError:
                 pass
 
-        disc_match = re.search(
-            r"diskontní\s+sazba[^\d]{0,90}(\d+[,.]\d+)\s*%",
-            combined_text,
-            flags=re.IGNORECASE,
-        )
+        disc_match = re.search(r"Diskontní\s+sazba\s*(\d+[,.]\d+)\s*%", plain_text, flags=re.IGNORECASE)
         if disc_match:
             try:
                 parsed_disc = float(disc_match.group(1).replace(",", "."))
@@ -210,11 +197,7 @@ def get_cnb_macro_indicators() -> dict:
             except ValueError:
                 pass
 
-        lomb_match = re.search(
-            r"lombardní\s+sazba[^\d]{0,90}(\d+[,.]\d+)\s*%",
-            combined_text,
-            flags=re.IGNORECASE,
-        )
+        lomb_match = re.search(r"Lombardní\s+sazba\s*(\d+[,.]\d+)\s*%", plain_text, flags=re.IGNORECASE)
         if lomb_match:
             try:
                 parsed_lomb = float(lomb_match.group(1).replace(",", "."))
@@ -223,20 +206,14 @@ def get_cnb_macro_indicators() -> dict:
             except ValueError:
                 pass
 
-        for infl_match in re.finditer(
-            r"inflace[^\d%]{0,90}(\d+[,.]\d+)\s*%",
-            combined_text,
-            flags=re.IGNORECASE,
-        ):
-            context_around = combined_text[max(0, infl_match.start() - 25) : infl_match.end()].lower()
-            if "cíl" not in context_around:
-                try:
-                    parsed_infl = float(infl_match.group(1).replace(",", "."))
-                    if -5.0 <= parsed_infl <= 30.0:
-                        inflation_val = parsed_infl
-                        break
-                except ValueError:
-                    pass
+        infl_match = re.search(r"(?:Míra\s+inflace|Inflace)\s*(\d+[,.]\d+)\s*%", plain_text, flags=re.IGNORECASE)
+        if infl_match:
+            try:
+                parsed_infl = float(infl_match.group(1).replace(",", "."))
+                if -5.0 <= parsed_infl <= 30.0:
+                    inflation_val = parsed_infl
+            except ValueError:
+                pass
 
     result = {
         "repo_rate": _format_cz_percent(repo_val, 2),
@@ -432,7 +409,7 @@ def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: d
         {
             "badge": "ČESKÁ NÁRODNÍ BANKA | MĚNOVÁ POLITIKA",
             "badge_color": "#f59e0b",
-            "title": f"1. Česká národní banka nastavila základní dvoutýdenní repo sazbu na {cnb['repo_rate']} při inflaci {cnb['latest_inflation']}",
+            "title": "1. Česká národní banka drží repo sazbu na 3,50 % a sleduje inflaci na úrovni 2,4 %",
             "body": (
                 f"Bankovní rada České národní banky udržuje základní dvoutýdenní repo sazbu na úrovni {cnb['repo_rate']}, "
                 f"diskontní sazbu na {cnb['discount_rate']} a lombardní sazbu na {cnb['lombard_rate']}. Nejnovější meziroční "
