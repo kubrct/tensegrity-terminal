@@ -1116,6 +1116,19 @@ async def lifespan(app_instance: FastAPI):
     yield
     task.cancel()
 
+@app.get("/trigger-newsletter")
+async def trigger_newsletter_endpoint():
+    """Veřejný endpoint pro probuzení serveru a okamžitou kontrolu/odeslání plánovaného zpravodaje."""
+    try:
+        now = get_prague_now()
+        subscribers = get_subscribers_internal()
+        if subscribers:
+            await dispatch_newsletter_to_recipients(subscribers)
+            return {"status": "ok", "message": f"Zpravodaj ručně/externě spuštěn pro {len(subscribers)} odběratelů.", "time": now.isoformat()}
+        return {"status": "ok", "message": "Žádní odběratelé k rozeslání.", "time": now.isoformat()}
+    except Exception as err:
+        logger.error("Chyba při externím spuštění zpravodaje: %s", err)
+        return {"status": "error", "detail": str(err)}, 500
 
 app = FastAPI(title="Tensegrity Terminal | Institutional Valuation Platform", version="2.1", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
