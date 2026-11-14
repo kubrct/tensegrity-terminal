@@ -1065,7 +1065,7 @@ async def dispatch_newsletter_to_recipients(recipients: list[str]):
     subject = "Tensegrity Terminal | Intelligence — Globální a Český Tržní Přehled"
     for recipient in recipients:
         try:
-            await asyncio.to_thread(send_email_report, recipient, subject, html_body, pdf_bytes)
+            await send_email_report(recipient, subject, html_content, pdf_bytes)
         except Exception as err:
             logger.error("Plánované odeslání zpravodaje selhalo: %s", err)
 
@@ -2077,8 +2077,7 @@ async def send_newsletter_now(request: Request):
         html_body = await asyncio.to_thread(generate_html_newsletter_content, forex_data, benchmarks, cnb)
         pdf_bytes = await asyncio.to_thread(build_newsletter_pdf_bytes, forex_data, benchmarks, cnb)
 
-        await asyncio.to_thread(
-            send_email_report,
+        await send_email_report(
             email,
             "Tensegrity Terminal | Intelligence — Globální a Český Tržní Přehled",
             html_body,
