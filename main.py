@@ -6,6 +6,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import parseaddr
 import asyncio
+import resend
+import base64
 import io
 import json
 import logging
