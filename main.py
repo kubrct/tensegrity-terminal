@@ -118,26 +118,68 @@ def extract_statement_series(df, row_names: list[str], max_years: int = 4) -> li
 
 
 def get_live_market_benchmarks() -> dict:
-    us10y = 4.28
-    sp500_pe = 22.4
+    import re
+    import urllib.request
+
+    us10y = None
+    sp500_pe = None
+
     try:
         tnx_hist = yf.Ticker("^TNX").history(period="5d", interval="1d")
         if not tnx_hist.empty:
-            last_tnx = safe_float(tnx_hist["Close"].dropna().iloc[-1], 4.28)
+            last_tnx = safe_float(tnx_hist["Close"].dropna().iloc[-1], 0.0)
             if 0.5 < last_tnx < 15.0:
                 us10y = round(last_tnx, 2)
     except Exception as err:
-        logger.warning("Nelze načíst živý výnos desetiletých amerických dluhopisů: %s", err)
+        logger.warning("Nelze načíst burzovní výnos desetiletých amerických dluhopisů: %s", err)
+
+    if us10y is None:
+        try:
+            req = urllib.request.Request(
+                "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                lines = resp.read().decode("utf-8", errors="ignore").strip().splitlines()
+            for line in reversed(lines[1:]):
+                parts = line.split(",")
+                if len(parts) == 2 and parts[1].strip() != ".":
+                    candidate = safe_float(parts[1].strip(), 0.0)
+                    if 0.5 < candidate < 15.0:
+                        us10y = round(candidate, 2)
+                        break
+        except Exception as err:
+            logger.warning("Nelze načíst záložní živý výnos z Federální rezervní banky: %s", err)
 
     try:
         spy_info = yf.Ticker("SPY").info or {}
         trailing_pe = safe_float(spy_info.get("trailingPE"), 0.0)
-        if 10.0 < trailing_pe < 45.0:
+        if 8.0 < trailing_pe < 60.0:
             sp500_pe = round(trailing_pe, 1)
     except Exception as err:
-        logger.warning("Nelze načíst živý poměr ceny a zisku indexu S&P 500: %s", err)
+        logger.warning("Nelze načíst burzovní poměr ceny a zisku indexu Standard and Poor's 500: %s", err)
 
-    return {"us10y_yield": us10y, "sp500_pe": sp500_pe}
+    if sp500_pe is None:
+        try:
+            req_pe = urllib.request.Request(
+                "https://www.multpl.com/s-p-500-pe-ratio",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            with urllib.request.urlopen(req_pe, timeout=8) as resp_pe:
+                page_text = re.sub(r"<[^>]+>", " ", resp_pe.read().decode("utf-8", errors="ignore"))
+                page_text = re.sub(r"\s+", " ", page_text)
+            pe_match = re.search(r"Current\s+S&P\s+500\s+PE\s+Ratio\s+is\s+(\d+\.\d+)", page_text, flags=re.IGNORECASE)
+            if pe_match:
+                candidate_pe = safe_float(pe_match.group(1), 0.0)
+                if 8.0 < candidate_pe < 60.0:
+                    sp500_pe = round(candidate_pe, 1)
+        except Exception as err:
+            logger.warning("Nelze načíst záložní živý poměr ceny a zisku: %s", err)
+
+    return {
+        "us10y_yield": us10y if us10y is not None else 0.0,
+        "sp500_pe": sp500_pe if sp500_pe is not None else 0.0,
+    }
 
 
 _CNB_CACHE: dict = {"expires_at": None, "data": None}
@@ -299,10 +341,38 @@ def get_cnb_macro_indicators() -> dict:
 
 
 def get_live_forex_rates() -> dict:
+    import urllib.request
+
+    cnb_daily_rates = {}
+    try:
+        req = urllib.request.Request(
+            "https://www.cnb.cz/cs/financni-trhy/devizovy-trh/kurzy-devizoveho-trhu/kurzy-devizoveho-trhu/denni_kurz.txt",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            lines = resp.read().decode("utf-8", errors="ignore").splitlines()
+        for line in lines[2:]:
+            parts = line.split("|")
+            if len(parts) == 5:
+                currency_code = parts[3].strip().upper()
+                amount = safe_float(parts[2].strip().replace(",", "."), 0.0)
+                czk_value = safe_float(parts[4].strip().replace(",", "."), 0.0)
+                if amount > 0 and czk_value > 0:
+                    cnb_daily_rates[f"{currency_code}/CZK"] = round(czk_value / amount, 4)
+    except Exception as error:
+        logger.warning("Nelze načíst denní kurzovní lístek České národní banky: %s", error)
+
     rates = {}
     for pair, symbol in FOREX_PAIRS.items():
-        rate = FOREX_FALLBACK_RATES[pair]
-        live = False
+        base_currency = pair.replace(" ", "").replace("/", "").replace("_", "").upper()[:3]
+        cnb_key = f"{base_currency}/CZK"
+        if cnb_key in cnb_daily_rates:
+            rate = cnb_daily_rates[cnb_key]
+            live = True
+        else:
+            rate = FOREX_FALLBACK_RATES[pair]
+            live = False
+
         try:
             history = yf.Ticker(symbol).history(period="5d", interval="1d")
             closes = history["Close"].dropna()
@@ -312,8 +382,10 @@ def get_live_forex_rates() -> dict:
                     rate = round(candidate, 4)
                     live = True
         except Exception as error:
-            logger.warning("Nelze načíst živý kurz pro %s: %s", pair, error)
+            logger.warning("Nelze načíst živý burzovní kurz pro %s: %s", pair, error)
+
         rates[pair] = {"rate": rate, "live": live}
+
     return {
         "rates": rates,
         "updated_at": get_prague_now().isoformat(timespec="minutes"),
@@ -380,6 +452,108 @@ def save_sent_slots(slots: set[str]):
         logger.warning("Nelze uložit stav plánovače: %s", err)
 
 
+def _fetch_live_rss_articles(
+    feed_sources: list[tuple[str, str]],
+    badge_color: str,
+    max_items: int = 5,
+) -> list[dict]:
+    from email.utils import parsedate_to_datetime
+    import html
+    import re
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    collected: list[dict] = []
+    seen_titles: set[str] = set()
+
+    for source_name, feed_url in feed_sources:
+        if len(collected) >= max_items:
+            break
+        try:
+            req = urllib.request.Request(
+                feed_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=7) as resp:
+                raw_xml = resp.read()
+            root = ET.fromstring(raw_xml)
+
+            items = root.findall(".//item")
+            if not items:
+                items = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+
+            per_source_count = 0
+            for entry in items:
+                if len(collected) >= max_items or per_source_count >= 2:
+                    break
+
+                title_el = entry.find("title")
+                if title_el is None:
+                    title_el = entry.find("{http://www.w3.org/2005/Atom}title")
+                raw_title = html.unescape(title_el.text or "").strip() if title_el is not None else ""
+                if not raw_title:
+                    continue
+
+                norm_key = re.sub(r"\W+", "", raw_title.lower())[:60]
+                if norm_key in seen_titles:
+                    continue
+
+                link_el = entry.find("link")
+                if link_el is None:
+                    link_el = entry.find("{http://www.w3.org/2005/Atom}link")
+                article_url = ""
+                if link_el is not None:
+                    article_url = (link_el.text or link_el.attrib.get("href") or "").strip()
+                if not article_url:
+                    article_url = feed_url
+
+                desc_el = entry.find("description")
+                if desc_el is None:
+                    desc_el = entry.find("{http://www.w3.org/2005/Atom}summary")
+                raw_desc = html.unescape(desc_el.text or "") if desc_el is not None else ""
+                clean_desc = re.sub(r"<[^>]+>", " ", raw_desc)
+                clean_desc = re.sub(r"\s+", " ", clean_desc).strip()
+
+                pub_el = entry.find("pubDate")
+                if pub_el is None:
+                    pub_el = entry.find("{http://www.w3.org/2005/Atom}updated")
+                pub_label = ""
+                if pub_el is not None and pub_el.text:
+                    try:
+                        dt = parsedate_to_datetime(pub_el.text.strip())
+                        pub_label = dt.strftime("%d. %m. %Y %H:%M")
+                    except Exception:
+                        pub_label = pub_el.text.strip()[:25]
+
+                if len(clean_desc) > 460:
+                    clean_desc = clean_desc[:457].rsplit(" ", 1)[0] + "..."
+
+                meta_prefix = f"Zdroj: {source_name}" + (f" ({pub_label})" if pub_label else "")
+                if clean_desc and clean_desc.lower() not in raw_title.lower():
+                    body_text = f"{clean_desc} [{meta_prefix}]"
+                else:
+                    body_text = f"{meta_prefix}. Aktuální tržní zpráva převzatá přímo z oficiálního zpravodajského kanálu."
+
+                seen_titles.add(norm_key)
+                per_source_count += 1
+                collected.append(
+                    {
+                        "badge": f"{source_name.upper()} | ŽIVÉ ZPRÁVY",
+                        "badge_color": badge_color,
+                        "title": f"{len(collected) + 1}. {raw_title}",
+                        "body": body_text,
+                        "url": article_url,
+                    }
+                )
+        except Exception as err:
+            logger.warning("Nelze načíst živý zpravodajský kanál %s: %s", source_name, err)
+
+    return collected
+
+
 def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: dict) -> tuple[list[dict], list[dict]]:
     eur_czk = forex_data["rates"]["EUR/CZK"]["rate"]
     usd_czk = forex_data["rates"]["USD/CZK"]["rate"]
@@ -387,170 +561,155 @@ def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: d
     us10y = benchmarks["us10y_yield"]
     sp500_pe = benchmarks["sp500_pe"]
 
-    world_sections = [
-        {
-            "badge": "BLOOMBERG | MĚNOVÁ POLITIKA",
-            "badge_color": "#38bdf8",
-            "title": "1. Americká centrální banka a Evropská centrální banka drží obezřetný kurz vůči inflaci",
-            "body": (
-                f"Americká centrální banka i Evropská centrální banka nadále zdůrazňují nutnost přísné měnové disciplíny, "
-                f"protože jádrová inflace v sektoru služeb zpomaluje pomaleji než ceny zboží. Výnos desetiletých amerických "
-                f"státních dluhopisů se pohybuje na úrovni {us10y:.2f} %, což přímo určuje bezrizikovou sazbu pro globální "
-                f"oceňování akcií i podnikových dluhopisů. Americký trh práce zůstává odolný a růst mezd brání centrálním "
-                f"bankéřům v unáhleném uvolňování měnových podmínek. V eurozóně navíc měnovou politiku komplikuje slabší "
-                f"průmyslová aktivita v Německu a rozdílná rozpočtová kondice jednotlivých členských států. Investoři proto "
-                f"přehodnocují očekávání ohledně rychlosti snižování základních úrokových sazeb v nadcházejících čtvrtletích. "
-                f"Vyšší náklady financování tak nadále oddělují společnosti se silnou tvorbou hotovosti od vysoce zadlužených firem."
-            ),
-            "url": "https://www.federalreserve.gov/monetarypolicy.htm",
-        },
-        {
-            "badge": "REUTERS | FÚZE A AKVIZICE",
-            "badge_color": "#38bdf8",
-            "title": "2. Globální trh fúzí a akvizic ožívá díky rekordním rezervám fondů soukromého kapitálu",
-            "body": (
-                "Celosvětová transakční aktivita v oblasti fúzí a akvizic zaznamenává zřetelné oživení po období vyčkávání "
-                "způsobeném drahým úvěrovým financováním. Globální fondy soukromého kapitálu disponují rekordním objemem "
-                "nevyčerpaného kapitálu a jsou pod tlakem investorů, aby jej začaly efektivně alokovat do strategických aktiv. "
-                "Vzhledem k vyšším úrokovým nákladům se struktura kupních smluv výrazně posunula směrem k odloženým výkonnostním "
-                "platbám vázaným na budoucí provozní zisk. Kupující provádějí podstatně hlubší hloubkovou prověrku udržitelnosti "
-                "marží, kvality pracovního kapitálu a odolnosti dodavatelských vztahů. Největší zájem směřuje do průmyslové "
-                "automatizace, podnikového softwaru, energetické infrastruktury a specializovaných zdravotnických služeb. "
-                "Transakční násobky se stabilizovaly na realističtějších úrovních, což usnadňuje shodu mezi prodávajícími a kupujícími."
-            ),
-            "url": "https://www.reuters.com/markets/deals/",
-        },
-        {
-            "badge": "FINANCIAL TIMES | TECHNOLOGIE A ČIPY",
-            "badge_color": "#38bdf8",
-            "title": "3. Finanční prověrka umělé inteligence a napětí v polovodičovém dodavatelském řetězci",
-            "body": (
-                f"Institucionální investoři zahájili důkladnou prověrku návratnosti obřích kapitálových výdajů, které přední "
-                f"technologické společnosti směřují do výstavby výpočetních center. Při průměrném poměru ceny a zisku indexu "
-                f"S&P 500 na úrovni {sp500_pe:.1f}násobku trh vyžaduje jasný důkaz, že masivní investice do hardwaru přinesou "
-                f"odpovídající nárůst volných peněžních toků. Výrobní kapacity pokročilých polovodičových pouzder a vysokorychlostních "
-                f"pamětí zůstávají napjaté, což udržuje vysoké vstupní ceny komponentů pro odběratele. Současně se ukazuje, že "
-                f"hlavním úzkým hrdlem dalšího rozvoje výpočetní infrastruktury není pouze samotná výroba čipů, ale také dostupnost "
-                f"stabilních dodávek elektrické energie a přenosové kapacity sítí. Dodavatelé energetických zařízení, chlazení "
-                f"a průmyslové kabeláže tak těží z sekundární vlny investičních zakázek. Trh v tomto segmentu stále ostřeji rozlišuje "
-                f"mezi skutečnými vlastníky klíčové infrastruktury a firmami bez prokazatelné cenové síly."
-            ),
-            "url": "https://www.ft.com/semiconductors",
-        },
-        {
-            "badge": "WALL STREET JOURNAL | SVĚTOVÁ POLITIKA",
-            "badge_color": "#38bdf8",
-            "title": "4. Obchodní a celní politika velmocí přepisuje mapu globálních dodavatelských řetězců",
-            "body": (
-                "Zostřující se obchodní politika mezi Spojenými státy americkými, Evropskou unií a asijskými exportními ekonomikami "
-                "se stává jedním z hlavních hybatelů nálady na světových finančních trzích. Zvažovaná i nově zaváděná celní opatření "
-                "na průmyslové zboží, elektromobilitu, ocel a strategické komponenty nutí nadnárodní korporace přehodnocovat umístění "
-                "výrobních závodů. Přesun výroby blíže ke koncovým trhům zvyšuje kapitálovou náročnost podnikání a vytváří dlouhodobý "
-                "tlak na výrobní náklady i spotřebitelské ceny. Exportně orientované evropské koncerny čelí dvojímu tlaku v podobě "
-                "slábnoucí poptávky v Číně a hrozby obchodních bariér na severoamerickém trhu. Devizové i komoditní trhy reagují na "
-                "každé politické oznámení zvýšenou rozkolísaností, což zdražuje zajišťovací operace podniků. Investoři proto do "
-                "oceňovacích modelů promítají vyšší geopolitickou rizikovou přirážku u firem s koncentrovanou zahraniční výrobou."
-            ),
-            "url": "https://www.wsj.com/economy/trade",
-        },
-        {
-            "badge": "POLITICO EUROPE | GEOPOLITIKA A REGULACE",
-            "badge_color": "#38bdf8",
-            "title": "5. Geopolitická kontrola pokročilých technologií a energetická bezpečnost mění pravidla hry",
-            "body": (
-                "Vlády západních zemí zpřísňují vývozní kontroly, licenční řízení a prověřování zahraničních investic u technologií "
-                "dvojího užití, polovodičů a kritických surovin. Zásahy státních úřadů do povolování dodávek pokročilých čipů a výrobních "
-                "zařízení přímo ovlivňují tržby i geografickou strukturu zakázek největších technologických hráčů. Souběžně s tím "
-                "probíhá v Evropě i Severní Americe intenzivní politická debata o zajištění soběstačnosti v oblasti jaderné energetiky, "
-                "plynových zásobníků a zpracování vzácných zemin. Státní rozpočty vyčleňují miliardové subvenční programy na podporu "
-                "domácí průmyslové a obranné základny, což zvyšuje emise státních dluhopisů. Tato kombinace průmyslového protekcionismu "
-                "a vysokých vládních výdajů udržuje dlouhodobé úrokové sazby výše, než bylo zvykem v minulém desetiletí. Kapitálové trhy "
-                "tak musejí vedle samotných hospodářských výsledků firem nepřetržitě vyhodnocovat regulatorní a politická rozhodnutí."
-            ),
-            "url": "https://www.politico.eu/section/technology/",
-        },
+    world_feeds = [
+        ("Americká centrální banka", "https://www.federalreserve.gov/feeds/press_monetary.xml"),
+        ("CNBC Finance", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
+        ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
+        ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
     ]
+    world_sections = _fetch_live_rss_articles(world_feeds, badge_color="#38bdf8", max_items=5)
 
-    czech_sections = [
-        {
-            "badge": "ČESKÁ NÁRODNÍ BANKA | MĚNOVÁ POLITIKA",
-            "badge_color": "#f59e0b",
-            "title": "1. Česká národní banka drží repo sazbu na 3,50 % a sleduje inflaci na úrovni 2,4 %",
-            "body": (
-                f"Bankovní rada České národní banky udržuje základní dvoutýdenní repo sazbu na úrovni {cnb['repo_rate']}, "
-                f"diskontní sazbu na {cnb['discount_rate']} a lombardní sazbu na {cnb['lombard_rate']}. Nejnovější meziroční "
-                f"spotřebitelská inflace v České republice činí {cnb['latest_inflation']}, a pohybuje se tak v horní polovině "
-                f"tolerančního pásma dvouprocentního cíle ({cnb['inflation_target']}). Centrální bankéři upozorňují, že ačkoliv "
-                f"ceny energií a pohonných hmot působí protiinflačně, rychlý růst cen ve službách, pohostinství a na trhu "
-                f"bydlení vyžaduje zachování přísnějších měnových podmínek. {cnb['outlook']} Pro tuzemské podniky i domácnosti "
-                f"to znamená, že úrokové sazby u úvěrů budou klesat jen velmi pozvolna a obezřetné řízení likvidity zůstává klíčové."
+    if len(world_sections) < 5:
+        live_tickers = [
+            ("INDEX STANDARD AND POOR'S 500", "^GSPC", "https://finance.yahoo.com/quote/%5EGSPC"),
+            ("INDEX NASDAQ COMPOSITE", "^IXIC", "https://finance.yahoo.com/quote/%5EIXIC"),
+            ("ZLATO (TERMÍNOVÝ KONTRAKT)", "GC=F", "https://finance.yahoo.com/quote/GC%3DF"),
+            ("ROPA WTI", "CL=F", "https://finance.yahoo.com/quote/CL%3DF"),
+            ("MĚNOVÝ PÁR EUR / USD", "EURUSD=X", "https://finance.yahoo.com/quote/EURUSD%3DX"),
+        ]
+        for label, symbol, link in live_tickers:
+            if len(world_sections) >= 5:
+                break
+            try:
+                hist = yf.Ticker(symbol).history(period="5d", interval="1d")["Close"].dropna()
+                if len(hist) >= 2:
+                    last_px = float(hist.iloc[-1])
+                    prev_px = float(hist.iloc[-2])
+                    chg_pct = ((last_px - prev_px) / prev_px) * 100.0 if prev_px else 0.0
+                    world_sections.append(
+                        {
+                            "badge": f"{label} | ŽIVÁ TRŽNÍ DATA",
+                            "badge_color": "#38bdf8",
+                            "title": f"{len(world_sections) + 1}. {label}: aktuální hodnota {last_px:,.2f} ({chg_pct:+.2f} %)",
+                            "body": (
+                                f"Živý burzovní údaj pro instrument {label} činí {last_px:,.2f} při denní změně {chg_pct:+.2f} %. "
+                                f"Bezrizikový výnos desetiletých amerických státních dluhopisů dosahuje {us10y:.2f} % "
+                                f"a ocenění indexu Standard and Poor's 500 činí {sp500_pe:.1f}násobek ročních zisků."
+                            ),
+                            "url": link,
+                        }
+                    )
+            except Exception:
+                pass
+
+    def _fetch_direct_portal_articles() -> list[dict]:
+        import html as html_lib
+        import re
+        from urllib.parse import urljoin
+        import urllib.request
+
+        portals = [
+            (
+                "Česká národní banka",
+                "https://www.cnb.cz/cs/cnb-news/tiskove-zpravy/",
+                r"/(?:cnb-news|verejnost/servis-pro-media)/(?:tiskove-zpravy|aktuality)/[^\"'#?]+",
             ),
-            "url": "https://www.cnb.cz/cs/menova-politika/",
-        },
-        {
-            "badge": "PATRIA FINANCE | DEVIZOVÝ TRH",
-            "badge_color": "#f59e0b",
-            "title": f"2. Česká koruna na kurzu {eur_czk:.2f} CZK/EUR těží z úrokového diferenciálu i opatrnosti centrální banky",
-            "body": (
-                f"Česká koruna se na devizovém trhu obchoduje kolem hodnoty {eur_czk:.2f} CZK za jedno euro, {usd_czk:.2f} CZK "
-                f"za americký dolar a {gbp_czk:.2f} CZK za britskou libru. Stabilitu domácí měny podporuje kladný úrokový "
-                f"diferenciál vůči eurozóně i komunikace České národní banky, která tlumí sázky na rychlé snižování úrokových "
-                f"sazeb. Tuzemští exportéři v automobilovém, strojírenském a obalovém průmyslu využívají klidnějšího obchodování "
-                f"k zajištění budoucích eurových inkas pomocí termínových kontraktů. Naopak silnější kurz koruny vůči dolaru "
-                f"pomáhá tlumit korunové ceny dovážených energetických surovin a technologických komponentů. Další směr kurzu "
-                f"bude záviset především na datech o průmyslové produkci v Německu a vývoji obchodní bilance České republiky."
+            (
+                "Kurzy.cz",
+                "https://www.kurzy.cz/zpravy/",
+                r"/zpravy/\d+-[^\"'#?]+",
             ),
-            "url": "https://www.patria.cz/zpravodajstvi/kurzy.html",
-        },
-        {
-            "badge": "HOSPODÁŘSKÉ NOVINY | KAPITÁLOVÝ TRH",
-            "badge_color": "#f59e0b",
-            "title": "3. Burza cenných papírů Praha láká na vysoké dividendy bank a sleduje energetický sektor",
-            "body": (
-                "Domácí akciový trh na Burze cenných papírů Praha si udržuje vysokou atraktivitu pro hodnotově orientované "
-                "investory díky nadprůměrnému dividendovému výnosu hlavního indexu. Tuzemské bankovní domy vykazují silnou "
-                "kapitálovou přiměřenost, nízký podíl nevýkonných úvěrů a stabilní čistý úrokový výnos i při postupné normalizaci "
-                "sazeb. Energetické tituly na pražském parketu reagují na vývoj velkoobchodních cen elektřiny na středoevropských "
-                "burzách a na odhady budoucích kapitálových výdajů do distribučních sítí a nových zdrojů. Zároveň pokračuje přesun "
-                "úspor českých domácností z běžných účtů do fondů peněžního trhu, státních dluhopisů a akciových instrumentů. "
-                "Analytici upozorňují, že likvidita na domácím trhu zůstává soustředěna do několika klíčových emisí, což vyžaduje "
-                "disciplinované načasování vstupů do pozic."
-            ),
-            "url": "https://www.pse.cz/",
-        },
-        {
-            "badge": "E15 | DOMÁCÍ POLITIKA A ROZPOČET",
-            "badge_color": "#f59e0b",
-            "title": "4. Rozpočtová politika státu, daňové parametry a reformní debata hýbou českým byznysem",
-            "body": (
-                "Politická scéna v České republice se soustředí na plnění státního rozpočtu, udržitelnost veřejných financí "
-                "a nastavení daňových i odvodových pravidel pro firmy a osoby samostatně výdělečně činné. Zaměstnavatelské svazy "
-                "i odborové organizace vedou ostré diskuse o dalším směřování zákoníku práce, růstu minimální mzdy a administrativní "
-                "zátěži podnikatelů. Změny v odpisech, zdanění zaměstnaneckých benefitů a odvodech přímo ovlivňují mzdové náklady "
-                "i investiční rozhodování malých a středních průmyslových podniků v regionech. Podnikatelská veřejnost zároveň "
-                "pozorně sleduje legislativní úpravy v oblasti stavebního řízení a povolování nových výrobních a logistických hal. "
-                "Předvídatelnost daňového a právního prostředí se tak stává klíčovým faktorem pro udržení domácích i zahraničních "
-                "investic v české ekonomice."
-            ),
-            "url": "https://www.e15.cz/domaci",
-        },
-        {
-            "badge": "SEZNAM ZPRÁVY | VEŘEJNÉ DĚNÍ A ENERGETIKA",
-            "badge_color": "#f59e0b",
-            "title": "5. Strategické investice do energetiky, dopravní infrastruktury a reakce veřejnosti na reformy",
-            "body": (
-                "Veřejný prostor v České republice rezonuje tématy dlouhodobé energetické bezpečnosti, financování výstavby nových "
-                "jaderných bloků a modernizace přenosové soustavy i páteřní dopravní sítě. Vláda i odborné instituce řeší model "
-                "financování strategických energetických projektů tak, aby neohrozil stabilitu státního dluhu a zároveň zajistil "
-                "konkurenceschopné ceny elektřiny pro český průmysl. Současně probíhají veřejné debaty i protestní akce profesních "
-                "skupin a občanů reagující na úpravy důchodového systému, dostupnost bydlení a ceny regulovaných služeb. Tyto "
-                "společenské a politické tlaky mají přímý dopad na rozpočtové priority státu v oblasti školství, zdravotnictví "
-                "i dopravních staveb. Pro kapitálový trh představuje probíhající transformace české energetiky a infrastruktury "
-                "zásadní téma na celé nadcházející desetiletí."
-            ),
-            "url": "https://www.seznamzpravy.cz/sekce/domaci-13",
-        },
+        ]
+        portal_items: list[dict] = []
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "cs-CZ,cs;q=0.9",
+        }
+
+        for source_name, page_url, link_pattern in portals:
+            try:
+                req = urllib.request.Request(page_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=7) as resp:
+                    raw_html = resp.read().decode("utf-8", errors="ignore")
+
+                for match in re.finditer(r"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", raw_html, flags=re.IGNORECASE | re.DOTALL):
+                    href = match.group(1).strip()
+                    if not re.search(link_pattern, href, flags=re.IGNORECASE):
+                        continue
+                    clean_title = re.sub(r"<[^>]+>", " ", html_lib.unescape(match.group(2)))
+                    clean_title = re.sub(r"\s+", " ", clean_title).strip()
+                    if len(clean_title) < 28 or clean_title.lower().startswith(("více", "archiv", "všechny")):
+                        continue
+
+                    full_url = urljoin(page_url, href)
+                    portal_items.append(
+                        {
+                            "badge": f"{source_name.upper()} | ŽIVÝ ZDROJ",
+                            "badge_color": "#f59e0b",
+                            "title": clean_title,
+                            "body": (
+                                f"Aktuální zpráva převzatá přímo z oficiálního portálu {source_name}. "
+                                f"Kliknutím na tlačítko níže otevřete celé původní znění na zdrojovém webu."
+                            ),
+                            "url": full_url,
+                        }
+                    )
+                    break
+            except Exception as err:
+                logger.warning("Nelze načíst přímý odkaz z portálu %s: %s", source_name, err)
+
+        return portal_items
+
+    direct_cz_articles = _fetch_direct_portal_articles()
+
+    czech_feeds = [
+        ("Česká tisková kancelář", "https://www.ceskenoviny.cz/sluzby/rss/ekonomika.php"),
+        ("Deník E15", "https://www.e15.cz/rss"),
+        ("Seznam Zprávy", "https://www.seznamzpravy.cz/rss"),
     ]
+    rss_cz_articles = _fetch_live_rss_articles(czech_feeds, badge_color="#f59e0b", max_items=5)
+
+    czech_sections: list[dict] = []
+    seen_cz: set[str] = set()
+    for item in direct_cz_articles + rss_cz_articles:
+        if len(czech_sections) >= 5:
+            break
+        raw_heading = re.sub(r"^\d+\.\s*", "", item["title"]).strip()
+        dedup_key = re.sub(r"\W+", "", raw_heading.lower())[:55]
+        if dedup_key in seen_cz:
+            continue
+        seen_cz.add(dedup_key)
+        item["title"] = f"{len(czech_sections) + 1}. {raw_heading}"
+        czech_sections.append(item)
+
+    if len(czech_sections) < 5:
+        live_cz_cards = [
+            {
+                "badge": "ČESKÁ NÁRODNÍ BANKA | ŽIVÉ SAZBY",
+                "badge_color": "#f59e0b",
+                "title": f"Česká národní banka drží základní repo sazbu na {cnb['repo_rate']} při inflaci {cnb['latest_inflation']}",
+                "body": (
+                    f"Aktuální základní dvoutýdenní repo sazba činí {cnb['repo_rate']}, diskontní sazba {cnb['discount_rate']} "
+                    f"a lombardní sazba {cnb['lombard_rate']}. Meziroční míra inflace v České republice dosahuje {cnb['latest_inflation']}."
+                ),
+                "url": "https://www.cnb.cz/cs/menova-politika/",
+            },
+            {
+                "badge": "KURZY.CZ | DEVIZOVÝ TRH",
+                "badge_color": "#f59e0b",
+                "title": f"Aktuální kurz české koruny: {eur_czk:.2f} za euro a {usd_czk:.2f} za americký dolar",
+                "body": (
+                    f"Na devizovém trhu se česká koruna obchoduje za {eur_czk:.2f} koruny za jedno euro, "
+                    f"{usd_czk:.2f} koruny za jeden americký dolar a {gbp_czk:.2f} koruny za jednu britskou libru."
+                ),
+                "url": "https://www.kurzy.cz/kurzy-men/",
+            },
+        ]
+        for fallback_card in live_cz_cards:
+            if len(czech_sections) >= 5:
+                break
+            fallback_card["title"] = f"{len(czech_sections) + 1}. {fallback_card['title']}"
+            czech_sections.append(fallback_card)
 
     return world_sections, czech_sections
 
