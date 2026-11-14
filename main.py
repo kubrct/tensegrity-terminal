@@ -1017,62 +1017,39 @@ def _connect_ipv4_smtp_starttls(host: str, port: int, timeout: float = 15.0):
         raise last_exc
     raise OSError("Nepodařilo se navázat zabezpečené spojení se serverem elektronické pošty.")
 
+import os
+import base64
+import asyncio
+import resend
 
-def send_email_report(recipient: str, subject: str, html_content: str, pdf_bytes: bytes | None = None):
-    if not SENDER_EMAIL or not SENDER_PASSWORD:
-        raise RuntimeError("Chybí přihlašovací údaje odesílatele pro elektronickou poštu.")
-
-    root_msg = MIMEMultipart("mixed")
-    root_msg["Subject"] = subject
-    root_msg["From"] = f"Tensegrity Terminal | Intelligence <{SENDER_EMAIL}>"
-    root_msg["To"] = recipient
-
-    alt_part = MIMEMultipart("alternative")
+async def send_email_report(recipient: str, subject: str, html_content: str, pdf_bytes: bytes | None = None):
+    resend.api_key = os.environ.get("RESEND_API_KEY")
+    
     plain_text = (
-        "Tensegrity Terminal | Intelligence Report.\n"
+        "Tensegrity Terminal Intelligence Report.\n"
         "Pro zobrazení kompletního vizuálního přehledu otevřete zprávu v režimu formátovaného textu "
-        "nebo si otevřete přiložený soubor Tensegrity_Terminal_Newsletter.pdf."
+        "nebo si otevřete přiložený soubor."
     )
-    alt_part.attach(MIMEText(plain_text, "plain", "utf-8"))
-    alt_part.attach(MIMEText(html_content, "html", "utf-8"))
-    root_msg.attach(alt_part)
-
+    
+    params = {
+        "from": "onboarding@resend.dev",
+        "to": [recipient],
+        "subject": subject,
+        "html": html_content,
+        "text": plain_text
+    }
+    
     if pdf_bytes:
-        pdf_attachment = MIMEApplication(pdf_bytes, _subtype="pdf")
-        pdf_attachment.add_header("Content-Disposition", "attachment", filename="Tensegrity_Terminal_Newsletter.pdf")
-        root_msg.attach(pdf_attachment)
-
-    errors = []
-    for connector_name, connector_fn in [
-        ("SSL_465", lambda: _connect_ipv4_smtp_ssl("smtp.gmail.com", 465)),
-        ("STARTTLS_587", lambda: _connect_ipv4_smtp_starttls("smtp.gmail.com", 587)),
-    ]:
-        server = None
-        try:
-            server = connector_fn()
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.sendmail(SENDER_EMAIL, [recipient], root_msg.as_string())
-            server.quit()
-            logger.info("Zpravodaj úspěšně odeslán přes %s.", connector_name)
-            return True
-        except smtplib.SMTPAuthenticationError as auth_err:
-            raise RuntimeError(
-                "Autentizace vůči poštovnímu účtu selhala. Ověřte platnost šestnáctiznakového hesla aplikace."
-            ) from auth_err
-        except Exception as conn_err:
-            errors.append(f"{connector_name}: {conn_err}")
-        finally:
-            if server is not None:
-                try:
-                    server.close()
-                except Exception:
-                    pass
-
-    raise RuntimeError(
-        "Odchozí spojení na poštovní server (porty 465 i 587) je blokováno lokální sítí nebo firewallem. "
-        f"Technický detail: {' | '.join(errors)}"
-    )
-
+        encoded_content = base64.b64encode(pdf_bytes).decode("utf-8")
+        params["attachments"] = [
+            {
+                "filename": "Tensegrity_Terminal_Newsletter.pdf",
+                "content": encoded_content
+            }
+        ]
+        
+    response = await asyncio.to_thread(resend.Emails.send, params)
+    return response
 
 async def dispatch_newsletter_to_recipients(recipients: list[str]):
     if not recipients:
