@@ -5,3 +5,4 @@ openpyxl
 reportlab
 pillow
 python-multipart
+resend
