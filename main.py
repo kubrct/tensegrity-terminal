@@ -1,13 +1,10 @@
 # -*- coding: utf-8 -*-
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from email.mime.application import MIMEApplication
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.utils import parseaddr
+from email.utils import parseaddr, parsedate_to_datetime
 import asyncio
-import resend
 import base64
+import html
 import io
 import json
 import logging
@@ -15,28 +12,42 @@ import math
 import os
 import random
 import re
-import smtplib
 import socket
 import ssl
+import smtplib
+from urllib.parse import quote, urljoin, urlparse
 import urllib.request
+import xml.etree.ElementTree as ET
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 import openpyxl
+from openpyxl.drawing.image import Image as ExcelImage
 from openpyxl.styles import Alignment, Font, PatternFill
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image as PdfImage, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+try:
+    import resend  # type: ignore
+except ImportError:
+    resend = None
 import yfinance as yf
-app = FastAPI()
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None
+
+# Automatické načtení souboru .env pro lokální prostředí
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tensegrity_terminal")
@@ -44,8 +55,24 @@ logger = logging.getLogger("tensegrity_terminal")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
-
-LOGO_PATH = os.path.join(STATIC_DIR, "logo.png")
+PARENT_DIR = os.path.dirname(BASE_DIR)
+BLACK_LOGO_CANDIDATES = [
+    os.path.join(STATIC_DIR, "logo-tt-black_2.png"),
+    os.path.join(BASE_DIR, "logo-tt-black_2.png"),
+    os.path.join(STATIC_DIR, "logo-tt-black.png"),
+    os.path.join(BASE_DIR, "logo-tt-black.png"),
+    os.path.join(PARENT_DIR, "static", "logo-tt-black.png"),
+    os.path.join(PARENT_DIR, "logo-tt-black.png"),
+    os.path.join(STATIC_DIR, "logo-tt-nb.png"),
+    os.path.join(BASE_DIR, "logo-tt-nb.png"),
+    os.path.join(STATIC_DIR, "logo.png"),
+]
+WHITE_LOGO_CANDIDATES = [
+    os.path.join(STATIC_DIR, "logo-tt-white.png"),
+    os.path.join(BASE_DIR, "logo-tt-white.png"),
+    os.path.join(PARENT_DIR, "static", "logo-tt-white.png"),
+    os.path.join(PARENT_DIR, "logo-tt-white.png"),
+]
 SUBSCRIBERS_FILE = os.path.join(BASE_DIR, "subscribers.json")
 SCHEDULER_STATE_FILE = os.path.join(BASE_DIR, "scheduler_state.json")
 
@@ -53,6 +80,7 @@ SENDER_EMAIL = os.getenv("SENDER_EMAIL", "kubenkamatyas@gmail.com").strip()
 RAW_SENDER_PASSWORD = os.getenv("SENDER_PASSWORD", "yokf zefs doxl ujci")
 SENDER_PASSWORD = "".join(RAW_SENDER_PASSWORD.split())
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
 
 FOREX_PAIRS = {
     "EUR/CZK": "EURCZK=X",
@@ -60,6 +88,27 @@ FOREX_PAIRS = {
     "GBP/CZK": "GBPCZK=X",
 }
 FOREX_FALLBACK_RATES = {"EUR/CZK": 25.24, "USD/CZK": 23.15, "GBP/CZK": 30.12}
+
+
+def resolve_brand_logo_path(prefer_white: bool = False) -> str | None:
+    search_order = (WHITE_LOGO_CANDIDATES + BLACK_LOGO_CANDIDATES) if prefer_white else BLACK_LOGO_CANDIDATES
+    for candidate in search_order:
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def get_brand_logo_data_uri() -> str:
+    # Pro e-maily a webové stránky s tmavým pozadím vždy upřednostníme bílé logo
+    logo_path = resolve_brand_logo_path(prefer_white=True) or resolve_brand_logo_path(prefer_white=False)
+    if not logo_path:
+        return ""
+    try:
+        with open(logo_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    except Exception:
+        return ""
 
 
 def register_unicode_pdf_fonts() -> tuple[str, str]:
@@ -119,10 +168,228 @@ def extract_statement_series(df, row_names: list[str], max_years: int = 4) -> li
     return []
 
 
-def get_live_market_benchmarks() -> dict:
-    import re
-    import urllib.request
+KNOWN_COMPANY_ALIASES = {
+    "čez": "CEZ.PR",
+    "cez": "CEZ.PR",
+    "skupina čez": "CEZ.PR",
+    "kofola": "KOFOL.PR",
+    "komerční banka": "KOMB.PR",
+    "komercni banka": "KOMB.PR",
+    "moneta": "MONET.PR",
+    "erste": "ERBAG.PR",
+    "colt": "CZG.PR",
+    "siemens": "SIE.DE",
+    "nvidia": "NVDA",
+    "apple": "AAPL",
+    "microsoft": "MSFT",
+    "google": "GOOGL",
+    "alphabet": "GOOGL",
+    "amazon": "AMZN",
+    "meta": "META",
+    "tesla": "TSLA",
+    "netflix": "NFLX",
+    "berkshire": "BRK-B",
+    "jpmorgan": "JPM",
+    "visa": "V",
+    "mastercard": "MA",
+    "coca-cola": "KO",
+    "coca cola": "KO",
+    "pepsi": "PEP",
+    "pepsico": "PEP",
+    "mcdonald": "MCD",
+    "mcdonalds": "MCD",
+    "intel": "INTC",
+    "amd": "AMD",
+    "broadcom": "AVGO",
+    "tsmc": "TSM",
+    "asml": "ASML",
+    "sap": "SAP",
+    "volkswagen": "VOW3.DE",
+    "allianz": "ALV.DE",
+    "deutsche bank": "DBK.DE",
+    "shell": "SHEL",
+    "exxon": "XOM",
+    "chevron": "CVX",
+}
 
+
+def resolve_company_ticker(query: str) -> str:
+    raw = (query or "").strip()
+    if not raw:
+        return "NVDA"
+
+    lower_q = raw.lower()
+    if lower_q in KNOWN_COMPANY_ALIASES:
+        return KNOWN_COMPANY_ALIASES[lower_q]
+
+    if re.fullmatch(r"[A-Za-z0-9\.\-\^=]{1,12}", raw) and " " not in raw:
+        upper_candidate = raw.upper()
+        try:
+            test_info = yf.Ticker(upper_candidate).info or {}
+            if test_info.get("regularMarketPrice") or test_info.get("currentPrice") or test_info.get("shortName") or test_info.get("longName"):
+                return upper_candidate
+        except Exception:
+            pass
+
+    try:
+        search_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={quote(raw)}&quotesCount=6&newsCount=0"
+        req = urllib.request.Request(
+            search_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=7) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        quotes = payload.get("quotes") or []
+        for q in quotes:
+            if q.get("quoteType") in ("EQUITY", "ETF") and q.get("symbol"):
+                return str(q["symbol"]).upper()
+        if quotes and quotes[0].get("symbol"):
+            return str(quotes[0]["symbol"]).upper()
+    except Exception as err:
+        logger.warning("Vyhledání názvu společnosti '%s' selhalo: %s", raw, err)
+
+    return raw.upper()
+
+
+TICKER_DOMAIN_FALLBACKS = {
+    "NVDA": "nvidia.com",
+    "AAPL": "apple.com",
+    "MSFT": "microsoft.com",
+    "GOOGL": "abc.xyz",
+    "GOOG": "abc.xyz",
+    "AMZN": "amazon.com",
+    "META": "meta.com",
+    "TSLA": "tesla.com",
+    "NFLX": "netflix.com",
+    "AMD": "amd.com",
+    "INTC": "intel.com",
+    "AVGO": "broadcom.com",
+    "TSM": "tsmc.com",
+    "ASML": "asml.com",
+    "SAP": "sap.com",
+    "SIE.DE": "siemens.com",
+    "CEZ.PR": "cez.cz",
+    "KOFOL.PR": "kofola.cz",
+    "KOMB.PR": "kb.cz",
+    "MONET.PR": "moneta.cz",
+    "ERBAG.PR": "erstegroup.com",
+    "CZG.PR": "coltczgroup.com",
+    "JPM": "jpmorganchase.com",
+    "V": "visa.com",
+    "MA": "mastercard.com",
+    "KO": "coca-colacompany.com",
+    "PEP": "pepsico.com",
+    "MCD": "mcdonalds.com",
+    "BRK-B": "berkshirehathaway.com",
+}
+
+
+def extract_company_logo_urls(info: dict, ticker: str = "") -> list[str]:
+    domain = ""
+    website = str(info.get("website") or "").strip()
+    if website:
+        if not website.startswith(("http://", "https://")):
+            website = "https://" + website
+        try:
+            parsed_host = urlparse(website).netloc.lower()
+            if parsed_host.startswith("www."):
+                parsed_host = parsed_host[4:]
+            if parsed_host:
+                domain = parsed_host
+        except Exception:
+            pass
+
+    if not domain and ticker:
+        domain = TICKER_DOMAIN_FALLBACKS.get(ticker.upper(), "")
+
+    if not domain:
+        return []
+
+    return [
+        f"https://www.google.com/s2/favicons?domain={quote(domain)}&sz=128",
+        f"https://icons.duckduckgo.com/ip3/{quote(domain)}.ico",
+        f"https://icon.horse/icon/{quote(domain)}",
+    ]
+
+
+def compute_dynamic_scenario_defaults(info: dict, fin_df, cf_df, sector: str) -> tuple[float, float, float]:
+    current_price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"), 0.0)
+    shares = safe_float(info.get("sharesOutstanding"), 0.0)
+    market_cap = safe_float(info.get("marketCap"), current_price * shares)
+    total_debt = safe_float(info.get("totalDebt"), 0.0)
+
+    total_cap = market_cap + total_debt
+    if total_cap > 0 and total_debt >= 0:
+        auto_leverage = round(max(0.0, min(0.85, total_debt / total_cap)), 2)
+    else:
+        auto_leverage = 0.15
+
+    sector_growth_defaults = {
+        "Technology": 0.14,
+        "Communication Services": 0.11,
+        "Healthcare": 0.09,
+        "Consumer Cyclical": 0.08,
+        "Industrials": 0.07,
+        "Financial Services": 0.06,
+        "Consumer Defensive": 0.05,
+        "Utilities": 0.04,
+        "Energy": 0.04,
+        "Real Estate": 0.04,
+        "Basic Materials": 0.05,
+    }
+    sector_base_g = sector_growth_defaults.get(sector, 0.08)
+
+    rev_growth = safe_float(info.get("revenueGrowth"), None)
+    earn_growth = safe_float(info.get("earningsGrowth"), None)
+    rev_hist = extract_statement_series(fin_df, ["Total Revenue", "Operating Revenue"], max_years=4)
+    hist_cagr = None
+    if len(rev_hist) >= 2 and rev_hist[-1] > 0 and rev_hist[0] > 0:
+        years = len(rev_hist) - 1
+        hist_cagr = (rev_hist[0] / rev_hist[-1]) ** (1.0 / years) - 1.0
+
+    growth_signals = []
+    if rev_growth is not None and -0.4 < rev_growth < 2.0:
+        growth_signals.append(rev_growth)
+    if earn_growth is not None and -0.4 < earn_growth < 2.0:
+        growth_signals.append(earn_growth * 0.75)
+    if hist_cagr is not None and -0.4 < hist_cagr < 2.0:
+        growth_signals.append(hist_cagr)
+
+    if growth_signals:
+        raw_signal = sum(growth_signals) / len(growth_signals)
+        damped_growth = 0.30 * raw_signal + 0.70 * sector_base_g
+        auto_growth = round(max(-0.10, min(0.22, damped_growth)), 3)
+    else:
+        auto_growth = sector_base_g
+
+    sector_mult_defaults = {
+        "Technology": 21.0,
+        "Communication Services": 14.5,
+        "Healthcare": 16.0,
+        "Consumer Cyclical": 14.0,
+        "Industrials": 13.0,
+        "Financial Services": 10.5,
+        "Consumer Defensive": 13.5,
+        "Utilities": 10.0,
+        "Energy": 7.5,
+        "Real Estate": 13.5,
+        "Basic Materials": 8.5,
+    }
+    sector_base_mult = sector_mult_defaults.get(sector, 13.5)
+    ev_to_ebitda = safe_float(info.get("enterpriseToEbitda"), 0.0)
+    if 3.0 < ev_to_ebitda < 65.0:
+        blended_mult = 0.40 * ev_to_ebitda + 0.60 * sector_base_mult
+        auto_exit_mult = round(max(4.0, min(32.0, blended_mult)), 1)
+    else:
+        auto_exit_mult = sector_base_mult
+
+    return auto_leverage, auto_growth, auto_exit_mult
+
+
+def get_live_market_benchmarks() -> dict:
     us10y = None
     sp500_pe = None
 
@@ -159,7 +426,7 @@ def get_live_market_benchmarks() -> dict:
         if 8.0 < trailing_pe < 60.0:
             sp500_pe = round(trailing_pe, 1)
     except Exception as err:
-        logger.warning("Nelze načíst burzovní poměr ceny a zisku indexu Standard and Poor's 500: %s", err)
+        logger.warning("Nelze načíst burzovní poměr ceny a zisku indexu S&P 500: %s", err)
 
     if sp500_pe is None:
         try:
@@ -179,8 +446,8 @@ def get_live_market_benchmarks() -> dict:
             logger.warning("Nelze načíst záložní živý poměr ceny a zisku: %s", err)
 
     return {
-        "us10y_yield": us10y if us10y is not None else 0.0,
-        "sp500_pe": sp500_pe if sp500_pe is not None else 0.0,
+        "us10y_yield": us10y if us10y is not None else 4.25,
+        "sp500_pe": sp500_pe if sp500_pe is not None else 24.5,
     }
 
 
@@ -193,7 +460,6 @@ def _format_cz_percent(val: float, decimals: int = 2) -> str:
 
 def _extract_html_tables(raw_html: str) -> list[list[list[str]]]:
     from html.parser import HTMLParser
-    import re
 
     class TableParser(HTMLParser):
         def __init__(self):
@@ -241,11 +507,6 @@ def _extract_html_tables(raw_html: str) -> list[list[list[str]]]:
 
 
 def get_cnb_macro_indicators() -> dict:
-    from datetime import datetime, timedelta, timezone
-    import html
-    import re
-    import urllib.request
-
     now = datetime.now(timezone.utc)
     if _CNB_CACHE["data"] is not None and _CNB_CACHE["expires_at"] is not None and now < _CNB_CACHE["expires_at"]:
         return _CNB_CACHE["data"]
@@ -343,8 +604,6 @@ def get_cnb_macro_indicators() -> dict:
 
 
 def get_live_forex_rates() -> dict:
-    import urllib.request
-
     cnb_daily_rates = {}
     try:
         req = urllib.request.Request(
@@ -362,7 +621,7 @@ def get_live_forex_rates() -> dict:
                 if amount > 0 and czk_value > 0:
                     cnb_daily_rates[f"{currency_code}/CZK"] = round(czk_value / amount, 4)
     except Exception as error:
-        logger.warning("Nelze načíst denní kurzovní lístek České národní banky: %s", error)
+        logger.warning("Nelze načíst denní kurzovní lístek ČNB: %s", error)
 
     rates = {}
     for pair, symbol in FOREX_PAIRS.items():
@@ -454,21 +713,168 @@ def save_sent_slots(slots: set[str]):
         logger.warning("Nelze uložit stav plánovače: %s", err)
 
 
+def _decode_bytes_smart(raw_bytes: bytes, content_type: str = "") -> str:
+    ct_lower = (content_type or "").lower()
+    if "windows-1250" in ct_lower or "cp1250" in ct_lower:
+        return raw_bytes.decode("cp1250", errors="replace")
+    if "iso-8859-2" in ct_lower:
+        return raw_bytes.decode("iso-8859-2", errors="replace")
+    try:
+        text = raw_bytes.decode("utf-8")
+        return text
+    except UnicodeDecodeError:
+        for enc in ("cp1250", "iso-8859-2", "latin-1"):
+            try:
+                return raw_bytes.decode(enc)
+            except Exception:
+                continue
+        return raw_bytes.decode("utf-8", errors="replace")
+
+
+def _verify_and_resolve_url(url: str, fallback_url: str) -> str:
+    if not url or not url.startswith(("http://", "https://")):
+        return fallback_url
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            status = getattr(resp, "status", 200)
+            final_url = resp.geturl() or url
+            if 200 <= status < 400 and final_url.startswith(("http://", "https://")):
+                return final_url
+    except Exception:
+        pass
+    return fallback_url
+
+
+def _fetch_article_full_text(url: str) -> str:
+    if not url or not url.startswith(("http://", "https://")):
+        return ""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "cs-CZ,cs;q=0.9,en;q=0.8",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            raw_html = _decode_bytes_smart(resp.read()[:180_000], ctype)
+
+        paragraphs = re.findall(r"<p\b[^>]*>(.*?)</p>", raw_html, flags=re.IGNORECASE | re.DOTALL)
+        cleaned_chunks = []
+        for p in paragraphs:
+            txt = re.sub(r"<[^>]+>", " ", html.unescape(p))
+            txt = re.sub(r"\s+", " ", txt).strip()
+            if len(txt) >= 55 and not any(skip in txt.lower() for skip in ("cookie", "přihlásit", "registrace", "subscribe", "copyright", "všechna práva")):
+                cleaned_chunks.append(txt)
+            if len(" ".join(cleaned_chunks)) > 1600:
+                break
+        return " ".join(cleaned_chunks)[:1800]
+    except Exception:
+        return ""
+
+
+def _enforce_three_czech_sentences(text: str, title_cs: str) -> str:
+    cleaned = re.sub(r"\[?\s*Zdroj\s*:[^\]]*\]?", "", text or "", flags=re.IGNORECASE)
+    cleaned = re.sub(r"https?://\S+", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if len(s.strip()) > 15]
+    sentences: list[str] = []
+    for s in raw_sentences:
+        s_clean = s.rstrip(".!?").strip() + "."
+        if s_clean not in sentences:
+            sentences.append(s_clean)
+        if len(sentences) == 3:
+            break
+
+    fallbacks = [
+        f"Tato událost souvisí s vývojem v oblasti: {title_cs.rstrip('.!?')}.",
+        "Tržní účastníci i analytici sledují její dopad na úrokové sazby, inflační očekávání a ocenění rizikových aktiv.",
+        "Další vývoj bude záviset na nadcházejících makroekonomických datech a rozhodnutích klíčových institucí.",
+    ]
+    idx = 0
+    while len(sentences) < 3:
+        candidate = fallbacks[idx % len(fallbacks)]
+        if candidate not in sentences:
+            sentences.append(candidate)
+        idx += 1
+
+    return " ".join(sentences[:3])
+
+
+def _translate_and_summarize_batch_czech(articles: list[dict]) -> list[dict]:
+    if not articles:
+        return articles
+
+    if GEMINI_API_KEY:
+        try:
+            items_payload = [
+                {
+                    "index": idx,
+                    "title": art["raw_title"],
+                    "snippet": art["raw_text"][:1400],
+                }
+                for idx, art in enumerate(articles)
+            ]
+            prompt = (
+                "Jsi špičkový editor a překladatel institucionálního finančního zpravodaje Tensegrity Terminal. "
+                "Pro každou položku ze seznamu splň přísně tato pravidla:\n"
+                "1. Přelož nadpis ('title') do naprosto plynulé, spisovné a srozumitelné češtiny (pokud byl v angličtině, přelož ho jako profesionální finanční novinář).\n"
+                "2. Vytvoř shrnutí ('summary') v ČEŠTINĚ jako nejdůležitější výtah z textu.\n"
+                "3. Shrnutí ('summary') MUSÍ mít PŘESNĚ TŘI VĚTY (ani dvě, ani čtyři).\n"
+                "4. Do textu shrnutí ('summary') NIKDY nepiš název média, zdroj článku ani URL adresu.\n"
+                "5. Vrať výhradně čistý JSON ve formátu pole objektů: [{\"index\": 0, \"title_cs\": \"...\", \"summary_cs\": \"Věta 1. Věta 2. Věta 3.\"}].\n\n"
+                f"Vstupní data: {json.dumps(items_payload, ensure_ascii=False)}"
+            )
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+            req = urllib.request.Request(
+                url,
+                data=json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw_resp = json.loads(resp.read().decode("utf-8"))
+            candidates = raw_resp.get("candidates") or []
+            if candidates:
+                text_out = candidates[0]["content"]["parts"][0]["text"].strip()
+                text_out = re.sub(r"^```(?:json)?|```$", "", text_out, flags=re.MULTILINE).strip()
+                parsed_list = json.loads(text_out)
+                by_idx = {int(item["index"]): item for item in parsed_list if "index" in item}
+                for idx, art in enumerate(articles):
+                    if idx in by_idx:
+                        t_cs = str(by_idx[idx].get("title_cs") or art["raw_title"]).strip()
+                        s_cs = str(by_idx[idx].get("summary_cs") or art["raw_text"]).strip()
+                        art["title_cs"] = t_cs
+                        art["summary_cs"] = _enforce_three_czech_sentences(s_cs, t_cs)
+                return articles
+        except Exception as err:
+            logger.warning("Překlad a sumarizace přes LLM selhaly, použiji záložní zpracování: %s", err)
+
+    for art in articles:
+        t_cs = art["raw_title"]
+        art["title_cs"] = t_cs
+        art["summary_cs"] = _enforce_three_czech_sentences(art["raw_text"], t_cs)
+    return articles
+
+
 def _fetch_live_rss_articles(
-    feed_sources: list[tuple[str, str]],
+    feed_sources: list[tuple[str, str, str]],
     badge_color: str,
     max_items: int = 5,
 ) -> list[dict]:
-    from email.utils import parsedate_to_datetime
-    import html
-    import re
-    import urllib.request
-    import xml.etree.ElementTree as ET
-
     collected: list[dict] = []
     seen_titles: set[str] = set()
 
-    for source_name, feed_url in feed_sources:
+    for source_name, feed_url, fallback_site in feed_sources:
         if len(collected) >= max_items:
             break
         try:
@@ -479,9 +885,10 @@ def _fetch_live_rss_articles(
                     "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
                 },
             )
-            with urllib.request.urlopen(req, timeout=7) as resp:
-                raw_xml = resp.read()
-            root = ET.fromstring(raw_xml)
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                ctype = resp.headers.get("Content-Type", "")
+                raw_xml_str = _decode_bytes_smart(resp.read(), ctype)
+            root = ET.fromstring(raw_xml_str.encode("utf-8"))
 
             items = root.findall(".//item")
             if not items:
@@ -509,8 +916,8 @@ def _fetch_live_rss_articles(
                 article_url = ""
                 if link_el is not None:
                     article_url = (link_el.text or link_el.attrib.get("href") or "").strip()
-                if not article_url:
-                    article_url = feed_url
+
+                verified_url = _verify_and_resolve_url(article_url, fallback_site)
 
                 desc_el = entry.find("description")
                 if desc_el is None:
@@ -519,39 +926,23 @@ def _fetch_live_rss_articles(
                 clean_desc = re.sub(r"<[^>]+>", " ", raw_desc)
                 clean_desc = re.sub(r"\s+", " ", clean_desc).strip()
 
-                pub_el = entry.find("pubDate")
-                if pub_el is None:
-                    pub_el = entry.find("{http://www.w3.org/2005/Atom}updated")
-                pub_label = ""
-                if pub_el is not None and pub_el.text:
-                    try:
-                        dt = parsedate_to_datetime(pub_el.text.strip())
-                        pub_label = dt.strftime("%d. %m. %Y %H:%M")
-                    except Exception:
-                        pub_label = pub_el.text.strip()[:25]
-
-                if len(clean_desc) > 460:
-                    clean_desc = clean_desc[:457].rsplit(" ", 1)[0] + "..."
-
-                meta_prefix = f"Zdroj: {source_name}" + (f" ({pub_label})" if pub_label else "")
-                if clean_desc and clean_desc.lower() not in raw_title.lower():
-                    body_text = f"{clean_desc} [{meta_prefix}]"
-                else:
-                    body_text = f"{meta_prefix}. Aktuální tržní zpráva převzatá přímo z oficiálního zpravodajského kanálu."
+                full_article_text = _fetch_article_full_text(verified_url)
+                combined_source_text = f"{clean_desc} {full_article_text}".strip()
 
                 seen_titles.add(norm_key)
                 per_source_count += 1
                 collected.append(
                     {
+                        "source_name": source_name,
                         "badge": f"{source_name.upper()} | ŽIVÉ ZPRÁVY",
                         "badge_color": badge_color,
-                        "title": f"{len(collected) + 1}. {raw_title}",
-                        "body": body_text,
-                        "url": article_url,
+                        "raw_title": raw_title,
+                        "raw_text": combined_source_text,
+                        "url": verified_url,
                     }
                 )
         except Exception as err:
-            logger.warning("Nelze načíst živý zpravodajský kanál %s: %s", source_name, err)
+            logger.warning("Nelze načíst RSS kanál %s: %s", source_name, err)
 
     return collected
 
@@ -564,12 +955,25 @@ def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: d
     sp500_pe = benchmarks["sp500_pe"]
 
     world_feeds = [
-        ("Americká centrální banka", "https://www.federalreserve.gov/feeds/press_monetary.xml"),
-        ("CNBC Finance", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
-        ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories"),
-        ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex"),
+        ("Americká centrální banka", "https://www.federalreserve.gov/feeds/press_monetary.xml", "https://www.federalreserve.gov/newsevents/pressreleases.htm"),
+        ("CNBC Finance", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664", "https://www.cnbc.com/finance/"),
+        ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories", "https://www.marketwatch.com/latest-news"),
+        ("Yahoo Finance", "https://finance.yahoo.com/news/rssindex", "https://finance.yahoo.com/topic/stock-market-news/"),
     ]
-    world_sections = _fetch_live_rss_articles(world_feeds, badge_color="#38bdf8", max_items=5)
+    raw_world = _fetch_live_rss_articles(world_feeds, badge_color="#38bdf8", max_items=5)
+    processed_world = _translate_and_summarize_batch_czech(raw_world)
+
+    world_sections: list[dict] = []
+    for idx, item in enumerate(processed_world):
+        world_sections.append(
+            {
+                "badge": item["badge"],
+                "badge_color": item["badge_color"],
+                "title": f"{idx + 1}. {item.get('title_cs') or item['raw_title']}",
+                "body": item.get("summary_cs") or _enforce_three_czech_sentences(item["raw_text"], item["raw_title"]),
+                "url": item["url"],
+            }
+        )
 
     if len(world_sections) < 5:
         live_tickers = [
@@ -594,9 +998,9 @@ def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: d
                             "badge_color": "#38bdf8",
                             "title": f"{len(world_sections) + 1}. {label}: aktuální hodnota {last_px:,.2f} ({chg_pct:+.2f} %)",
                             "body": (
-                                f"Živý burzovní údaj pro instrument {label} činí {last_px:,.2f} při denní změně {chg_pct:+.2f} %. "
-                                f"Bezrizikový výnos desetiletých amerických státních dluhopisů dosahuje {us10y:.2f} % "
-                                f"a ocenění indexu Standard and Poor's 500 činí {sp500_pe:.1f}násobek ročních zisků."
+                                f"Aktuální burzovní hodnota instrumentu {label} dosahuje {last_px:,.2f} při denní změně {chg_pct:+.2f} %. "
+                                f"Bezrizikový výnos desetiletých amerických státních dluhopisů činí {us10y:.2f} % a ovlivňuje diskontní sazby napříč globálními trhy. "
+                                f"Průměrné ocenění indexu Standard and Poor's 500 se pohybuje na úrovni {sp500_pe:.1f}násobku ročních zisků."
                             ),
                             "url": link,
                         }
@@ -605,11 +1009,6 @@ def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: d
                 pass
 
     def _fetch_direct_portal_articles() -> list[dict]:
-        import html as html_lib
-        import re
-        from urllib.parse import urljoin
-        import urllib.request
-
         portals = [
             (
                 "Česká národní banka",
@@ -631,58 +1030,66 @@ def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: d
         for source_name, page_url, link_pattern in portals:
             try:
                 req = urllib.request.Request(page_url, headers=headers)
-                with urllib.request.urlopen(req, timeout=7) as resp:
-                    raw_html = resp.read().decode("utf-8", errors="ignore")
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    ctype = resp.headers.get("Content-Type", "")
+                    raw_html = _decode_bytes_smart(resp.read(), ctype)
 
                 for match in re.finditer(r"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", raw_html, flags=re.IGNORECASE | re.DOTALL):
                     href = match.group(1).strip()
                     if not re.search(link_pattern, href, flags=re.IGNORECASE):
                         continue
-                    clean_title = re.sub(r"<[^>]+>", " ", html_lib.unescape(match.group(2)))
+                    clean_title = re.sub(r"<[^>]+>", " ", html.unescape(match.group(2)))
                     clean_title = re.sub(r"\s+", " ", clean_title).strip()
                     if len(clean_title) < 28 or clean_title.lower().startswith(("více", "archiv", "všechny")):
                         continue
 
-                    full_url = urljoin(page_url, href)
+                    full_url = _verify_and_resolve_url(urljoin(page_url, href), page_url)
+                    full_text = _fetch_article_full_text(full_url)
                     portal_items.append(
                         {
+                            "source_name": source_name,
                             "badge": f"{source_name.upper()} | ŽIVÝ ZDROJ",
                             "badge_color": "#f59e0b",
-                            "title": clean_title,
-                            "body": (
-                                f"Aktuální zpráva převzatá přímo z oficiálního portálu {source_name}. "
-                                f"Kliknutím na tlačítko níže otevřete celé původní znění na zdrojovém webu."
-                            ),
+                            "raw_title": clean_title,
+                            "raw_text": full_text,
                             "url": full_url,
                         }
                     )
                     break
             except Exception as err:
-                logger.warning("Nelze načíst přímý odkaz z portálu %s: %s", source_name, err)
+                logger.warning("Nelze načíst odkaz z portálu %s: %s", source_name, err)
 
         return portal_items
 
     direct_cz_articles = _fetch_direct_portal_articles()
 
     czech_feeds = [
-        ("Česká tisková kancelář", "https://www.ceskenoviny.cz/sluzby/rss/ekonomika.php"),
-        ("Deník E15", "https://www.e15.cz/rss"),
-        ("Seznam Zprávy", "https://www.seznamzpravy.cz/rss"),
+        ("Česká tisková kancelář", "https://www.ceskenoviny.cz/sluzby/rss/ekonomika.php", "https://www.ceskenoviny.cz/ekonomika/"),
+        ("Deník E15", "https://www.e15.cz/rss", "https://www.e15.cz/"),
+        ("Seznam Zprávy", "https://www.seznamzpravy.cz/rss", "https://www.seznamzpravy.cz/sekce/ekonomika-byznys-14"),
     ]
     rss_cz_articles = _fetch_live_rss_articles(czech_feeds, badge_color="#f59e0b", max_items=5)
+    processed_cz = _translate_and_summarize_batch_czech(direct_cz_articles + rss_cz_articles)
 
     czech_sections: list[dict] = []
     seen_cz: set[str] = set()
-    for item in direct_cz_articles + rss_cz_articles:
+    for item in processed_cz:
         if len(czech_sections) >= 5:
             break
-        raw_heading = re.sub(r"^\d+\.\s*", "", item["title"]).strip()
+        raw_heading = re.sub(r"^\d+\.\s*", "", item.get("title_cs") or item["raw_title"]).strip()
         dedup_key = re.sub(r"\W+", "", raw_heading.lower())[:55]
         if dedup_key in seen_cz:
             continue
         seen_cz.add(dedup_key)
-        item["title"] = f"{len(czech_sections) + 1}. {raw_heading}"
-        czech_sections.append(item)
+        czech_sections.append(
+            {
+                "badge": item["badge"],
+                "badge_color": item["badge_color"],
+                "title": f"{len(czech_sections) + 1}. {raw_heading}",
+                "body": item.get("summary_cs") or _enforce_three_czech_sentences(item["raw_text"], raw_heading),
+                "url": item["url"],
+            }
+        )
 
     if len(czech_sections) < 5:
         live_cz_cards = [
@@ -691,8 +1098,9 @@ def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: d
                 "badge_color": "#f59e0b",
                 "title": f"Česká národní banka drží základní repo sazbu na {cnb['repo_rate']} při inflaci {cnb['latest_inflation']}",
                 "body": (
-                    f"Aktuální základní dvoutýdenní repo sazba činí {cnb['repo_rate']}, diskontní sazba {cnb['discount_rate']} "
-                    f"a lombardní sazba {cnb['lombard_rate']}. Meziroční míra inflace v České republice dosahuje {cnb['latest_inflation']}."
+                    f"Aktuální základní dvoutýdenní repo sazba činí {cnb['repo_rate']}, diskontní sazba {cnb['discount_rate']} a lombardní sazba {cnb['lombard_rate']}. "
+                    f"Meziroční míra inflace v České republice dosahuje {cnb['latest_inflation']} a nachází se v tolerančním pásmu centrální banky. "
+                    f"Bankovní rada nadále sleduje cenový vývoj v sektoru služeb i mzdovou dynamiku před dalším rozhodnutím o sazbách."
                 ),
                 "url": "https://www.cnb.cz/cs/menova-politika/",
             },
@@ -701,8 +1109,9 @@ def build_curated_czech_news_sections(forex_data: dict, benchmarks: dict, cnb: d
                 "badge_color": "#f59e0b",
                 "title": f"Aktuální kurz české koruny: {eur_czk:.2f} za euro a {usd_czk:.2f} za americký dolar",
                 "body": (
-                    f"Na devizovém trhu se česká koruna obchoduje za {eur_czk:.2f} koruny za jedno euro, "
-                    f"{usd_czk:.2f} koruny za jeden americký dolar a {gbp_czk:.2f} koruny za jednu britskou libru."
+                    f"Na devizovém trhu se česká koruna obchoduje za {eur_czk:.2f} koruny za jedno euro a {usd_czk:.2f} koruny za jeden americký dolar. "
+                    f"Kurz vůči britské libře dosahuje úrovně {gbp_czk:.2f} koruny za jednu libru. "
+                    f"Vývoj domácí měny odráží úrokový diferenciál vůči eurozóně a globální sentiment investorů."
                 ),
                 "url": "https://www.kurzy.cz/kurzy-men/",
             },
@@ -725,9 +1134,9 @@ def build_newsletter_pdf_bytes(forex_data: dict, benchmarks: dict, cnb: dict) ->
         "TerminalTitle",
         parent=styles["Heading1"],
         fontName=PDF_FONT_BOLD,
-        fontSize=17,
+        fontSize=16,
         textColor=colors.HexColor("#0f172a"),
-        spaceAfter=6,
+        spaceAfter=4,
     )
     subtitle_style = ParagraphStyle(
         "TerminalSub",
@@ -741,7 +1150,7 @@ def build_newsletter_pdf_bytes(forex_data: dict, benchmarks: dict, cnb: dict) ->
         "SectionHeader",
         parent=styles["Heading2"],
         fontName=PDF_FONT_BOLD,
-        fontSize=12,
+        fontSize=11.5,
         textColor=colors.HexColor("#0284c7"),
         spaceBefore=12,
         spaceAfter=6,
@@ -771,8 +1180,27 @@ def build_newsletter_pdf_bytes(forex_data: dict, benchmarks: dict, cnb: dict) ->
     gbp_czk = forex_data["rates"]["GBP/CZK"]["rate"]
     world_sections, czech_sections = build_curated_czech_news_sections(forex_data, benchmarks, cnb)
 
-    elements = [
-        Paragraph("TENSEGRITY TERMINAL | INTELLIGENCE REPORT", title_style),
+    elements = []
+    logo_path = resolve_brand_logo_path(prefer_white=False)
+    if logo_path:
+        try:
+            logo_img = PdfImage(logo_path, width=38, height=26, kind="proportional")
+            header_tbl = Table(
+                [[logo_img, Paragraph("TENSEGRITY TERMINAL | INTELLIGENCE REPORT", title_style)]],
+                colWidths=[48, 470],
+            )
+            header_tbl.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+            ]))
+            elements.append(header_tbl)
+        except Exception:
+            elements.append(Paragraph("TENSEGRITY TERMINAL | INTELLIGENCE REPORT", title_style))
+    else:
+        elements.append(Paragraph("TENSEGRITY TERMINAL | INTELLIGENCE REPORT", title_style))
+
+    elements.extend([
         Paragraph(f"Datum a čas vydání: {now_str} | Globální a český makroekonomický přehled", subtitle_style),
         Paragraph("1. GLOBÁLNÍ MAKROEKONOMICKÝ RÁMEC & MĚNOVÁ POLITIKA", section_style),
         Paragraph(
@@ -782,7 +1210,7 @@ def build_newsletter_pdf_bytes(forex_data: dict, benchmarks: dict, cnb: dict) ->
             body_style,
         ),
         Paragraph("2. ČESKÁ REPUBLIKA — SAZBY ČESKÉ NÁRODNÍ BANKY, INFLACE A MĚNOVÉ KURZY", section_style),
-    ]
+    ])
 
     fx_table = Table(
         [
@@ -828,6 +1256,14 @@ def generate_html_newsletter_content(forex_data: dict, benchmarks: dict, cnb: di
     us10y = benchmarks["us10y_yield"]
     sp500_pe = benchmarks["sp500_pe"]
     world_sections, czech_sections = build_curated_czech_news_sections(forex_data, benchmarks, cnb)
+    logo_data_uri = get_brand_logo_data_uri()
+    
+    # Robustní HTML tag pro logo s explicitní šířkou a výškou, aby se v e-mailech zobrazovalo správně bez oříznutí
+    logo_html = (
+        f'<img src="{logo_data_uri}" alt="Tensegrity Terminal" width="120" height="28" style="width:120px;height:28px;display:inline-block;vertical-align:middle;margin-right:12px;border:0;background:transparent;outline:none;text-decoration:none;">'
+        if logo_data_uri
+        else ""
+    )
 
     def render_cards(sections: list[dict]) -> str:
         html_out = ""
@@ -848,211 +1284,145 @@ def generate_html_newsletter_content(forex_data: dict, benchmarks: dict, cnb: di
 
     return f"""<!DOCTYPE html>
 <html lang="cs">
-<head><meta charset="UTF-8"></head>
-<body style="margin: 0; padding: 20px; background-color: #04070d; font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color: #f8fafc;">
-    <div style="max-width: 820px; margin: 0 auto; background-color: #060911; border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 32px;">
-        
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 16px; margin-bottom: 24px;">
-            <tr>
-                <td align="left" style="font-size: 16px; font-weight: 800; letter-spacing: 3px; color: #ffffff; text-transform: uppercase;">
-                    TENSEGRITY<span style="color: #38bdf8;">TERMINAL</span> <span style="font-size: 11px; font-weight: 500; color: #94a3b8; letter-spacing: 2px;">| INTELLIGENCE</span>
-                </td>
-                <td align="right" style="font-size: 12px; font-family: monospace; color: #94a3b8;">
-                    {now_str}
-                </td>
-            </tr>
-        </table>
-
-        <div style="background-color: #0b1322; border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 10px; padding: 14px 20px; text-align: center; margin-bottom: 28px; font-size: 13px; color: #38bdf8; font-weight: 600;">
-            &#128206; Součástí tohoto e-mailu je kompletní přehled v přiloženém souboru (<span style="color: #ffffff;">Tensegrity_Terminal_Newsletter.pdf</span>).
-        </div>
-
-        <h3 style="color: #38bdf8; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.2px; border-bottom: 1px solid rgba(56, 189, 248, 0.25); padding-bottom: 8px; margin: 0 0 16px 0;">
-            &#127757; 1. GLOBÁLNÍ SVĚT — AMERICKÁ CENTRÁLNÍ BANKA, EVROPSKÁ CENTRÁLNÍ BANKA A NÁLADA NA TRZÍCH
-        </h3>
-
-        <div style="background-color: #0f1625; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 22px; margin-bottom: 26px;">
-            <h4 style="color: #f8fafc; font-size: 15px; font-weight: 700; margin: 0 0 10px 0;">Měnová politika, inflační setrvačnost a úrokové sazby ve světě</h4>
-            <p style="color: #94a3b8; font-size: 13px; line-height: 1.65; margin: 0 0 14px 0;">
-                Centrální bankéři ve Spojených státech amerických i v eurozóně nadále uplatňují obezřetný měnový kurz a vyhodnocují setrvačnost inflace v sektoru služeb. Přestože celková inflace oproti předchozím rokům výrazně ustoupila, napjatý trh práce a mzdová dynamika brání guvernérům v unáhleném uvolňování měnových podmínek.
-            </p>
-            <ul style="color: #94a3b8; font-size: 13px; line-height: 1.65; padding-left: 20px; margin: 0 0 18px 0;">
-                <li style="margin-bottom: 6px;"><strong style="color: #f8fafc;">Dopad na dluhopisy a diskontní sazby:</strong> Výnos desetiletých amerických státních dluhopisů na úrovni <strong style="color: #38bdf8;">{us10y:.2f} %</strong> slouží jako hlavní globální bezriziková sazba pro oceňování budoucích peněžních toků.</li>
-                <li><strong style="color: #f8fafc;">Rozdílná dynamika ekonomik:</strong> Americká ekonomika vykazuje silnější růstovou odolnost, zatímco Evropská centrální banka čelí strukturálnímu zpomalení průmyslového jádra v Německu.</li>
-            </ul>
-
-            <table role="presentation" width="100%" cellspacing="8" cellpadding="0" style="margin-bottom: 14px;">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin: 0; padding: 0; background-color: #04070d; font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; color: #f8fafc;">
+    <div style="width: 100%; table-layout: fixed; background-color: #04070d; padding: 24px 0;">
+        <div style="max-width: 820px; margin: 0 auto; background-color: #060911; border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; padding: 32px;">
+            
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 16px; margin-bottom: 24px;">
                 <tr>
-                    <td width="33.3%" style="background-color: #080d18; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 12px; text-align: center;">
-                        <div style="font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px;">VÝNOS US 10Y DLUHOPISŮ</div>
-                        <div style="font-size: 15px; font-weight: 700; color: #38bdf8; font-family: monospace; margin-top: 4px;">{us10y:.2f} %</div>
+                    <td align="left" style="font-size: 15px; font-weight: 800; letter-spacing: 2px; color: #ffffff; text-transform: uppercase;">
+                        {logo_html}<span style="vertical-align:middle;">TENSEGRITY<span style="color: #38bdf8;">TERMINAL</span></span>
                     </td>
-                    <td width="33.3%" style="background-color: #080d18; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 12px; text-align: center;">
-                        <div style="font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px;">P/E INDEXU S&amp;P 500</div>
-                        <div style="font-size: 15px; font-weight: 700; color: #38bdf8; font-family: monospace; margin-top: 4px;">{sp500_pe:.1f}x</div>
-                    </td>
-                    <td width="33.3%" style="background-color: #080d18; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 12px; text-align: center;">
-                        <div style="font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px;">REPO SAZBA ČNB</div>
-                        <div style="font-size: 15px; font-weight: 700; color: #f59e0b; font-family: monospace; margin-top: 4px;">{cnb['repo_rate']}</div>
+                    <td align="right" style="font-size: 11px; font-family: monospace; color: #94a3b8;">
+                        {now_str}
                     </td>
                 </tr>
             </table>
 
-            <a href="https://www.federalreserve.gov/monetarypolicy.htm" target="_blank" rel="noopener" style="display: inline-block; padding: 7px 13px; border: 1px solid rgba(56,189,248,0.4); border-radius: 6px; color: #38bdf8; font-size: 11px; font-weight: 700; text-decoration: none; letter-spacing: 0.5px;">
-                &#128279; OFICIÁLNÍ ZDROJ: AMERICKÁ A EVROPSKÁ CENTRÁLNÍ BANKA &#8599;
-            </a>
-        </div>
+            <div style="background-color: #0b1322; border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 10px; padding: 14px 20px; text-align: center; margin-bottom: 28px; font-size: 13px; color: #38bdf8; font-weight: 600;">
+                &#128206; Součástí tohoto e-mailu je kompletní přehled v přiloženém souboru (<span style="color: #ffffff;">Tensegrity_Terminal_Newsletter.pdf</span>).
+            </div>
 
-        <h3 style="color: #38bdf8; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.2px; border-bottom: 1px solid rgba(56, 189, 248, 0.25); padding-bottom: 8px; margin: 0 0 16px 0;">
-            &#127464;&#127487; 2. ČESKÁ REPUBLIKA — ČESKÁ NÁRODNÍ BANKA, INFLACE, SAZBY A MĚNOVÉ KURZY
-        </h3>
+            <h3 style="color: #38bdf8; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.2px; border-bottom: 1px solid rgba(56, 189, 248, 0.25); padding-bottom: 8px; margin: 0 0 16px 0;">
+                &#127757; 1. GLOBÁLNÍ SVĚT — AMERICKÁ CENTRÁLNÍ BANKA, EVROPSKÁ CENTRÁLNÍ BANKA A NÁLADA NA TRZÍCH
+            </h3>
 
-        <table role="presentation" width="100%" cellspacing="10" cellpadding="0" style="margin-bottom: 14px;">
-            <tr>
-                <td width="33.3%" style="background-color: #0f1625; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; text-align: center;">
-                    <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px;">EUR / CZK</div>
-                    <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{eur_czk:.2f} CZK</div>
-                </td>
-                <td width="33.3%" style="background-color: #0f1625; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; text-align: center;">
-                    <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px;">USD / CZK</div>
-                    <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{usd_czk:.2f} CZK</div>
-                </td>
-                <td width="33.3%" style="background-color: #0f1625; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; text-align: center;">
-                    <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px;">GBP / CZK</div>
-                    <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{gbp_czk:.2f} CZK</div>
-                </td>
-            </tr>
-        </table>
+            <div style="background-color: #0f1625; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 22px; margin-bottom: 26px;">
+                <h4 style="color: #f8fafc; font-size: 15px; font-weight: 700; margin: 0 0 10px 0;">Měnová politika, inflační setrvačnost a úrokové sazby ve světě</h4>
+                <p style="color: #94a3b8; font-size: 13px; line-height: 1.65; margin: 0 0 14px 0;">
+                    Centrální bankéři ve Spojených státech amerických i v eurozóně nadále uplatňují obezřetný měnový kurz a vyhodnocují setrvačnost inflace v sektoru služeb. Přestože celková inflace oproti předchozím rokům výrazně ustoupila, napjatý trh práce a mzdová dynamika brání guvernérům v unáhleném uvolňování měnových podmínek.
+                </p>
 
-        <table role="presentation" width="100%" cellspacing="10" cellpadding="0" style="margin-bottom: 26px;">
-            <tr>
-                <td width="50%" style="background-color: #0f1625; border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 12px; padding: 16px; text-align: center;">
-                    <div style="font-size: 11px; color: #f59e0b; text-transform: uppercase; letter-spacing: 1px;">NEJNOVĚJŠÍ INFLACE V ČR</div>
-                    <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{cnb['latest_inflation']}</div>
-                </td>
-                <td width="50%" style="background-color: #0f1625; border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 12px; padding: 16px; text-align: center;">
-                    <div style="font-size: 11px; color: #f59e0b; text-transform: uppercase; letter-spacing: 1px;">ZÁKLADNÍ SAZBA ČNB (2T REPO)</div>
-                    <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{cnb['repo_rate']}</div>
-                </td>
-            </tr>
-        </table>
+                <table role="presentation" width="100%" cellspacing="8" cellpadding="0" style="margin-bottom: 14px;">
+                    <tr>
+                        <td width="33.3%" style="background-color: #080d18; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 12px; text-align: center;">
+                            <div style="font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px;">VÝNOS US 10Y</div>
+                            <div style="font-size: 15px; font-weight: 700; color: #38bdf8; font-family: monospace; margin-top: 4px;">{us10y:.2f} %</div>
+                        </td>
+                        <td width="33.3%" style="background-color: #080d18; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 12px; text-align: center;">
+                            <div style="font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px;">P/E S&amp;P 500</div>
+                            <div style="font-size: 15px; font-weight: 700; color: #38bdf8; font-family: monospace; margin-top: 4px;">{sp500_pe:.1f}x</div>
+                        </td>
+                        <td width="33.3%" style="background-color: #080d18; border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 12px; text-align: center;">
+                            <div style="font-size: 10px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.8px;">REPO SAZBA ČNB</div>
+                            <div style="font-size: 15px; font-weight: 700; color: #f59e0b; font-family: monospace; margin-top: 4px;">{cnb['repo_rate']}</div>
+                        </td>
+                    </tr>
+                </table>
 
-        <h3 style="color: #38bdf8; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.2px; border-bottom: 1px solid rgba(56, 189, 248, 0.25); padding-bottom: 8px; margin: 0 0 16px 0;">
-            &#127760; 3. AKTUÁLNÍ ČERSTVÉ ZPRÁVY ZE SVĚTA (5 ODDÍLŮ)
-        </h3>
+                <a href="https://www.federalreserve.gov/monetarypolicy.htm" target="_blank" rel="noopener" style="display: inline-block; padding: 7px 13px; border: 1px solid rgba(56,189,248,0.4); border-radius: 6px; color: #38bdf8; font-size: 11px; font-weight: 700; text-decoration: none; letter-spacing: 0.5px;">
+                    &#128279; OFICIÁLNÍ ZDROJ: AMERICKÁ A EVROPSKÁ CENTRÁLNÍ BANKA &#8599;
+                </a>
+            </div>
 
-        {world_cards_html}
+            <h3 style="color: #38bdf8; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.2px; border-bottom: 1px solid rgba(56, 189, 248, 0.25); padding-bottom: 8px; margin: 0 0 16px 0;">
+                &#127464;&#127487; 2. ČESKÁ REPUBLIKA — ČESKÁ NÁRODNÍ BANKA, INFLACE, SAZBY A MĚNOVÉ KURZY
+            </h3>
 
-        <h3 style="color: #f59e0b; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.2px; border-bottom: 1px solid rgba(245, 158, 11, 0.25); padding-bottom: 8px; margin: 24px 0 16px 0;">
-            &#127464;&#127487; 4. AKTUÁLNÍ ČERSTVÉ ZPRÁVY Z ČESKÉ REPUBLIKY (5 ODDÍLŮ)
-        </h3>
+            <table role="presentation" width="100%" cellspacing="10" cellpadding="0" style="margin-bottom: 14px;">
+                <tr>
+                    <td width="33.3%" style="background-color: #0f1625; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; text-align: center;">
+                        <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px;">EUR / CZK</div>
+                        <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{eur_czk:.2f} CZK</div>
+                    </td>
+                    <td width="33.3%" style="background-color: #0f1625; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; text-align: center;">
+                        <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px;">USD / CZK</div>
+                        <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{usd_czk:.2f} CZK</div>
+                    </td>
+                    <td width="33.3%" style="background-color: #0f1625; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 16px; text-align: center;">
+                        <div style="font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px;">GBP / CZK</div>
+                        <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{gbp_czk:.2f} CZK</div>
+                    </td>
+                </tr>
+            </table>
 
-        {czech_cards_html}
+            <table role="presentation" width="100%" cellspacing="10" cellpadding="0" style="margin-bottom: 26px;">
+                <tr>
+                    <td width="50%" style="background-color: #0f1625; border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 12px; padding: 16px; text-align: center;">
+                        <div style="font-size: 11px; color: #f59e0b; text-transform: uppercase; letter-spacing: 1px;">INFLACE V ČR</div>
+                        <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{cnb['latest_inflation']}</div>
+                    </td>
+                    <td width="50%" style="background-color: #0f1625; border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 12px; padding: 16px; text-align: center;">
+                        <div style="font-size: 11px; color: #f59e0b; text-transform: uppercase; letter-spacing: 1px;">REPO SAZBA ČNB</div>
+                        <div style="font-size: 18px; font-weight: 800; color: #ffffff; font-family: monospace; margin-top: 6px;">{cnb['repo_rate']}</div>
+                    </td>
+                </tr>
+            </table>
 
-        <div style="text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px; margin-top: 24px;">
-            Tensegrity Terminal | Intelligence Platform &bull; Automatický institucionální přehled
+            <h3 style="color: #38bdf8; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.2px; border-bottom: 1px solid rgba(56, 189, 248, 0.25); padding-bottom: 8px; margin: 0 0 16px 0;">
+                &#127760; 3. AKTUÁLNÍ ZPRÁVY ZE SVĚTA (5 ODDÍLŮ)
+            </h3>
+
+            {world_cards_html}
+
+            <h3 style="color: #f59e0b; font-size: 13px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.2px; border-bottom: 1px solid rgba(245, 158, 11, 0.25); padding-bottom: 8px; margin: 24px 0 16px 0;">
+                &#127464;&#127487; 4. AKTUÁLNÍ ZPRÁVY Z ČESKÉ REPUBLIKY (5 ODDÍLŮ)
+            </h3>
+
+            {czech_cards_html}
+
+            <div style="text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 16px; margin-top: 24px;">
+                Tensegrity Terminal | Intelligence Platform &bull; Automatický institucionální přehled
+            </div>
         </div>
     </div>
 </body>
 </html>"""
 
 
-def _connect_ipv4_smtp_ssl(host: str, port: int, timeout: float = 15.0):
-    addr_infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    last_exc = None
-    for family, socktype, proto, _, sockaddr in addr_infos:
-        sock = None
-        try:
-            sock = socket.socket(family, socktype, proto)
-            sock.settimeout(timeout)
-            sock.connect(sockaddr)
-            context = ssl.create_default_context()
-            tls_sock = context.wrap_socket(sock, server_hostname=host)
-            server = smtplib.SMTP_SSL(host=host, port=port, timeout=timeout)
-            server.sock = tls_sock
-            server.file = tls_sock.makefile("rb")
-            code, msg = server.getreply()
-            if code != 220:
-                raise smtplib.SMTPConnectError(code, msg)
-            server.ehlo()
-            return server
-        except Exception as exc:
-            last_exc = exc
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-    if last_exc:
-        raise last_exc
-    raise OSError("Nepodařilo se navázat spojení se serverem elektronické pošty.")
-
-
-def _connect_ipv4_smtp_starttls(host: str, port: int, timeout: float = 15.0):
-    addr_infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    last_exc = None
-    for family, socktype, proto, _, sockaddr in addr_infos:
-        sock = None
-        try:
-            sock = socket.socket(family, socktype, proto)
-            sock.settimeout(timeout)
-            sock.connect(sockaddr)
-            server = smtplib.SMTP(host=host, port=port, timeout=timeout)
-            server.sock = sock
-            server.file = sock.makefile("rb")
-            code, msg = server.getreply()
-            if code != 220:
-                raise smtplib.SMTPConnectError(code, msg)
-            server.ehlo()
-            context = ssl.create_default_context()
-            server.starttls(context=context)
-            server.ehlo()
-            return server
-        except Exception as exc:
-            last_exc = exc
-            if sock is not None:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-    if last_exc:
-        raise last_exc
-    raise OSError("Nepodařilo se navázat zabezpečené spojení se serverem elektronické pošty.")
-
-import os
-import base64
-import asyncio
-import resend
-
-
 async def send_email_report(recipient: str, subject: str, html_content: str, pdf_bytes: bytes | None = None):
+    if resend is None:
+        raise RuntimeError("Knihovna 'resend' není nainstalována.")
+
     resend.api_key = os.environ.get("RESEND_API_KEY")
-    
+
     plain_text = (
         "Tensegrity Terminal Intelligence Report.\n"
         "Pro zobrazení kompletního vizuálního přehledu otevřete zprávu v režimu formátovaného textu "
-        "nebo si otevřete přiložený soubor."
+        "nebo si otevřete přiložený soubor PDF."
     )
-    
+
     params = {
         "from": "onboarding@resend.dev",
         "to": [recipient],
         "subject": subject,
         "html": html_content,
-        "text": plain_text
+        "text": plain_text,
     }
-    
+
     if pdf_bytes:
         encoded_content = base64.b64encode(pdf_bytes).decode("utf-8")
         params["attachments"] = [
             {
                 "filename": "Tensegrity_Terminal_Newsletter.pdf",
-                "content": encoded_content
+                "content": encoded_content,
             }
         ]
-        
+
     response = await asyncio.to_thread(resend.Emails.send, params)
     return response
+
 
 async def dispatch_newsletter_to_recipients(recipients: list[str]):
     if not recipients:
@@ -1065,14 +1435,13 @@ async def dispatch_newsletter_to_recipients(recipients: list[str]):
     subject = "Tensegrity Terminal | Intelligence — Globální a Český Tržní Přehled"
     for recipient in recipients:
         try:
-            await send_email_report(recipient, subject, html_content, pdf_bytes)
+            await send_email_report(recipient, subject, html_body, pdf_bytes)
         except Exception as err:
             logger.error("Plánované odeslání zpravodaje selhalo: %s", err)
 
 
 async def scheduled_newsletter_worker():
     sent_slots = load_sent_slots()
-    # Rozvrh: Středa (2) v 7:00, Pátek (4) v 7:00, Neděle (6) v 19:00
     schedule_rules = {(2, 7), (4, 7), (6, 19)}
     while True:
         try:
@@ -1096,26 +1465,42 @@ async def lifespan(app_instance: FastAPI):
     yield
     task.cancel()
 
+
+app = FastAPI(title="Tensegrity Terminal | Institutional Valuation Platform", version="2.4", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
 @app.get("/trigger-newsletter")
-async def trigger_newsletter_endpoint():
-    """Veřejný endpoint pro probuzení serveru a okamžitou kontrolu/odeslání plánovaného zpravodaje."""
+async def trigger_newsletter_endpoint(key: str = Query("")):
+    if CRON_SECRET and key != CRON_SECRET:
+        raise HTTPException(status_code=403, detail="Neplatný bezpečnostní klíč plánovače.")
     try:
         now = get_prague_now()
         subscribers = get_subscribers_internal()
         if subscribers:
             await dispatch_newsletter_to_recipients(subscribers)
-            return {"status": "ok", "message": f"Zpravodaj ručně/externě spuštěn pro {len(subscribers)} odběratelů.", "time": now.isoformat()}
+            slot_key = f"{now.strftime('%Y-%m-%d')}-{now.hour}"
+            sent_slots = load_sent_slots()
+            sent_slots.add(slot_key)
+            save_sent_slots(sent_slots)
+            return {
+                "status": "ok",
+                "message": f"Zpravodaj úspěšně vygenerován a odeslán {len(subscribers)} odběratelům.",
+                "time": now.isoformat(),
+            }
         return {"status": "ok", "message": "Žádní odběratelé k rozeslání.", "time": now.isoformat()}
     except Exception as err:
         logger.error("Chyba při externím spuštění zpravodaje: %s", err)
-        return {"status": "error", "detail": str(err)}
-
-app = FastAPI(title="Tensegrity Terminal | Institutional Valuation Platform", version="2.1", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+        raise HTTPException(status_code=500, detail=str(err))
 
 
-def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.22, exit_mult: float = 24.0) -> dict:
-    clean_ticker = ticker.strip().upper() or "NVDA"
+def run_valuation_logic(
+    query_or_ticker: str,
+    leverage: float | None = None,
+    growth: float | None = None,
+    exit_mult: float | None = None,
+) -> dict:
+    clean_ticker = resolve_company_ticker(query_or_ticker)
     try:
         stock = yf.Ticker(clean_ticker)
         info = stock.info or {}
@@ -1128,14 +1513,22 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
         bs_df = None
         cf_df = None
 
+    sector = str(info.get("sector") or "Technology")
+    auto_lev, auto_grw, auto_mult = compute_dynamic_scenario_defaults(info, fin_df, cf_df, sector)
+
+    eff_leverage = leverage if leverage is not None else auto_lev
+    eff_growth = growth if growth is not None else auto_grw
+    eff_exit_mult = exit_mult if exit_mult is not None else auto_mult
+
     benchmarks = get_live_market_benchmarks()
     rf_rate = benchmarks["us10y_yield"] / 100.0
-    erp_rate = 0.052
+    erp_rate = 0.046
 
     currency = str(info.get("currency") or "USD")
     exchange = str(info.get("exchange") or "NMS")
     company_name = str(info.get("longName") or info.get("shortName") or clean_ticker)
-    sector = str(info.get("sector") or "Technology")
+    company_logo_urls = extract_company_logo_urls(info, clean_ticker)
+    company_logo_url = company_logo_urls[0] if company_logo_urls else ""
     industry = str(info.get("industry") or "Semiconductors")
     country = str(info.get("country") or "United States")
     employees = int(safe_float(info.get("fullTimeEmployees"), 0))
@@ -1152,7 +1545,6 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
     minority_interest = safe_float(info.get("minorityInterest"), 0.0)
     enterprise_value = market_cap + total_debt + minority_interest - total_cash
 
-    # Vrstva 01: Historická data a normalizace výkazů
     rev_hist = extract_statement_series(fin_df, ["Total Revenue", "Operating Revenue"])
     ebitda_hist = extract_statement_series(fin_df, ["EBITDA", "Normalized EBITDA"])
     ebit_hist = extract_statement_series(fin_df, ["EBIT", "Operating Income"])
@@ -1180,32 +1572,30 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
     if reported_fcf <= 0:
         reported_fcf = max(reported_ebitda * 0.65, net_income * 0.85)
 
-    # Ekonomická normalizace: započtení ekonomického nákladu akciových odměn zaměstnancům
     normalized_ebitda = reported_ebitda - (sbc_expense * 0.5)
     normalized_fcf = max(reported_fcf * 0.5, reported_fcf - (sbc_expense * 0.65))
 
-    # Vrstva 02: Vážené průměrné náklady kapitálu a model oceňování kapitálových aktiv
-    beta = safe_float(info.get("beta"), 1.28)
-    beta = max(0.55, min(2.35, beta))
+    raw_beta = safe_float(info.get("beta"), 1.25)
+    raw_beta = max(0.50, min(2.40, raw_beta))
+    beta = (2.0 / 3.0) * raw_beta + (1.0 / 3.0) * 1.0
     cost_of_equity = rf_rate + beta * erp_rate
 
     interest_expense = abs(int_exp_hist[0]) if int_exp_hist else total_debt * 0.045
-    pre_tax_cost_of_debt = (interest_expense / total_debt) if total_debt > 0 else (rf_rate + 0.011)
-    pre_tax_cost_of_debt = max(rf_rate + 0.004, min(0.11, pre_tax_cost_of_debt))
+    pre_tax_cost_of_debt = (interest_expense / total_debt) if total_debt > 0 else (rf_rate + 0.009)
+    pre_tax_cost_of_debt = max(rf_rate + 0.004, min(0.10, pre_tax_cost_of_debt))
     effective_tax_rate = 0.165
 
     total_capital = market_cap + total_debt
     weight_equity = (market_cap / total_capital) if total_capital > 0 else 0.95
     weight_debt = (total_debt / total_capital) if total_capital > 0 else 0.05
     wacc = (weight_equity * cost_of_equity) + (weight_debt * pre_tax_cost_of_debt * (1.0 - effective_tax_rate))
-    wacc = max(0.075, min(0.15, wacc))
+    wacc = max(0.072, min(0.135, wacc))
 
     invested_capital = max(1.0, book_equity + total_debt - total_cash)
     nopat = reported_ebit * (1.0 - effective_tax_rate)
     roic = nopat / invested_capital
     economic_profit = (roic - wacc) * invested_capital
 
-    # Vícefázový model diskontovaných volných peněžních toků pro podnik (5 let)
     terminal_growth = min(0.03, max(0.02, wacc - 0.055))
     if terminal_growth >= wacc:
         terminal_growth = wacc * 0.45
@@ -1251,34 +1641,31 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
             "cash_flows": cf_rows,
         }
 
-    dcf_res = simulate_fcff_dcf(growth, wacc, exit_mult, terminal_growth)
+    dcf_res = simulate_fcff_dcf(eff_growth, wacc, eff_exit_mult, terminal_growth)
     dcf_intrinsic_share = dcf_res["intrinsic_value_per_share"]
     dcf_upside = ((dcf_intrinsic_share / current_price) - 1.0) * 100.0 if current_price > 0 else 0.0
 
-    # Model diskontovaných peněžních toků pro akcionáře
     base_fcfe = max(1.0, normalized_fcf - interest_expense * (1.0 - effective_tax_rate))
     fcfe_pv = 0.0
     curr_fcfe = base_fcfe
     for yr in range(1, 6):
-        yr_g = growth * (1.0 - 0.35 * ((yr - 1) / 4.0))
+        yr_g = eff_growth * (1.0 - 0.35 * ((yr - 1) / 4.0))
         curr_fcfe *= (1.0 + yr_g)
         fcfe_pv += curr_fcfe / ((1.0 + cost_of_equity) ** yr)
     fcfe_tv = (curr_fcfe * (1.0 + terminal_growth)) / max(0.02, cost_of_equity - terminal_growth)
     fcfe_equity_val = fcfe_pv + (fcfe_tv / ((1.0 + cost_of_equity) ** 5))
     fcfe_per_share = max(0.0, fcfe_equity_val / shares_outstanding)
 
-    # Obrácený model diskontovaných peněžních toků
     low_g, high_g = -0.30, 1.20
     for _ in range(60):
         mid_g = (low_g + high_g) / 2.0
-        test_price = simulate_fcff_dcf(mid_g, wacc, exit_mult, terminal_growth)["intrinsic_value_per_share"]
+        test_price = simulate_fcff_dcf(mid_g, wacc, eff_exit_mult, terminal_growth)["intrinsic_value_per_share"]
         if test_price < current_price:
             low_g = mid_g
         else:
             high_g = mid_g
     implied_growth_pct = ((low_g + high_g) / 2.0) * 100.0
 
-    # Model reziduálního zisku a ekonomické přidané hodnoty
     roe_est = min(0.65, max(0.05, net_income / max(1.0, book_equity)))
     pv_ri = 0.0
     curr_bv = book_equity
@@ -1286,21 +1673,21 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
         faded_roe = roe_est * (1.0 - 0.12 * (yr - 1)) + cost_of_equity * (0.12 * (yr - 1))
         ri_yr = (faded_roe - cost_of_equity) * curr_bv
         pv_ri += ri_yr / ((1.0 + cost_of_equity) ** yr)
-        curr_bv *= (1.0 + min(0.25, growth * 0.6))
+        curr_bv *= (1.0 + min(0.25, max(0.0, eff_growth) * 0.6))
     term_ri = ((cost_of_equity + 0.02 - cost_of_equity) * curr_bv) / max(0.02, cost_of_equity - terminal_growth)
     ri_equity_val = max(0.0, book_equity + pv_ri + (term_ri / ((1.0 + cost_of_equity) ** 5)))
     ri_per_share = ri_equity_val / shares_outstanding
 
-    # Vrstva 03: Relativní ocenění pomocí srovnatelných tržních násobků
     sector_benchmarks = {
         "Technology": {"ev_ebitda": 24.0, "pe": 32.0, "ev_revenue": 11.5, "pb": 12.0},
         "Financial Services": {"ev_ebitda": 11.0, "pe": 13.5, "ev_revenue": 3.5, "pb": 1.45},
         "Healthcare": {"ev_ebitda": 16.5, "pe": 22.0, "ev_revenue": 4.8, "pb": 4.5},
         "Industrials": {"ev_ebitda": 14.0, "pe": 20.0, "ev_revenue": 2.4, "pb": 3.8},
         "Energy": {"ev_ebitda": 7.5, "pe": 11.5, "ev_revenue": 1.4, "pb": 1.8},
+        "Utilities": {"ev_ebitda": 10.5, "pe": 14.0, "ev_revenue": 2.2, "pb": 1.6},
     }
-    bench = sector_benchmarks.get(sector, {"ev_ebitda": 18.0, "pe": 24.0, "ev_revenue": 5.5, "pb": 5.0})
-    fwd_factor = (1.0 + growth) ** 2
+    bench = sector_benchmarks.get(sector, {"ev_ebitda": 16.0, "pe": 22.0, "ev_revenue": 4.5, "pb": 4.5})
+    fwd_factor = (1.0 + eff_growth) ** 2
 
     peer_rows = [
         {
@@ -1331,16 +1718,14 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
     comps_prices = [r["implied_share_price"] for r in peer_rows[:3] if r["implied_share_price"] > 0]
     blended_comps_price = sum(comps_prices) / len(comps_prices) if comps_prices else dcf_intrinsic_share
 
-    # Vrstva 04: Majetkové ocenění (součet částí a čistá hodnota aktiv)
-    core_segment_ev = normalized_ebitda * exit_mult * 0.82
-    growth_segment_ev = normalized_ebitda * (exit_mult * 1.15) * 0.18
+    core_segment_ev = normalized_ebitda * eff_exit_mult * 0.82
+    growth_segment_ev = normalized_ebitda * (eff_exit_mult * 1.15) * 0.18
     sotp_ev = core_segment_ev + growth_segment_ev
     sotp_equity = max(0.0, sotp_ev + total_cash - total_debt - minority_interest)
     sotp_per_share = sotp_equity / shares_outstanding
     nav_per_share = max(0.0, (book_equity + (total_cash - total_debt) * 0.25) / shares_outstanding)
 
-    # Vrstva 05: Model pákového odkupu a citlivostní matice
-    lbo_entry_debt = enterprise_value * leverage
+    lbo_entry_debt = enterprise_value * eff_leverage
     lbo_entry_equity = max(1000.0, enterprise_value - lbo_entry_debt)
 
     def simulate_lbo(g_rate: float) -> list[dict]:
@@ -1365,14 +1750,14 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
             })
         return rows
 
-    lbo_years = simulate_lbo(growth)
-    lbo_exit_ev = lbo_years[-1]["projektovany_provozni_zisk_pred_odpisy"] * exit_mult
+    lbo_years = simulate_lbo(eff_growth)
+    lbo_exit_ev = lbo_years[-1]["projektovany_provozni_zisk_pred_odpisy"] * eff_exit_mult
     lbo_exit_equity = max(0.0, lbo_exit_ev - lbo_years[-1]["zbyvajici_cizi_kapital"])
     lbo_moic = (lbo_exit_equity / lbo_entry_equity) if lbo_entry_equity > 0 else 0.0
     lbo_irr = ((lbo_moic ** (1.0 / 5.0)) - 1.0) * 100.0 if lbo_moic > 0 else -100.0
 
-    growth_grid = [max(-0.50, growth + d) for d in [-0.04, -0.02, 0.0, 0.02, 0.04]]
-    mult_grid = [max(2.0, exit_mult + d) for d in [-5.0, -2.5, 0.0, 2.5, 5.0]]
+    growth_grid = [max(-0.50, eff_growth + d) for d in [-0.04, -0.02, 0.0, 0.02, 0.04]]
+    mult_grid = [max(2.0, eff_exit_mult + d) for d in [-5.0, -2.5, 0.0, 2.5, 5.0]]
     lbo_sensitivity = []
     for g_val in growth_grid:
         sim_y = simulate_lbo(g_val)
@@ -1396,22 +1781,21 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
         cells = []
         for tg_val in tg_grid:
             safe_tg = min(tg_val, w_val - 0.015)
-            p_val = simulate_fcff_dcf(growth, w_val, exit_mult, safe_tg)["intrinsic_value_per_share"]
+            p_val = simulate_fcff_dcf(eff_growth, w_val, eff_exit_mult, safe_tg)["intrinsic_value_per_share"]
             cells.append({"tg": round(tg_val * 100.0, 2), "price": round(p_val, 2)})
         dcf_sensitivity.append({"wacc": round(w_val * 100.0, 2), "cells": cells})
 
-    # Vrstva 06: Scénáře a simulace Monte Carlo (2 500 běhů) + histogram pro živý graf
-    bear_val = simulate_fcff_dcf(growth * 0.55, wacc + 0.015, exit_mult * 0.78, max(0.015, terminal_growth - 0.005))["intrinsic_value_per_share"]
+    bear_val = simulate_fcff_dcf(eff_growth * 0.55, wacc + 0.015, eff_exit_mult * 0.78, max(0.015, terminal_growth - 0.005))["intrinsic_value_per_share"]
     base_val = dcf_intrinsic_share
-    bull_val = simulate_fcff_dcf(growth * 1.30, max(0.065, wacc - 0.010), exit_mult * 1.18, min(0.035, terminal_growth + 0.005))["intrinsic_value_per_share"]
+    bull_val = simulate_fcff_dcf(eff_growth * 1.30, max(0.065, wacc - 0.010), eff_exit_mult * 1.18, min(0.035, terminal_growth + 0.005))["intrinsic_value_per_share"]
     scenario_expected = 0.25 * bear_val + 0.50 * base_val + 0.25 * bull_val
 
     rng = random.Random(42)
     mc_results = []
     for _ in range(2500):
-        sim_g = rng.gauss(growth, max(0.03, abs(growth) * 0.22))
+        sim_g = rng.gauss(eff_growth, max(0.03, abs(eff_growth) * 0.22))
         sim_wacc = max(0.06, min(0.18, rng.gauss(wacc, 0.011)))
-        sim_mult = max(5.0, rng.gauss(exit_mult, exit_mult * 0.14))
+        sim_mult = max(5.0, rng.gauss(eff_exit_mult, eff_exit_mult * 0.14))
         sim_margin_shock = rng.gauss(1.0, 0.08)
         sim_fcf = normalized_fcf * sim_margin_shock
         pv_cf = 0.0
@@ -1440,7 +1824,6 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
     mc_p95 = mc_results[int(0.95 * n_mc)]
     prob_above_market = sum(1 for x in mc_results if x > current_price) / n_mc * 100.0
 
-    # Výpočet 14 intervalů histogramu mezi P2 a P98 pro graf Monte Carlo
     hist_low = mc_results[int(0.02 * n_mc)]
     hist_high = max(hist_low + 1.0, mc_results[int(0.98 * n_mc)])
     num_bins = 14
@@ -1457,7 +1840,6 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
             "count": count,
         })
 
-    # Vrstva 07: Syntéza ocenění
     if sector == "Financial Services":
         weights = {
             "Vícefázový DCF pro podnik": 0.15,
@@ -1466,6 +1848,15 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
             "Model reziduálního zisku": 0.20,
             "Metoda součtu částí": 0.05,
             "Medián Monte Carlo (P50)": 0.10,
+        }
+    elif market_cap > book_equity * 6.0:
+        weights = {
+            "Vícefázový DCF pro podnik": 0.40,
+            "DCF pro vlastní kapitál": 0.12,
+            "Srovnatelné tržní násobky": 0.20,
+            "Model reziduálního zisku": 0.03,
+            "Metoda součtu částí": 0.10,
+            "Medián Monte Carlo (P50)": 0.15,
         }
     else:
         weights = {
@@ -1517,7 +1908,7 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
         disagreement_note = (
             f"Rozptyl mezi fundamentálním výnosovým modelem ({dcf_intrinsic_share:,.2f} {currency}) a tržními násobky "
             f"({blended_comps_price:,.2f} {currency}) dosahuje {spread_ratio * 100:.1f} %. Rozdíl je způsoben projekcí "
-            f"růstu volných peněžních toků ({growth * 100:.1f} %) vůči průměrným sektorovým násobkům."
+            f"růstu volných peněžních toků ({eff_growth * 100:.1f} %) vůči průměrným sektorovým násobkům."
         )
     else:
         disagreement_note = (
@@ -1525,7 +1916,6 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
             f"a relativní násobky ({blended_comps_price:,.2f} {currency}) potvrzují konzistentní odhad vnitřní hodnoty."
         )
 
-    # Vrstva 08: Rozhodovací rámec a analýza rizik
     mos_percent = ((weighted_fair_value - current_price) / weighted_fair_value) * 100.0 if weighted_fair_value > 0 else 0.0
     upside_to_fair = ((weighted_fair_value / current_price) - 1.0) * 100.0 if current_price > 0 else 0.0
 
@@ -1588,6 +1978,8 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
     return {
         "spolecnost": clean_ticker,
         "company_name": company_name,
+        "company_logo_url": company_logo_url,
+        "company_logo_urls": company_logo_urls,
         "ticker": clean_ticker,
         "currency": currency,
         "exchange": exchange,
@@ -1596,6 +1988,11 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
         "country": country,
         "employees": employees,
         "business_summary": business_summary,
+        "dynamic_defaults": {
+            "leverage_percent": round(auto_lev * 100.0, 1),
+            "growth_percent": round(auto_grw * 100.0, 1),
+            "exit_multiple": round(auto_mult, 1),
+        },
         "trzni_kapitalizace": round(market_cap, 2),
         "celkovy_dluh": round(total_debt, 2),
         "hotovost": round(total_cash, 2),
@@ -1648,8 +2045,8 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
         },
         "reverse_dcf": {
             "implied_fcf_growth_percent": round(implied_growth_pct, 2),
-            "assumed_growth_percent": round(growth * 100.0, 2),
-            "expectation_gap_percent": round((growth * 100.0) - implied_growth_pct, 2),
+            "assumed_growth_percent": round(eff_growth * 100.0, 2),
+            "expectation_gap_percent": round((eff_growth * 100.0) - implied_growth_pct, 2),
         },
         "residual_income": {
             "book_value_equity": round(book_equity, 2),
@@ -1722,15 +2119,15 @@ def run_valuation_logic(ticker: str, leverage: float = 0.15, growth: float = 0.2
             "altman_status": altman_status,
         },
         "audit_trail": {
-            "model_version": "Tensegrity Institutional Engine v2.1",
+            "model_version": "Tensegrity Institutional Engine v2.4",
             "timestamp": get_prague_now().strftime("%Y-%m-%d %H:%M:%S %Z"),
             "data_source": "Yahoo Finance Institutional Feed + Live Treasury Benchmark",
             "currency": currency,
             "units": "Absolutní hodnoty (akcie v jednotkách)",
             "assumptions": {
-                "leverage_percent": round(leverage * 100.0, 1),
-                "growth_percent": round(growth * 100.0, 1),
-                "exit_multiple": round(exit_mult, 1),
+                "leverage_percent": round(eff_leverage * 100.0, 1),
+                "growth_percent": round(eff_growth * 100.0, 1),
+                "exit_multiple": round(eff_exit_mult, 1),
                 "terminal_growth_percent": round(terminal_growth * 100.0, 2),
             },
         },
@@ -1781,11 +2178,12 @@ def call_external_llm_if_configured(question: str, history: list[dict], d: dict)
             "risk_analysis": d["risk_analysis"],
         }
         system_instruction = (
-            "Jsi institucionální finanční a investiční analytik platformy Tensegrity Terminal. "
-            "Odpovídej vždy česky, věcně, přesně, kriticky a přímo na otázku uživatele. "
-            "Nepoužívej zbytečné zkratky, vysvětluj souvislosti s konkrétními čísly z přiloženého modelu společnosti. "
-            "Pokud se uživatel ptá na obecné finanční, ekonomické nebo investiční téma, odpověz naplno a propojíš to s kontextem.\n"
-            f"Data aktuálně analyzované společnosti: {json.dumps(compact_context, ensure_ascii=False)}"
+            "Jsi špičkový institucionální investiční, finanční a všeobecný analytik platformy Tensegrity Terminal. "
+            "Máš ABSOLUTNÍ VOLNOST odpovědět na JAKÝKOLIV dotaz uživatele bez jakýchkoliv omezení. "
+            "Ať už se uživatel ptá na složité oceňovací modely, vysvětlení pojmů pro dítě, filosofické otázky, "
+            "obecné věci, kódování, historii, nebo úplné banality, vždy odpovíš inteligentně, věcně, přirozenou češtinou, "
+            "bez jakýchkoliv šablonovitých frází a bez vnucování finančních údajů, pokud se na ně uživatel výslovně neptal.\n"
+            f"Živá data aktuálně vybrané společnosti (použij je POUZE tehdy, pokud se dotaz týká financí nebo této firmy): {json.dumps(compact_context, ensure_ascii=False)}"
         )
         history_text = ""
         for msg in history[-6:]:
@@ -1816,7 +2214,7 @@ def call_external_llm_if_configured(question: str, history: list[dict], d: dict)
             if parts and parts[0].get("text"):
                 return parts[0]["text"].strip()
     except Exception as err:
-        logger.warning("Externí jazykový model nebyl dostupný, přepínám na lokální analytické jádro: %s", err)
+        logger.warning("Externí jazykový model nebyl dostupný, přepínám na lokální jádro: %s", err)
     return None
 
 
@@ -1825,7 +2223,8 @@ def generate_smart_advisor_answer(question: str, history: list[dict], d: dict) -
     if llm_reply:
         return llm_reply
 
-    q = question.lower().strip()
+    q_raw = question.strip()
+    q = q_raw.lower()
     curr = d["currency"]
     name = d["company_name"]
     tk = d["ticker"]
@@ -1839,6 +2238,7 @@ def generate_smart_advisor_answer(question: str, history: list[dict], d: dict) -
     mos = d["decision_engine"]["margin_of_safety_percent"]
     zone = d["decision_engine"]["zone"]
     tranche = d["decision_engine"]["tranche_allocation_percent"]
+    bands = d["decision_engine"]["bands"]
     f = d["fundamentals"]
     w = d["wacc_engine"]
     rev = d["reverse_dcf"]
@@ -1847,198 +2247,112 @@ def generate_smart_advisor_answer(question: str, history: list[dict], d: dict) -
     rsk = d["risk_analysis"]
     lbo = d["model_odkupu_za_cizi_kapital_base_case"]
 
-    # 1. Vysvětlení konkrétních pojmů ("co znamená", "co je", "vysvětli")
-    if any(k in q for k in ["co znamená", "co je ", "vysvětli", "definice", "jak se počítá"]):
-        if "wacc" in q or "náklady kapitálu" in q or "diskont" in q:
+    # Pokud se uživatel ptá na vysvětlení jako pro dítě / pro malého kluka
+    if any(k in q for k in ["dítě", "dítěte", "ditě", "dítko", "malého", "malemu", "decku", "dečka", "jednoduše", "jednoduse"]):
+        if any(k in q for k in ["lbo", "pákový", "pakovy"]):
             return (
-                f"Vážené průměrné náklady kapitálu představují minimální roční výnosnost, kterou musí {name} ({tk}) dosáhnout, "
-                f"aby uspokojila jak své akcionáře, tak věřitele. V aktuálním modelu vycházejí na {w['wacc_percent']:.2f} %.\n\n"
-                f"Jak jsme k tomuto číslu došli:\n"
-                f"• Náklady vlastního kapitálu činí {w['cost_of_equity_percent']:.2f} % (součet bezrizikové sazby desetiletých amerických dluhopisů "
-                f"{w['risk_free_rate_percent']:.2f} % a součinu citlivosti akcie {w['beta']:.2f} s tržní rizikovou prémií {w['erp_percent']:.2f} %).\n"
-                f"• Náklady cizího kapitálu po zdanění činí {w['after_tax_cost_of_debt_percent']:.2f} %.\n"
-                f"• Vzhledem ke kapitálové struktuře ({w['weight_equity_percent']:.1f} % vlastní kapitál a {w['weight_debt_percent']:.1f} % dluh) "
-                f"vzniká výsledná diskontní sazba {w['wacc_percent']:.2f} %. Čím vyšší tato sazba je, tím nižší je současná hodnota budoucích peněžních toků."
+                f"Představ si, že chceš koupit velký obchod s hračkami, ale nemáš dost peněz. "
+                f"Tak si půjčíš většinu peněz od banky, obchod koupíš a z vydělaných peněz z prodeje hraček tu půjčku bance postupně splácíš. "
+                f"Když pak obchod po pěti letech prodáš dráž, všechny peníze, které zbydou po splacení banky, jsou tvoje čistý zisk!"
             )
-        if "reverse" in q or "obrácen" in q or "implikovan" in q:
+        if any(k in q for k in ["dcf", "dfc", "diskont"]):
             return (
-                f"Obrácený model diskontovaných peněžních toků otáčí běžný výpočet naruby: místo hledání vnitřní hodnoty zjišťuje, "
-                f"jaké roční tempo růstu volných peněžních toků už je započítáno v dnešní tržní ceně akcie ({p_now:,.2f} {curr}).\n\n"
-                f"U společnosti {name} ({tk}) současná cena na burze předpokládá roční růst volných peněžních toků o {rev['implied_fcf_growth_percent']:.2f} % "
-                f"v příštích pěti letech. V našem scénáři uvažujeme růst {rev['assumed_growth_percent']:.2f} %, což vytváří rozdíl "
-                f"{rev['expectation_gap_percent']:+.2f} procentního bodu mezi naším odhadem a očekáváním trhu."
-            )
-        if "monte carlo" in q or "percentil" in q or "p50" in q:
-            return (
-                f"Simulace Monte Carlo spouští 2 500 nezávislých výpočtů vnitřní hodnoty, ve kterých se současně náhodně mění tempo růstu, "
-                f"diskontní sazba, výstupní násobek i provozní marže podle pravděpodobnostního rozdělení.\n\n"
-                f"Pro {name} ({tk}) ukazuje prostřední hodnota (medián P50) úroveň {mc['p50']:,.2f} {curr}. "
-                f"Osmdesát procent všech scénářů se nachází mezi {mc['p10']:,.2f} {curr} a {mc['p90']:,.2f} {curr}, "
-                f"přičemž pravděpodobnost, že vnitřní hodnota převyšuje dnešní tržní cenu, dosahuje {mc['prob_above_market_percent']:.1f} %."
-            )
-        if "roic" in q or "návratnost" in q or "ekonomický zisk" in q or "eva" in q:
-            return (
-                f"Návratnost investovaného kapitálu měří, kolik čistého provozního zisku po zdanění dokáže {name} ({tk}) vygenerovat "
-                f"z každé koruny či dolaru vloženého do podnikání. Aktuálně dosahuje {f['roic_percent']:.2f} %.\n\n"
-                f"Protože tato návratnost převyšuje vážené průměrné náklady kapitálu ({w['wacc_percent']:.2f} %), firma vytváří skutečnou "
-                f"ekonomickou hodnotu ve výši {_fmt_cz_large(f['economic_profit'], curr)} ročně. Pokud by návratnost klesla pod náklady kapitálu, "
-                f"růst firmy by hodnotu pro akcionáře naopak ničil."
-            )
-        if "piotroski" in q or "altman" in q or "skóre" in q:
-            return (
-                f"Piotroski skóre (0 až 9 bodů) hodnotí devět účetních kritérií ziskovosti, tvorby hotovosti, zadlužení a provozní efektivity. "
-                f"{name} ({tk}) dosahuje {rsk['piotroski_f_score']} z 9 bodů.\n\n"
-                f"Altmanovo Z-skóre měří finanční stabilitu a odolnost vůči úpadku kombinací pracovního kapitálu, nerozděleného zisku, "
-                f"provozního zisku, tržní hodnoty vlastního kapitálu a obratu aktiv. Hodnota {rsk['altman_z_score']:.2f} znamená: {rsk['altman_status']}."
-            )
-        if "margin of safety" in q or "bezpečnostní rezerva" in q or "zón" in q:
-            return (
-                f"Bezpečnostní rezerva vyjadřuje procentuální rozdíl mezi odhadovanou váženou vnitřní hodnotou ({p_fair:,.2f} {curr}) "
-                f"a aktuální tržní cenou ({p_now:,.2f} {curr}). U {name} ({tk}) nyní činí {mos:.2f} %.\n\n"
-                f"Model rozděluje cenové pásmo do čtyř zón: zelená (rezerva nad 20 %, alokace 55 % plánované pozice), "
-                f"žlutá (rezerva 10 až 20 %, alokace 30 %), oranžová (rezerva 0 až 10 %, alokace 15 %) a červená (cena nad vnitřní hodnotou, alokace 0 %). "
-                f"Aktuálně se titul nachází v zóně {zone}."
+                f"Představ si, že máš strom, který každý rok rodí zlatá jablka. "
+                f"Metoda DCF je jako chytrý výpočet toho, kolik by ti někdo musel zaplatit hned teď, kdybychom sečetli všechna zlatá jablka, která ten strom v budoucnu sklidí."
             )
 
-    # 2. Zadluženost, hotovost, likvidita, rozvaha
-    if any(k in q for k in ["dluh", "zadlužen", "hotovost", "likvidit", "solvent", "úrok", "rozvah", "přežije"]):
-        net_debt_txt = (
-            f"čistou hotovost ve výši {_fmt_cz_large(abs(d['cisty_dluh']), curr)} (hotovost převyšuje celkový dluh)"
-            if d["cisty_dluh"] <= 0
-            else f"čistý dluh ve výši {_fmt_cz_large(d['cisty_dluh'], curr)}, což odpovídá {f['net_debt_to_ebitda']:.2f}násobku normalizovaného provozního zisku"
-        )
+    amount_match = re.search(r"(\d[\d\s\.,]*\d|\d+)\s*(tis\.?|tisíc|mil\.?|milion|kč|czk|usd|\$|eur|€)?", q)
+    if any(k in q for k in ["rozložit", "kapitál", "investovat", "částk", "peněz", "peníze", "portfoli", "tranš", "kolik koupit", "alokac"]) or (
+        amount_match and any(k in q for k in ["mám", "chci", "kč", "czk", "usd", "eur", "tisíc", "tis"])
+    ):
+        raw_num = 30000.0
+        unit_label = "CZK"
+        if amount_match:
+            num_str = re.sub(r"[^\d,\.]", "", amount_match.group(1)).replace(",", ".")
+            try:
+                parsed_val = float(num_str)
+                unit_raw = (amount_match.group(2) or "").lower()
+                if "tis" in unit_raw:
+                    parsed_val *= 1000.0
+                elif "mil" in unit_raw:
+                    parsed_val *= 1_000_000.0
+                if parsed_val > 0:
+                    raw_num = parsed_val
+                if any(u in q for u in ["usd", "$", "dolar"]):
+                    unit_label = "USD"
+                elif any(u in q for u in ["eur", "€"]):
+                    unit_label = "EUR"
+            except ValueError:
+                pass
+
+        fx_rates = get_live_forex_rates()["rates"]
+        usd_czk = fx_rates["USD/CZK"]["rate"]
+        eur_czk = fx_rates["EUR/CZK"]["rate"]
+
+        if unit_label == "CZK" and curr == "USD":
+            invest_in_stock_curr = raw_num / usd_czk
+            conv_note = f"(přepočteno živým kurzem {usd_czk:.2f} CZK/USD na cca {invest_in_stock_curr:,.2f} USD)"
+        elif unit_label == "CZK" and curr == "EUR":
+            invest_in_stock_curr = raw_num / eur_czk
+            conv_note = f"(přepočteno živým kurzem {eur_czk:.2f} CZK/EUR na cca {invest_in_stock_curr:,.2f} EUR)"
+        else:
+            invest_in_stock_curr = raw_num
+            conv_note = ""
+
+        single_stock_cap = raw_num * 0.30
+        rest_portfolio = raw_num - single_stock_cap
+        t_orange = single_stock_cap * 0.25
+        t_yellow = single_stock_cap * 0.35
+        t_green = single_stock_cap * 0.40
+
         return (
-            f"Rozvahová a dluhová analýza společnosti {name} ({tk}):\n"
-            f"• Celkový úročený dluh činí {_fmt_cz_large(d['celkovy_dluh'], curr)}, zatímco disponibilní hotovost a krátkodobé investice dosahují {_fmt_cz_large(d['hotovost'], curr)}.\n"
-            f"• Firma tedy vykazuje {net_debt_txt}.\n"
-            f"• Běžná likvidita (poměr oběžných aktiv ke krátkodobým závazkům) je {f['current_ratio']:.2f} a úrokové krytí provozním ziskem dosahuje {f['interest_coverage']:.1f}násobku.\n"
-            f"• Altmanovo Z-skóre stability je {rsk['altman_z_score']:.2f} ({rsk['altman_status']}). Z pohledu rozvahy je finanční riziko {'velmi nízké' if d['cisty_dluh'] <= 0 or f['net_debt_to_ebitda'] < 1.5 else 'zvýšené a vyžaduje sledování úrokových nákladů'}."
+            f"Návrh rozložení kapitálu {raw_num:,.0f} {unit_label} {conv_note} se zaměřením na {name} ({tk}):\n\n"
+            f"1. Řízení rizika a diverzifikace:\n"
+            f"• Do jedné jednotlivé akcie ({tk}) doporučuji alokovat nejvýše 30 % celkového kapitálu, tedy {single_stock_cap:,.0f} {unit_label}.\n"
+            f"• Zbývajících {rest_portfolio:,.0f} {unit_label} (70 %) rozložte mezi široký indexový fond (např. S&P 500, cca 50 %) a úročenou hotovostní rezervu (cca 20 %).逢"
+            f"2. Postupné nákupní tranše pro {tk}:\n"
+            f"• 1. tranše (25 % = {t_orange:,.0f} {unit_label}): limitní nákup v zóně ORANGE.\n"
+            f"• 2. tranše (35 % = {t_yellow:,.0f} {unit_label}): dokup v zóně YELLOW.\n"
+            f"• 3. tranše (40 % = {t_green:,.0f} {unit_label}): hlavní dokup v zóně GREEN."
         )
 
-    # 3. Negativa, skryté chyby, problémy firmy, rizika
-    if any(k in q for k in ["negativ", "skryt", "chyb", "problém", "rizik", "slab", "pozor", "hrozb", "špatn"]):
-        red_flags = []
-        sbc_share = (f["sbc_expense"] / max(1.0, f["reported_fcf"])) * 100.0
-        red_flags.append(
-            f"1. Ředění prostřednictvím akciových odměn zaměstnancům: Vykazovaný volný peněžní tok ({_fmt_cz_large(f['reported_fcf'], curr)}) "
-            f"je nadhodnocen nepeněžními akciovými odměnami ve výši {_fmt_cz_large(f['sbc_expense'], curr)} ({sbc_share:.1f} % reportovaného toku). "
-            f"Po jejich ekonomickém očištění klesá reálný peněžní tok pro akcionáře na {_fmt_cz_large(f['normalized_fcf'], curr)}."
-        )
-        if d["dcf_valuation"]["tv_share_percent"] > 65.0:
-            red_flags.append(
-                f"2. Vysoká citlivost na vzdálenou budoucnost: Plných {d['dcf_valuation']['tv_share_percent']:.1f} % hodnoty podniku ve výnosovém modelu "
-                f"pochází až z terminální hodnoty po pátém roce. I malá změna úrokových sazeb nebo zpomalení růstu po pátém roce výrazně zahýbe s cenou akcie."
-            )
-        if rev["implied_fcf_growth_percent"] > 15.0:
-            red_flags.append(
-                f"3. Vysoko nastavená laťka tržních očekávání: Současná burzovní cena už v sobě započítává roční růst peněžních toků o "
-                f"{rev['implied_fcf_growth_percent']:.2f} % po dobu pěti let. Jakékoliv čtvrtletní zaváhání v maržích může vyvolat prudkou korekci násobků."
-            )
-        if mos < 0:
-            red_flags.append(
-                f"4. Absence bezpečnostní rezervy: Akcie se obchoduje o {abs(mos):.2f} % dráže, než činí naše vážená vnitřní hodnota ({p_fair:,.2f} {curr}), "
-                f"což neposkytuje žádný polštář proti makroekonomickému zpomalení."
-            )
-        if d["cisty_dluh"] > 0 and f["net_debt_to_ebitda"] > 2.0:
-            red_flags.append(
-                f"5. Vyšší dluhová páka: Čistý dluh dosahuje {f['net_debt_to_ebitda']:.2f}násobku provozního zisku, což zvyšuje citlivost na refinanční sazby."
-            )
-        if len(red_flags) < 3:
-            red_flags.append(
-                f"3. Cyklicita a koncentrace odvětví ({d['sector']} / {d['industry']}): Provozní marže ({f['operating_margin_percent']:.1f} %) "
-                f"jsou vystaveny investičním cyklům odběratelů, konkurenčnímu tlaku a regulačním zásahům."
-            )
-        return (
-            f"Hloubkový audit rizik, slabin a skrytých úskalí pro {name} ({tk}):\n\n"
-            + "\n\n".join(red_flags)
-        )
+    concept_explanations = [
+        (["dcff", "fcff"], f"DCFF (Discounted Cash Flow to Firm) oceňuje celou firmu na základě budoucích volných peněžních toků diskontovaných přes WACC ({w['wacc_percent']:.2f} %). U {name} vychází na {dcf_p:,.2f} {curr} na akcii."),
+        (["fcfe"], f"FCFE počítá peněžní toky čistě pro akcionáře po zaplacení dluhu. Pro {name} vychází na {fcfe_p:,.2f} {curr} na akcii."),
+        (["dcf", "dfc", "diskontovan"], f"DCF určuje vnitřní hodnotu firmy součtem všech budoucích volných peněžních toků převedených na dnešní hodnotu pomocí diskontní sazby WACC ({w['wacc_percent']:.2f} %). U {name} vychází na {dcf_p:,.2f} {curr}."),
+        (["akcie", "akcii", "akciový"], f"Akcie představuje vlastnický podíl na společnosti. Koupí jedné akcie {name} ({tk}) za {p_now:,.2f} {curr} se stáváte spolumajitelem podniku."),
+        (["wacc", "náklady kapitálu"], f"Náklady kapitálu (WACC) u {name} činí {w['wacc_percent']:.2f} % (náklady vlastního kapitálu {w['cost_of_equity_percent']:.2f} % a zdaněné náklady dluhu {w['after_tax_cost_of_debt_percent']:.2f} %)."),
+        (["roic", "návratnost"], f"Návratnost investovaného kapitálu (ROIC) dosahuje {f['roic_percent']:.2f} % při WACC {w['wacc_percent']:.2f} %, což generuje ekonomický zisk {_fmt_cz_large(f['economic_profit'], curr)}."),
+        (["lbo", "pákový"], f"LBO (Leveraged Buyout) simuluje převzetí firmy s využitím cizího kapitálu a její prodej po 5 letech. U {name} vychází MOIC na {lbo['moic']:.2f}x a IRR na {lbo['irr_procent']:.2f} %."),
+        (["ebitda"], f"EBITDA je provozní zisk před odpisy. U {name} činí normalizovaná EBITDA {_fmt_cz_large(f['normalized_ebitda'], curr)}."),
+        (["fcf", "volný peněžní tok"], f"Volný peněžní tok (FCF) představuje hotovost po odečtení investic. Normalizovaný FCF {name} činí {_fmt_cz_large(f['normalized_fcf'], curr)} ročně."),
+    ]
+    for keywords, explanation in concept_explanations:
+        if any(k in q for k in keywords):
+            return explanation
 
-    # 4. Pozitiva, silné stránky, proč koupit
-    if any(k in q for k in ["pozitiv", "siln", "výhod", "proč koupit", "atraktiv", "kvalit", "potenciál"]):
-        positives = [
-            f"1. Tvorba ekonomické hodnoty: Návratnost investovaného kapitálu ({f['roic_percent']:.2f} %) výrazně překonává náklady kapitálu ({w['wacc_percent']:.2f} %), "
-            f"čímž firma generuje čistý ekonomický zisk {_fmt_cz_large(f['economic_profit'], curr)} ročně.",
-            f"2. Silná přeměna zisku na hotovost: Konverze normalizovaného provozního zisku do volného peněžního toku dosahuje {f['fcf_conversion_percent']:.1f} %, "
-            f"což umožňuje financovat další expanzi bez nutnosti externího zadlužování.",
-            f"3. Fundamentální zdraví účetních výkazů: Piotroski skóre dosahuje {rsk['piotroski_f_score']} z 9 bodů při provozní marži {f['operating_margin_percent']:.1f} %.",
-        ]
-        if d["cisty_dluh"] <= 0:
-            positives.append(
-                f"4. Pevnostní rozvaha s čistou hotovostí: Hotovost ({_fmt_cz_large(d['hotovost'], curr)}) převyšuje celkový dluh ({_fmt_cz_large(d['celkovy_dluh'], curr)}), "
-                f"což dává vedení prostor pro zpětné odkupy akcií i odolnost v recesi."
-            )
-        if mos > 0:
-            positives.append(
-                f"5. Pozitivní bezpečnostní rezerva: Akcie se obchoduje se slevou {mos:.2f} % pod váženou vnitřní hodnotou {p_fair:,.2f} {curr} (zóna {zone})."
-            )
-        return f"Hlavní fundamentální pozitiva a konkurenční přednosti {name} ({tk}):\n\n" + "\n\n".join(positives)
-
-    # 5. Proč valuace vyšla takhle / vysvětlení výpočtu
-    if any(k in q for k in ["proč", "vyšla", "vysvětli valuaci", "jak vyšla", "rozdíl", "metod"]):
-        return (
-            f"Rozklad toho, proč vážená vnitřní hodnota {name} ({tk}) vyšla na {p_fair:,.2f} {curr} oproti tržní ceně {p_now:,.2f} {curr}:\n\n"
-            f"• Výchozí základna: Vycházíme z ročních tržeb {_fmt_cz_large(f['revenue'], curr)} a normalizovaného volného peněžního toku "
-            f"{_fmt_cz_large(f['normalized_fcf'], curr)} (po odečtení ekonomického nákladu akciových odměn).\n"
-            f"• Jednotlivé oceňovací přístupy dávají tyto výsledky:\n"
-            f"  – Vícefázový výnosový model pro podnik (váha 35 %): {dcf_p:,.2f} {curr} při diskontní sazbě {w['wacc_percent']:.2f} %.\n"
-            f"  – Srovnatelné tržní násobky sektoru (váha 20 %): {comps_p:,.2f} {curr}.\n"
-            f"  – Medián simulace Monte Carlo (váha 15 %): {mc['p50']:,.2f} {curr}.\n"
-            f"  – Výnosový model pro vlastní kapitál (váha 10 %): {fcfe_p:,.2f} {curr}.\n"
-            f"  – Model reziduálního zisku (váha 10 %): {ri_p:,.2f} {curr}.\n"
-            f"  – Ocenění součtem částí (váha 10 %): {sotp_p:,.2f} {curr}.\n\n"
-            f"• Diagnostika shody: {d['valuation_synthesis']['disagreement_note']}"
-        )
-
-    # 6. Scénáře, výhled, očekávání
-    if any(k in q for k in ["scénář", "očekávat", "výhled", "budoucnost", "bear", "bull", "pravděpodobnost"]):
-        return (
-            f"Scénářová a pravděpodobnostní analýza vývoje hodnoty pro {name} ({tk}):\n\n"
-            f"• Pesimistický scénář (pravděpodobnost 25 %): Při zpomalení růstu a vyšších úrokových sazbách vychází hodnota akcie na {sc['bear']['fair_value']:,.2f} {curr}.\n"
-            f"• Základní scénář (pravděpodobnost 50 %): Při naplnění modelových předpokladů činí hodnota {sc['base']['fair_value']:,.2f} {curr}.\n"
-            f"• Optimistický scénář (pravděpodobnost 25 %): Při akceleraci tržeb a expanzi násobků dosahuje hodnota {sc['bull']['fair_value']:,.2f} {curr}.\n"
-            f"• Pravděpodobnostně vážená očekávaná hodnota scénářů činí {sc['expected_value']:,.2f} {curr}.\n"
-            f"• Z 2 500 simulací Monte Carlo končí {mc['prob_above_market_percent']:.1f} % případů nad dnešní tržní cenou ({p_now:,.2f} {curr}), "
-            f"přičemž střední hodnota leží na {mc['p50']:,.2f} {curr}."
-        )
-
-    # 7. Profil společnosti, odvětví, čím se zabývá
-    if any(k in q for k in ["čím se zabývá", "co dělá", "profil", "byznys", "odvětví", "sektor", "zaměstnanc", "společnost"]):
-        summary_snippet = d["business_summary"][:450] + ("..." if len(d["business_summary"]) > 450 else "")
-        return (
-            f"Profil společnosti {name} ({tk}):\n"
-            f"• Zařazení: Sektor {d['sector']}, odvětví {d['industry']}, sídlo {d['country']}, počet zaměstnanců přibližně {d['employees']:,}.\n"
-            f"• Velikost a výkonnost: Tržní kapitalizace {_fmt_cz_large(d['trzni_kapitalizace'], curr)}, roční tržby {_fmt_cz_large(f['revenue'], curr)} "
-            f"a provozní marže {f['operating_margin_percent']:.1f} %.\n"
-            f"• Popis činnosti z burzovního prospektu: {summary_snippet if summary_snippet else 'Podrobný popis činnosti není u tohoto titulu v datovém zdroji uveden.'}"
-        )
-
-    # 8. Pákový odkup
-    if any(k in q for k in ["pákov", "odkup", "lbo", "irr", "moic", "akvizic"]):
-        return (
-            f"Analýza modelu pákového odkupu pro {name} ({tk}) při nastavení {d['audit_trail']['assumptions']['leverage_percent']:.1f} % cizího kapitálu:\n"
-            f"• Vstupní vlastní kapitál investora činí {_fmt_cz_large(lbo['vstupni_vlastni_kapital'], curr)} a vstupní akviziční dluh {_fmt_cz_large(lbo['vstupni_cizi_kapital'], curr)}.\n"
-            f"• Za pět let splácení dluhu z volných peněžních toků dosahuje výstupní hodnota vlastního kapitálu {_fmt_cz_large(lbo['vystupni_hodnota_vlastniho_kapitalu'], curr)}.\n"
-            f"• Výsledný násobek investovaného kapitálu činí {lbo['moic']}x a vnitřní míra výnosnosti dosahuje {lbo['irr_procent']:.2f} % ročně."
-        )
-
-    # 9. Obecný inteligentní rozbor na jakýkoliv jiný dotaz
     return (
-        f"Odpověď k vašemu dotazu „{question}“ v kontextu společnosti {name} ({tk}):\n\n"
-        f"• Aktuální tržní cena činí {p_now:,.2f} {curr}, zatímco syntéza šesti nezávislých oceňovacích metod stanovuje váženou vnitřní hodnotu "
-        f"na {p_fair:,.2f} {curr} (bezpečnostní rezerva {mos:.2f} %, zóna {zone} s doporučenou alokací {tranche} %).\n"
-        f"• Klíčový fundamentální závěr: Firma generuje návratnost investovaného kapitálu {f['roic_percent']:.2f} % proti nákladům kapitálu "
-        f"{w['wacc_percent']:.2f} %, což znamená roční tvorbu ekonomické hodnoty {_fmt_cz_large(f['economic_profit'], curr)}.\n"
-        f"• Tržní očekávání vs. rizika: Cena na burze předpokládá roční růst peněžních toků o {rev['implied_fcf_growth_percent']:.2f} %. "
-        f"Pokud se chcete zaměřit na konkrétní oblast, zeptejte se například na zadluženost, skryté účetní chyby, vysvětlení libovolného ukazatele "
-        f"nebo pravděpodobnost jednotlivých scénářů."
+        f"Odpověď k dotazu „{q_raw}“:\n\n"
+        f"• Kontext pro titul {name} ({tk}): Tržní cena činí {p_now:,.2f} {curr}, vážená vnitřní hodnota je {p_fair:,.2f} {curr} (zóna {zone}).\n"
+        f"• Klíčové parametry: Růst FCF {d['audit_trail']['assumptions']['growth_percent']:.1f} %, WACC {w['wacc_percent']:.2f} %, ROIC {f['roic_percent']:.1f} %.\n\n"
+        f"Můžete se mě zeptat na cokoli dalšího — na výpočty, vysvětlení pojmů, scénáře či alokaci kapitálu."
     )
 
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
-    if os.path.exists(LOGO_PATH):
-        return FileResponse(LOGO_PATH)
+    logo_path = resolve_brand_logo_path(prefer_white=False)
+    if logo_path:
+        return FileResponse(logo_path)
     raise HTTPException(status_code=404, detail="Ikona nenalezena.")
+
+
+@app.get("/brand-logo.png", include_in_schema=False)
+async def brand_logo():
+    logo_path = resolve_brand_logo_path(prefer_white=True) or resolve_brand_logo_path(prefer_white=False)
+    if logo_path:
+        return FileResponse(logo_path)
+    raise HTTPException(status_code=404, detail="Logo nenalezeno.")
 
 
 @app.api_route("/subscribe", methods=["GET", "POST"])
@@ -2056,9 +2370,9 @@ async def handle_subscribe(request: Request, email: str = Query("")):
     return {
         "status": "ok",
         "message": (
-            "Pravidelný odběr byl bezpečně zaevidován. Seznam odběratelů je neveřejný a chráněný."
+            "Pravidelný odběr byl bezpečně zaevidován."
             if created
-            else "Tato e-mailová adresa je již bezpečně zaevidována k pravidelnému odběru."
+            else "Tato e-mailová adresa je již zaevidována."
         ),
     }
 
@@ -2085,7 +2399,7 @@ async def send_newsletter_now(request: Request):
         )
         return {
             "status": "ok",
-            "message": f"Zpravodaj Tensegrity Terminal | Intelligence včetně přílohy byl úspěšně odeslán na adresu {email}.",
+            "message": f"Zpravodaj včetně přílohy PDF byl úspěšně odeslán na adresu {email}.",
         }
     except HTTPException:
         raise
@@ -2096,9 +2410,9 @@ async def send_newsletter_now(request: Request):
 @app.get("/api/valuation/{ticker}")
 def get_institutional_terminal_valuation(
     ticker: str,
-    leverage: float = Query(0.15, ge=0.0, le=1.0),
-    growth: float = Query(0.22, gt=-0.95, le=5.0),
-    exit_mult: float = Query(24.0, gt=0.5, le=150.0),
+    leverage: float | None = Query(None, ge=0.0, le=1.0),
+    growth: float | None = Query(None, gt=-0.95, le=5.0),
+    exit_mult: float | None = Query(None, gt=0.5, le=150.0),
 ):
     try:
         return run_valuation_logic(ticker, leverage, growth, exit_mult)
@@ -2113,9 +2427,9 @@ async def ask_terminal_advisor(ticker: str, request: Request):
         question = str(payload.get("question", "")).strip()[:1200]
         history = payload.get("history") or []
         scenario = payload.get("scenario") or {}
-        leverage = safe_float(scenario.get("leverage"), 0.15)
-        growth = safe_float(scenario.get("growth"), 0.22)
-        exit_mult = safe_float(scenario.get("exit_mult"), 24.0)
+        leverage = safe_float(scenario.get("leverage"), None) if scenario.get("leverage") is not None else None
+        growth = safe_float(scenario.get("growth"), None) if scenario.get("growth") is not None else None
+        exit_mult = safe_float(scenario.get("exit_mult"), None) if scenario.get("exit_mult") is not None else None
         if not question:
             raise HTTPException(status_code=422, detail="Zadejte prosím svůj dotaz.")
 
@@ -2131,7 +2445,8 @@ async def ask_terminal_advisor(ticker: str, request: Request):
 @app.get("/api/news/{ticker}")
 def get_ticker_news(ticker: str):
     try:
-        raw_news = yf.Ticker(ticker.strip().upper() or "NVDA").news or []
+        resolved = resolve_company_ticker(ticker)
+        raw_news = yf.Ticker(resolved).news or []
         articles = []
         for item in raw_news[:8]:
             content = item.get("content", item) if isinstance(item, dict) else {}
@@ -2144,7 +2459,7 @@ def get_ticker_news(ticker: str):
                 "source": provider.get("displayName") or item.get("publisher") or "Finanční zpravodajství",
                 "url": clickthrough.get("url") or item.get("link") or "#",
             })
-        return {"ticker": ticker.upper(), "articles": articles}
+        return {"ticker": resolved, "articles": articles}
     except Exception as err:
         raise HTTPException(status_code=500, detail=str(err))
 
@@ -2157,9 +2472,9 @@ async def get_forex_rates():
 @app.get("/api/export/excel/{ticker}")
 def export_valuation_excel(
     ticker: str,
-    leverage: float = Query(0.15, ge=0.0, le=1.0),
-    growth: float = Query(0.22, gt=-0.95, le=5.0),
-    exit_mult: float = Query(24.0, gt=0.5, le=150.0),
+    leverage: float | None = Query(None, ge=0.0, le=1.0),
+    growth: float | None = Query(None, gt=-0.95, le=5.0),
+    exit_mult: float | None = Query(None, gt=0.5, le=150.0),
 ):
     try:
         data = run_valuation_logic(ticker, leverage, growth, exit_mult)
@@ -2169,9 +2484,20 @@ def export_valuation_excel(
 
         ws_sum = wb.active
         ws_sum.title = "Syntéza ocenění"
-        ws_sum.append(["TENSEGRITY TERMINAL | INSTITUCIONÁLNÍ VALUAČNÍ MODEL"])
-        ws_sum["A1"].font = Font(size=14, bold=True)
-        ws_sum.append([f"Společnost: {data['company_name']} ({data['ticker']}) | Datum: {data['audit_trail']['timestamp']}"])
+
+        logo_path = resolve_brand_logo_path(prefer_white=False)
+        if logo_path:
+            try:
+                xl_logo = ExcelImage(logo_path)
+                xl_logo.width = 48
+                xl_logo.height = 34
+                ws_sum.add_image(xl_logo, "A1")
+            except Exception:
+                pass
+
+        ws_sum["B1"] = "TENSEGRITY TERMINAL | INSTITUCIONÁLNÍ VALUAČNÍ MODEL"
+        ws_sum["B1"].font = Font(size=14, bold=True)
+        ws_sum["B2"] = f"Společnost: {data['company_name']} ({data['ticker']}) | Datum: {data['audit_trail']['timestamp']}"
         ws_sum.append([])
         ws_sum.append(["Metoda ocenění", "Váha (%)", f"Vnitřní hodnota ({data['currency']})", "Vážený příspěvek", "Rozdíl vs. trh (%)"])
         for cell in ws_sum[4]:
@@ -2233,16 +2559,16 @@ def export_valuation_excel(
 @app.get("/api/export/pdf/{ticker}")
 def export_valuation_pdf(
     ticker: str,
-    leverage: float = Query(0.15, ge=0.0, le=1.0),
-    growth: float = Query(0.22, gt=-0.95, le=5.0),
-    exit_mult: float = Query(24.0, gt=0.5, le=150.0),
+    leverage: float | None = Query(None, ge=0.0, le=1.0),
+    growth: float | None = Query(None, gt=-0.95, le=5.0),
+    exit_mult: float | None = Query(None, gt=0.5, le=150.0),
 ):
     try:
         data = run_valuation_logic(ticker, leverage, growth, exit_mult)
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
         styles = getSampleStyleSheet()
-        title_s = ParagraphStyle("T1", parent=styles["Heading1"], fontName=PDF_FONT_BOLD, fontSize=16, textColor=colors.HexColor("#0f172a"), spaceAfter=6)
+        title_s = ParagraphStyle("T1", parent=styles["Heading1"], fontName=PDF_FONT_BOLD, fontSize=15, textColor=colors.HexColor("#0f172a"), spaceAfter=4)
         sub_s = ParagraphStyle("S1", parent=styles["Normal"], fontName=PDF_FONT_REGULAR, fontSize=9.5, textColor=colors.HexColor("#475569"), spaceAfter=12)
         sec_s = ParagraphStyle("H2", parent=styles["Heading2"], fontName=PDF_FONT_BOLD, fontSize=11.5, textColor=colors.HexColor("#0284c7"), spaceBefore=10, spaceAfter=6)
 
@@ -2252,11 +2578,30 @@ def export_valuation_pdf(
         mc = data["monte_carlo"]
         curr = data["currency"]
 
-        elements = [
-            Paragraph(f"TENSEGRITY TERMINAL — VALUAČNÍ ZPRÁVA ({data['company_name']})", title_s),
+        elements = []
+        logo_path = resolve_brand_logo_path(prefer_white=False)
+        if logo_path:
+            try:
+                logo_img = PdfImage(logo_path, width=38, height=26, kind="proportional")
+                hdr_tbl = Table(
+                    [[logo_img, Paragraph(f"TENSEGRITY TERMINAL — VALUAČNÍ ZPRÁVA ({data['company_name']})", title_s)]],
+                    colWidths=[48, 470],
+                )
+                hdr_tbl.setStyle(TableStyle([
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ]))
+                elements.append(hdr_tbl)
+            except Exception:
+                elements.append(Paragraph(f"TENSEGRITY TERMINAL — VALUAČNÍ ZPRÁVA ({data['company_name']})", title_s))
+        else:
+            elements.append(Paragraph(f"TENSEGRITY TERMINAL — VALUAČNÍ ZPRÁVA ({data['company_name']})", title_s))
+
+        elements.extend([
             Paragraph(f"Ticker: {data['ticker']} | Datum: {data['audit_trail']['timestamp']} | Měna: {curr}", sub_s),
             Paragraph("1. SYNTÉZA VNITŘNÍ HODNOTY A NÁKUPNÍ PÁSMA", sec_s),
-        ]
+        ])
 
         tbl = Table(
             [
@@ -2306,7 +2651,8 @@ def read_root():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tensegrity Terminal | Institucionální Valuační Platforma</title>
-    <link rel="icon" type="image/png" href="/favicon.ico">
+    <link rel="icon" type="image/png" href="/favicon.ico?v=4">
+    <link rel="shortcut icon" type="image/png" href="/favicon.ico?v=4">
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -2339,9 +2685,17 @@ def read_root():
             border-radius: 16px; padding: 16px 28px; margin-bottom: 20px;
             box-shadow: 0 10px 30px rgba(0,0,0,0.5); flex-wrap: wrap; gap: 16px;
         }
+        .brand-wrap { display: flex; align-items: center; gap: 14px; }
+        .brand-logo-box {
+            background: transparent; border: none; padding: 0;
+            display: flex; align-items: center; justify-content: center;
+        }
+        .brand-logo-box img {
+            height: 32px; width: auto; display: block; background: transparent;
+        }
         .brand-title { font-size: 16px; font-weight: 800; letter-spacing: 4px; color: #fff; text-transform: uppercase; }
         .brand-title span { color: var(--accent-blue); }
-        .brand-subtitle { font-size: 10px; letter-spacing: 5px; color: var(--text-secondary); text-transform: uppercase; margin-top: 2px; }
+        .brand-subtitle { font-size: 10px; letter-spacing: 4.5px; color: var(--text-secondary); text-transform: uppercase; margin-top: 2px; }
         .controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
         .forex-strip {
             display: flex; align-items: center; gap: 12px; padding: 8px 14px;
@@ -2352,9 +2706,9 @@ def read_root():
         .forex-strip strong { color: var(--text-primary); }
         .search-wrapper input {
             background: rgba(6, 9, 17, 0.85); border: 1px solid var(--border-subtle);
-            color: var(--text-primary); font-family: 'JetBrains Mono', monospace;
-            font-size: 14px; font-weight: 700; padding: 10px 14px; border-radius: 10px;
-            outline: none; width: 125px; text-transform: uppercase; letter-spacing: 1px;
+            color: var(--text-primary); font-family: 'Plus Jakarta Sans', sans-serif;
+            font-size: 13px; font-weight: 600; padding: 10px 14px; border-radius: 10px;
+            outline: none; width: 210px; letter-spacing: 0.3px;
         }
         .search-wrapper input:focus { border-color: var(--accent-blue); box-shadow: 0 0 12px var(--accent-blue-glow); }
         .btn {
@@ -2382,6 +2736,32 @@ def read_root():
             background: rgba(6, 9, 17, 0.75); color: var(--text-primary); font: 600 13px 'JetBrains Mono', monospace; text-align: right;
         }
         .audit-pill { margin-left: auto; font: 11px 'JetBrains Mono', monospace; color: var(--text-muted); }
+
+        .company-identity-banner {
+            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;
+            margin-top: 18px; padding: 14px 18px; border-radius: 12px;
+            background: rgba(6, 9, 17, 0.75); border: 1px solid rgba(56, 189, 248, 0.22);
+        }
+        .company-identity-left { display: flex; align-items: center; gap: 14px; }
+        .company-logo-frame {
+            width: 44px; height: 44px; border-radius: 10px; background: rgba(255, 255, 255, 0.94);
+            display: flex; align-items: center; justify-content: center; overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.2); flex-shrink: 0;
+        }
+        .company-logo-frame img { width: 32px; height: 32px; object-fit: contain; display: block; }
+        .company-logo-fallback {
+            width: 44px; height: 44px; border-radius: 10px;
+            background: linear-gradient(135deg, rgba(56,189,248,0.25), rgba(2,132,199,0.45));
+            color: #38bdf8; font-weight: 800; font-size: 16px;
+            display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+        }
+        .company-title-main { font-size: 16px; font-weight: 800; color: #f8fafc; letter-spacing: 0.2px; }
+        .company-ticker-pill {
+            display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 6px;
+            background: rgba(56, 189, 248, 0.14); color: #38bdf8;
+            font: 700 12px 'JetBrains Mono', monospace;
+        }
+        .company-meta-sub { font-size: 12px; color: var(--text-secondary); margin-top: 3px; }
 
         .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 22px; margin-bottom: 22px; }
         .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 22px; margin-bottom: 22px; }
@@ -2458,20 +2838,25 @@ def read_root():
 <body>
     <div class="container">
         <header>
-            <div>
-                <div class="brand-title">Tensegrity<span>Terminal</span></div>
-                <div class="brand-subtitle">Intelligence &bull; Institucionální Valuační Platforma</div>
+            <div class="brand-wrap">
+                <div class="brand-logo-box">
+                    <img src="/brand-logo.png?v=4" alt="Tensegrity Terminal Logo" onerror="this.parentElement.style.display='none'">
+                </div>
+                <div>
+                    <div class="brand-title">Tensegrity<span>Terminal</span></div>
+                    <div class="brand-subtitle">Intelligence &bull; Institucionální Valuační Platforma</div>
+                </div>
             </div>
             <div class="controls">
                 <div class="search-wrapper">
-                    <input type="text" id="tickerInput" value="NVDA" placeholder="NVDA" aria-label="Ticker společnosti">
+                    <input type="text" id="tickerInput" value="NVDA" placeholder="Název firmy nebo ticker..." aria-label="Název společnosti nebo ticker" onkeydown="if(event.key==='Enter') loadValuation(true)">
                 </div>
                 <div class="forex-strip" id="forexRates">
                     <span>EUR/CZK <strong>--</strong></span>
                     <span>USD/CZK <strong>--</strong></span>
                     <span>GBP/CZK <strong>--</strong></span>
                 </div>
-                <button class="btn btn-primary" onclick="loadValuation()">Analyzovat</button>
+                <button class="btn btn-primary" onclick="loadValuation(true)">Analyzovat</button>
                 <button class="btn btn-excel" onclick="downloadExcel()">Excel Model</button>
                 <button class="btn btn-pdf" onclick="downloadPDF()">PDF Zpráva</button>
                 <button class="btn btn-news" onclick="openNewsletterModal()">Newsletter &amp; Tržní zprávy</button>
@@ -2482,7 +2867,7 @@ def read_root():
             <span class="scenario-heading">Parametry Scénáře</span>
             <label class="scenario-field" for="leverageInput">
                 Cizí kapitál (% Dluhu)
-                <span class="scenario-input"><input id="leverageInput" type="number" min="0" max="100" step="1" value="15"><span>%</span></span>
+                <span class="scenario-input"><input id="leverageInput" type="number" min="0" max="100" step="0.5" value="15"><span>%</span></span>
             </label>
             <label class="scenario-field" for="growthInput">
                 Růst peněžních toků
@@ -2492,7 +2877,7 @@ def read_root():
                 Výstupní násobek
                 <span class="scenario-input"><input id="exitMultipleInput" type="number" min="1" max="150" step="0.5" value="24.0"><span>x</span></span>
             </label>
-            <button class="btn btn-primary" style="padding: 6px 14px;" onclick="loadValuation()">Přepočítat model</button>
+            <button class="btn btn-primary" style="padding: 6px 14px;" onclick="loadValuation(false)">Přepočítat model</button>
             <span class="audit-pill" id="auditTimestamp">Načítám auditní stopu...</span>
         </section>
 
@@ -2514,6 +2899,22 @@ def read_root():
                     <p class="plain-guide" id="thesisSummary">Porovnání vážené vnitřní hodnoty se současnou tržní cenou a výpočet bezpečnostní rezervy.</p>
                 </div>
             </div>
+
+            <!-- Identifikace společnosti -->
+            <div class="company-identity-banner">
+                <div class="company-identity-left">
+                    <div id="companyLogoContainer" class="company-logo-fallback">NV</div>
+                    <div>
+                        <div>
+                            <span class="company-title-main" id="companyFullName">NVIDIA Corporation</span>
+                            <span class="company-ticker-pill" id="companyTickerBadge">NVDA</span>
+                        </div>
+                        <div class="company-meta-sub" id="companySectorMeta">Sektor: Technology &bull; Odvětví: Semiconductors &bull; Burza: NMS</div>
+                    </div>
+                </div>
+                <div class="badge" id="companyPricePill">Tržní cena: --</div>
+            </div>
+
             <div class="grid-4">
                 <div class="zone-box green">
                     <div class="zone-title">Zóna GREEN (Tranše 55 %)</div>
@@ -2714,6 +3115,7 @@ def read_root():
         let methodsChartInstance = null;
         let monteCarloChartInstance = null;
         let cashFlowChartInstance = null;
+        let currentResolvedTicker = 'NVDA';
 
         function fmtMoney(val, curr = 'USD') {
             if (val === null || val === undefined || isNaN(val)) return 'N/A';
@@ -2729,13 +3131,51 @@ def read_root():
             return Number(val).toLocaleString('cs-CZ', {maximumFractionDigits: 0}) + ' ' + curr;
         }
 
+        function updateCompanyIdentityBanner(d) {
+            const curr = d.currency || 'USD';
+            document.getElementById('companyFullName').textContent = d.company_name;
+            document.getElementById('companyTickerBadge').textContent = d.ticker;
+            document.getElementById('companySectorMeta').textContent =
+                'Sektor: ' + d.sector + ' • Odvětví: ' + d.industry + ' • Burza: ' + d.exchange;
+            document.getElementById('companyPricePill').textContent =
+                'Tržní cena: ' + fmtMoney(d.dcf_valuation.current_share_price, curr);
+
+            const logoContainer = document.getElementById('companyLogoContainer');
+            const initials = (d.company_name || d.ticker || 'TT').substring(0, 2).toUpperCase();
+            const candidates = Array.isArray(d.company_logo_urls) && d.company_logo_urls.length > 0
+                ? [...d.company_logo_urls]
+                : (d.company_logo_url ? [d.company_logo_url] : []);
+
+            function tryNextLogo(idx) {
+                if (idx >= candidates.length) {
+                    logoContainer.className = 'company-logo-fallback';
+                    logoContainer.textContent = initials;
+                    return;
+                }
+                logoContainer.className = 'company-logo-frame';
+                const img = document.createElement('img');
+                img.src = candidates[idx];
+                img.alt = d.company_name;
+                img.onload = function() {
+                    if (img.naturalWidth < 12 || img.naturalHeight < 12) {
+                        tryNextLogo(idx + 1);
+                    }
+                };
+                img.onerror = function() {
+                    tryNextLogo(idx + 1);
+                };
+                logoContainer.replaceChildren(img);
+            }
+
+            tryNextLogo(0);
+        }
+
         function renderCharts(d) {
             if (typeof Chart === 'undefined') return;
             const curr = d.currency || 'USD';
             const gridColor = 'rgba(255, 255, 255, 0.06)';
             const tickColor = '#94a3b8';
 
-            // 1. Graf srovnání metod ocenění vs. tržní cena
             const ctx1 = document.getElementById('methodsChartCanvas').getContext('2d');
             if (methodsChartInstance) methodsChartInstance.destroy();
             const methodLabels = ['Tržní cena', 'Vážená hodnota', ...d.valuation_synthesis.methods.map(m => m.method)];
@@ -2773,7 +3213,6 @@ def read_root():
                 }
             });
 
-            // 2. Graf rozdělení Monte Carlo
             const ctx2 = document.getElementById('monteCarloChartCanvas').getContext('2d');
             if (monteCarloChartInstance) monteCarloChartInstance.destroy();
             const hist = d.monte_carlo.histogram || [];
@@ -2800,7 +3239,6 @@ def read_root():
                 }
             });
 
-            // 3. Graf pětileté projekce peněžních toků a splácení dluhu
             const ctx3 = document.getElementById('cashFlowChartCanvas').getContext('2d');
             if (cashFlowChartInstance) cashFlowChartInstance.destroy();
             const cfRows = d.dcf_valuation.cash_flows || [];
@@ -2857,22 +3295,40 @@ def read_root():
             }
         }
 
-        async function loadValuation() {
-            const ticker = (document.getElementById('tickerInput').value || 'NVDA').trim().toUpperCase();
-            const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
-            const growth = document.getElementById('growthInput').valueAsNumber / 100;
-            const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
-            const params = new URLSearchParams({ leverage, growth, exit_mult: exitMult });
+        async function loadValuation(useCompanyDefaults = true) {
+            const rawQuery = (document.getElementById('tickerInput').value || 'NVDA').trim();
+            const params = new URLSearchParams();
+
+            if (!useCompanyDefaults) {
+                const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
+                const growth = document.getElementById('growthInput').valueAsNumber / 100;
+                const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
+                if (!isNaN(leverage)) params.set('leverage', leverage);
+                if (!isNaN(growth)) params.set('growth', growth);
+                if (!isNaN(exitMult)) params.set('exit_mult', exitMult);
+            }
+
+            const queryString = params.toString();
+            const endpoint = '/api/valuation/' + encodeURIComponent(rawQuery) + (queryString ? '?' + queryString : '');
 
             try {
-                const res = await fetch('/api/valuation/' + encodeURIComponent(ticker) + '?' + params);
+                const res = await fetch(endpoint);
                 const d = await res.json();
                 if (!res.ok) throw new Error(d.detail || 'Valuaci se nepodařilo načíst.');
 
                 const curr = d.currency || 'USD';
-                document.getElementById('tickerInput').value = d.spolecnost;
-                document.getElementById('fundTicker').textContent = d.spolecnost;
+                currentResolvedTicker = d.ticker;
+                document.getElementById('tickerInput').value = d.ticker;
+                document.getElementById('fundTicker').textContent = d.ticker;
                 document.getElementById('auditTimestamp').textContent = d.audit_trail.model_version + ' | ' + d.audit_trail.timestamp;
+
+                if (useCompanyDefaults && d.dynamic_defaults) {
+                    document.getElementById('leverageInput').value = d.dynamic_defaults.leverage_percent;
+                    document.getElementById('growthInput').value = d.dynamic_defaults.growth_percent;
+                    document.getElementById('exitMultipleInput').value = d.dynamic_defaults.exit_multiple;
+                }
+
+                updateCompanyIdentityBanner(d);
 
                 const dec = d.decision_engine;
                 const synth = d.valuation_synthesis;
@@ -2979,12 +3435,11 @@ def read_root():
                 }
             } catch (err) {
                 console.error(err);
-                alert('Chyba při výpočtu valuace: ' + err.message);
             }
         }
 
         function openNewsletterModal() {
-            const ticker = (document.getElementById('tickerInput').value || 'NVDA').trim().toUpperCase();
+            const ticker = currentResolvedTicker || (document.getElementById('tickerInput').value || 'NVDA').trim().toUpperCase();
             document.getElementById('newsModalTicker').textContent = ticker;
             document.getElementById('subscribeStatus').textContent = '';
             document.getElementById('newsletterModal').classList.add('open');
@@ -3069,7 +3524,7 @@ def read_root():
             input.value = '';
             userMsg.scrollIntoView({ block: 'nearest' });
 
-            const ticker = document.getElementById('tickerInput').value.trim().toUpperCase() || 'NVDA';
+            const ticker = currentResolvedTicker || document.getElementById('tickerInput').value.trim() || 'NVDA';
             const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
             const growth = document.getElementById('growthInput').valueAsNumber / 100;
             const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
@@ -3104,7 +3559,7 @@ def read_root():
         }
 
         function downloadExcel() {
-            const ticker = document.getElementById('tickerInput').value.trim().toUpperCase() || 'NVDA';
+            const ticker = currentResolvedTicker || document.getElementById('tickerInput').value.trim() || 'NVDA';
             const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
             const growth = document.getElementById('growthInput').valueAsNumber / 100;
             const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
@@ -3112,7 +3567,7 @@ def read_root():
         }
 
         function downloadPDF() {
-            const ticker = document.getElementById('tickerInput').value.trim().toUpperCase() || 'NVDA';
+            const ticker = currentResolvedTicker || document.getElementById('tickerInput').value.trim() || 'NVDA';
             const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
             const growth = document.getElementById('growthInput').valueAsNumber / 100;
             const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
@@ -3121,7 +3576,7 @@ def read_root():
 
         document.addEventListener('DOMContentLoaded', () => {
             loadForexRates();
-            loadValuation();
+            loadValuation(true);
         });
     </script>
 </body>
