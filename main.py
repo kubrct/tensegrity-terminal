@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email import encoders
 from email.mime.base import MIMEBase
@@ -9,6 +10,7 @@ from email.mime.text import MIMEText
 from email.utils import formataddr, parseaddr
 import asyncio
 import base64
+import hashlib
 import html
 import io
 import json
@@ -59,7 +61,9 @@ logger = logging.getLogger("tensegrity_terminal")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 os.makedirs(STATIC_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
 PARENT_DIR = os.path.dirname(BASE_DIR)
 
 BLACK_LOGO_CANDIDATES = [
@@ -91,6 +95,8 @@ RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+FMP_API_KEY = os.getenv("FMP_API_KEY", "").strip()
+SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "TensegrityTerminal Research@tensegrity-terminal.local").strip()
 CRON_SECRET = os.getenv("CRON_SECRET", "").strip()
 ENV_SUBSCRIBERS = os.getenv("SUBSCRIBERS_LIST", "").strip()
 
@@ -149,7 +155,7 @@ def get_prague_now() -> datetime:
 
 def safe_float(value, default: float | None = 0.0) -> float | None:
     try:
-        if value is None:
+        if value is None or isinstance(value, bool):
             return default
         num = float(value)
         if math.isnan(num) or math.isinf(num):
@@ -206,7 +212,7 @@ def save_gemini_key_to_env(new_key: str):
 
 
 # ==============================================================================
-# 2. VYHLEDÁVÁNÍ SPOLEČNOSTÍ, MĚNOVÝ PŘEVODNÍK VÝKAZŮ A LOGO PROFILU
+# 2. VYHLEDÁVÁNÍ SPOLEČNOSTÍ (VČETNĚ NOVÝCH IPO JAKO SPACEX / ANTHROPIC), FX A LOGA
 # ==============================================================================
 
 KNOWN_COMPANY_ALIASES = {
@@ -230,6 +236,7 @@ KNOWN_COMPANY_ALIASES = {
     "tesla": "TSLA",
     "netflix": "NFLX",
     "berkshire": "BRK-B",
+    "berkshire hathaway": "BRK-B",
     "jpmorgan": "JPM",
     "visa": "V",
     "mastercard": "MA",
@@ -251,8 +258,67 @@ KNOWN_COMPANY_ALIASES = {
     "shell": "SHEL",
     "exxon": "XOM",
     "chevron": "CVX",
-    "spacex": "SPCX",
 }
+
+SPELLING_NORMALIZATIONS = {
+    "entropic": "Anthropic",
+    "antropic": "Anthropic",
+    "space x": "SpaceX",
+    "spacex": "SpaceX",
+}
+
+
+def _yahoo_search_equity_symbol(query_str: str) -> str | None:
+    try:
+        search_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={quote(query_str)}&quotesCount=10&newsCount=0"
+        req = urllib.request.Request(
+            search_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=7) as resp:
+            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        quotes = payload.get("quotes") or []
+        q_norm = query_str.lower().strip()
+
+        # 1. Hledáme přímou shodu v názvu společnosti (EQUITY), nikoli ETF fondy typu SPCX
+        for q in quotes:
+            if q.get("quoteType") == "EQUITY" and q.get("symbol"):
+                long_n = str(q.get("longname") or q.get("shortname") or "").lower()
+                if q_norm in long_n or long_n.startswith(q_norm):
+                    return str(q["symbol"]).upper()
+
+        # 2. Jakákoliv veřejně obchodovaná akcie (EQUITY)
+        for q in quotes:
+            if q.get("quoteType") == "EQUITY" and q.get("symbol"):
+                return str(q["symbol"]).upper()
+
+        # 3. Teprve pokud neexistuje EQUITY, zkusíme ETF
+        for q in quotes:
+            if q.get("quoteType") == "ETF" and q.get("symbol"):
+                return str(q["symbol"]).upper()
+    except Exception as err:
+        logger.warning("Vyhledání společnosti '%s' na Yahoo Finance selhalo: %s", query_str, err)
+    return None
+
+
+def _sec_search_ticker_by_name(query_str: str) -> str | None:
+    """Vyhledá oficiální ticker přímo v registru SEC EDGAR podle názvu firmy (např. Space Exploration Technologies / Anthropic)."""
+    q_low = query_str.lower().strip()
+    search_terms = [q_low]
+    if "spacex" in q_low:
+        search_terms.append("space exploration technologies")
+    try:
+        cik_map = _load_sec_ticker_to_cik_map()
+        for tkr, (_, title) in cik_map.items():
+            t_low = title.lower()
+            if any(term in t_low for term in search_terms):
+                return tkr
+    except Exception:
+        pass
+    return None
 
 
 def resolve_company_ticker(query: str) -> str:
@@ -264,39 +330,32 @@ def resolve_company_ticker(query: str) -> str:
     if lower_q in KNOWN_COMPANY_ALIASES:
         return KNOWN_COMPANY_ALIASES[lower_q]
 
-    if re.fullmatch(r"[A-Za-z0-9\.\-\^=]{1,14}", raw) and " " not in raw:
-        upper_candidate = raw.upper()
-        try:
-            test_info = yf.Ticker(upper_candidate).info or {}
-            if (
-                test_info.get("regularMarketPrice")
-                or test_info.get("currentPrice")
-                or test_info.get("shortName")
-                or test_info.get("longName")
-            ):
-                return upper_candidate
-        except Exception:
-            pass
+    normalized_name = SPELLING_NORMALIZATIONS.get(lower_q, raw)
 
-    try:
-        search_url = f"https://query2.finance.yahoo.com/v1/finance/search?q={quote(raw)}&quotesCount=6&newsCount=0"
-        req = urllib.request.Request(
-            search_url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "application/json",
-            },
+    # Pokud uživatel zadal přímo krátký burzovní ticker (např. NVDA, CEZ.PR, BRK-B) a není to název firmy jako SpaceX/Anthropic
+    if (
+        lower_q not in SPELLING_NORMALIZATIONS
+        and normalized_name.lower() not in ("anthropic", "spacex", "openai", "stripe", "databricks")
+        and re.fullmatch(r"[A-Za-z0-9\.\-\^=]{1,12}", raw)
+        and " " not in raw
+    ):
+        return raw.upper()
+
+    # Dynamické vyhledání přes Yahoo Finance (řeší i čerstvá IPO jako SpaceX nebo Anthropic)
+    found_yf = _yahoo_search_equity_symbol(normalized_name)
+    if found_yf:
+        return found_yf
+
+    # Záložní vyhledání přímo v SEC EDGAR podle názvu emitenta
+    found_sec = _sec_search_ticker_by_name(normalized_name)
+    if found_sec:
+        return found_sec
+
+    if normalized_name.lower() in ("spacex", "anthropic"):
+        raise ValueError(
+            f"Společnost '{normalized_name}' nebyla v aktuálním feedu nalezena jako veřejně obchodovaný titul s dostupnými výkazy "
+            "(může jít o soukromou firmu před IPO nebo pod jiným burzovním symbolem — zadejte prosím její přesný burzovní ticker)."
         )
-        with urllib.request.urlopen(req, timeout=7) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
-        quotes = payload.get("quotes") or []
-        for q in quotes:
-            if q.get("quoteType") in ("EQUITY", "ETF") and q.get("symbol"):
-                return str(q["symbol"]).upper()
-        if quotes and quotes[0].get("symbol"):
-            return str(quotes[0]["symbol"]).upper()
-    except Exception as err:
-        logger.warning("Vyhledání názvu společnosti '%s' selhalo: %s", raw, err)
 
     return raw.upper()
 
@@ -390,7 +449,6 @@ TICKER_DOMAIN_FALLBACKS = {
     "PEP": "pepsico.com",
     "MCD": "mcdonalds.com",
     "BRK-B": "berkshirehathaway.com",
-    "SPCX": "spacex.com",
 }
 
 
@@ -423,7 +481,650 @@ def extract_company_logo_urls(info: dict, ticker: str = "") -> list[str]:
 
 
 # ==============================================================================
-# 3. ŽIVÁ MAKROEKONOMICKÁ DATA, MĚNOVÉ KURZY A ČNB
+# 3. MODULÁRNÍ DATOVÁ VRSTVA (SEC EDGAR 10-K/S-1/10-Q + FMP + DUAL-CLASS + IPO GATE)
+# ==============================================================================
+
+@dataclass
+class DataPoint:
+    value: float | None
+    status: str  # "REPORTED" | "ESTIMATED" | "MISSING"
+    source: str
+    note: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "value": round(self.value, 2) if self.value is not None else None,
+            "status": self.status,
+            "source": self.source,
+            "note": self.note,
+        }
+
+
+_SEC_CIK_MAP_CACHE: dict[str, tuple[str, str]] | None = None
+_SEC_FACTS_MEMORY_CACHE: dict[str, tuple[datetime, dict]] = {}
+
+
+def _load_sec_ticker_to_cik_map() -> dict[str, tuple[str, str]]:
+    global _SEC_CIK_MAP_CACHE
+    if _SEC_CIK_MAP_CACHE is not None:
+        return _SEC_CIK_MAP_CACHE
+
+    cache_file = os.path.join(CACHE_DIR, "sec_company_tickers.json")
+    raw_data = None
+
+    if os.path.exists(cache_file):
+        age_sec = datetime.now().timestamp() - os.path.getmtime(cache_file)
+        if age_sec < 7 * 86400:
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    raw_data = json.load(f)
+            except Exception:
+                raw_data = None
+
+    if raw_data is None:
+        try:
+            req = urllib.request.Request(
+                "https://www.sec.gov/files/company_tickers.json",
+                headers={"User-Agent": SEC_USER_AGENT, "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw_data = json.loads(resp.read().decode("utf-8"))
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(raw_data, f)
+        except Exception as err:
+            logger.warning("Nelze stáhnout mapu CIK ze SEC EDGAR: %s", err)
+            _SEC_CIK_MAP_CACHE = {}
+            return _SEC_CIK_MAP_CACHE
+
+    mapping: dict[str, tuple[str, str]] = {}
+    if isinstance(raw_data, dict):
+        for _, entry in raw_data.items():
+            if not isinstance(entry, dict):
+                continue
+            tkr = str(entry.get("ticker") or "").upper().strip()
+            cik_num = entry.get("cik_str")
+            title = str(entry.get("title") or "").strip()
+            if tkr and cik_num is not None:
+                cik_padded = str(int(cik_num)).zfill(10)
+                mapping[tkr] = (cik_padded, title)
+                if "-" in tkr:
+                    mapping[tkr.replace("-", ".")] = (cik_padded, title)
+                if "." in tkr:
+                    mapping[tkr.replace(".", "-")] = (cik_padded, title)
+
+    _SEC_CIK_MAP_CACHE = mapping
+    return mapping
+
+
+def _extract_sec_annual_series(
+    us_gaap: dict,
+    dei: dict,
+    tag_candidates: list[tuple[str, str]],
+    max_years: int = 4,
+    is_balance_sheet: bool = False,
+) -> tuple[list[float], str | None, str | None, str | None]:
+    annual_forms = ("10-K", "10-K/A", "20-F", "40-F", "S-1", "S-1/A")
+
+    for taxonomy, tag in tag_candidates:
+        root_dict = us_gaap if taxonomy == "us-gaap" else dei
+        tag_obj = root_dict.get(tag)
+        if not isinstance(tag_obj, dict):
+            continue
+        units = tag_obj.get("units") or {}
+        unit_items = None
+        for u_key in ("USD", "shares"):
+            if u_key in units and isinstance(units[u_key], list):
+                unit_items = units[u_key]
+                break
+        if unit_items is None and units:
+            first_key = next(iter(units.keys()))
+            if isinstance(units[first_key], list):
+                unit_items = units[first_key]
+        if not unit_items:
+            continue
+
+        by_fiscal_year: dict[int, tuple[str, float, str, str]] = {}
+        latest_10q: tuple[str, float, str] | None = None
+
+        for item in unit_items:
+            if not isinstance(item, dict):
+                continue
+            form = str(item.get("form") or "").upper()
+            val = safe_float(item.get("val"), None)
+            if val is None:
+                continue
+            fy = item.get("fy")
+            end_date = str(item.get("end") or "")
+            start_date = str(item.get("start") or "")
+            filed = str(item.get("filed") or "")
+            frame = str(item.get("frame") or "").upper()
+
+            days_span: int | None = None
+            if start_date and end_date:
+                try:
+                    d0 = datetime.strptime(start_date[:10], "%Y-%m-%d")
+                    d1 = datetime.strptime(end_date[:10], "%Y-%m-%d")
+                    days_span = (d1 - d0).days
+                except Exception:
+                    days_span = None
+
+            if form in annual_forms:
+                if not is_balance_sheet:
+                    if frame and not re.fullmatch(r"CY\d{4}", frame):
+                        continue
+                    if days_span is not None and days_span < 330:
+                        continue
+                    if not frame and days_span is None:
+                        continue
+
+                yr_key = int(fy) if isinstance(fy, int) else (int(end_date[:4]) if len(end_date) >= 4 and end_date[:4].isdigit() else None)
+                if yr_key is None:
+                    continue
+
+                prev = by_fiscal_year.get(yr_key)
+                if prev is None or (end_date, filed) >= (prev[0], prev[2]):
+                    by_fiscal_year[yr_key] = (end_date, val, filed, form)
+
+            elif form in ("10-Q", "10-Q/A"):
+                if not is_balance_sheet:
+                    if days_span is not None and not (75 <= days_span <= 105):
+                        continue
+                    if frame and not re.fullmatch(r"CY\d{4}Q[1-4]", frame):
+                        continue
+                    ann_val = val * 4.0
+                else:
+                    ann_val = val
+
+                if latest_10q is None or (end_date, filed) >= (latest_10q[0], latest_10q[2]):
+                    latest_10q = (end_date, ann_val, filed)
+
+        if by_fiscal_year:
+            sorted_years = sorted(by_fiscal_year.keys(), reverse=True)[:max_years]
+            vals = [by_fiscal_year[y][1] for y in sorted_years]
+            latest_end = by_fiscal_year[sorted_years[0]][0]
+            latest_form = by_fiscal_year[sorted_years[0]][3]
+            return vals, f"{taxonomy}:{tag}", latest_end, latest_form
+
+        if latest_10q is not None:
+            return [latest_10q[1]], f"{taxonomy}:{tag}", latest_10q[0], "10-Q TTM"
+
+    return [], None, None, None
+
+
+def fetch_sec_edgar_fundamentals(ticker: str) -> dict | None:
+    clean_tkr = ticker.upper().strip()
+    if "." in clean_tkr and not clean_tkr.endswith((".A", ".B", ".C")):
+        return None
+
+    cik_map = _load_sec_ticker_to_cik_map()
+    sec_entry = cik_map.get(clean_tkr)
+    if not sec_entry:
+        return None
+
+    cik_padded, sec_title = sec_entry
+    now = datetime.now(timezone.utc)
+    facts_json = None
+
+    if cik_padded in _SEC_FACTS_MEMORY_CACHE and now < _SEC_FACTS_MEMORY_CACHE[cik_padded][0]:
+        facts_json = _SEC_FACTS_MEMORY_CACHE[cik_padded][1]
+    else:
+        cache_path = os.path.join(CACHE_DIR, f"sec_facts_v2_{cik_padded}.json")
+        if os.path.exists(cache_path):
+            age_sec = datetime.now().timestamp() - os.path.getmtime(cache_path)
+            if age_sec < 12 * 3600:
+                try:
+                    with open(cache_path, "r", encoding="utf-8") as f:
+                        facts_json = json.load(f)
+                except Exception:
+                    facts_json = None
+
+        if facts_json is None:
+            try:
+                url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_padded}.json"
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": SEC_USER_AGENT, "Accept": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    facts_json = json.loads(resp.read().decode("utf-8"))
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(facts_json, f)
+            except Exception as err:
+                logger.warning("SEC EDGAR API selhalo pro %s (CIK %s): %s", clean_tkr, cik_padded, err)
+                return None
+
+        if facts_json is not None:
+            _SEC_FACTS_MEMORY_CACHE[cik_padded] = (now + timedelta(minutes=45), facts_json)
+
+    facts = (facts_json or {}).get("facts") or {}
+    us_gaap = facts.get("us-gaap") or {}
+    dei = facts.get("dei") or {}
+    if not us_gaap:
+        return None
+
+    balance_sheet_keys = {
+        "equity", "long_term_debt", "short_term_debt", "cash",
+        "short_term_investments", "long_term_investments", "deferred_tax_liab",
+        "insurance_float", "current_assets", "current_liabilities",
+        "total_assets", "retained_earnings", "minority_interest", "shares",
+    }
+
+    tag_specs = {
+        "revenue": [
+            ("us-gaap", "RevenueFromContractWithCustomerExcludingAssessedTax"),
+            ("us-gaap", "Revenues"),
+            ("us-gaap", "SalesRevenueNet"),
+            ("us-gaap", "RevenueFromContractWithCustomerIncludingAssessedTax"),
+        ],
+        "ebit": [("us-gaap", "OperatingIncomeLoss")],
+        "da": [
+            ("us-gaap", "DepreciationDepletionAndAmortization"),
+            ("us-gaap", "DepreciationAndAmortization"),
+            ("us-gaap", "Depreciation"),
+        ],
+        "net_income": [("us-gaap", "NetIncomeLoss"), ("us-gaap", "ProfitLoss")],
+        "pretax_income": [
+            ("us-gaap", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"),
+            ("us-gaap", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"),
+        ],
+        "tax_provision": [("us-gaap", "IncomeTaxExpenseBenefit")],
+        "interest_expense": [("us-gaap", "InterestExpense"), ("us-gaap", "InterestExpenseDebt")],
+        "ocf": [
+            ("us-gaap", "NetCashProvidedByUsedInOperatingActivities"),
+            ("us-gaap", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"),
+        ],
+        "capex": [
+            ("us-gaap", "PaymentsToAcquirePropertyPlantAndEquipment"),
+            ("us-gaap", "PaymentsToAcquireProductiveAssets"),
+        ],
+        "sbc": [
+            ("us-gaap", "ShareBasedCompensation"),
+            ("us-gaap", "AllocatedShareBasedCompensationExpense"),
+        ],
+        "equity": [
+            ("us-gaap", "StockholdersEquity"),
+            ("us-gaap", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
+        ],
+        "long_term_debt": [("us-gaap", "LongTermDebtNoncurrent"), ("us-gaap", "LongTermDebt")],
+        "short_term_debt": [
+            ("us-gaap", "LongTermDebtCurrent"),
+            ("us-gaap", "ShortTermBorrowings"),
+            ("us-gaap", "DebtCurrent"),
+        ],
+        "cash": [
+            ("us-gaap", "CashAndCashEquivalentsAtCarryingValue"),
+            ("us-gaap", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"),
+        ],
+        "short_term_investments": [
+            ("us-gaap", "MarketableSecuritiesCurrent"),
+            ("us-gaap", "ShortTermInvestments"),
+            ("us-gaap", "AvailableForSaleSecuritiesDebtSecuritiesCurrent"),
+        ],
+        "long_term_investments": [
+            ("us-gaap", "MarketableSecuritiesNoncurrent"),
+            ("us-gaap", "LongTermInvestments"),
+            ("us-gaap", "EquityMethodInvestments"),
+        ],
+        "deferred_tax_liab": [
+            ("us-gaap", "DeferredIncomeTaxLiabilitiesNet"),
+            ("us-gaap", "DeferredTaxLiabilitiesNoncurrent"),
+        ],
+        "insurance_float": [
+            ("us-gaap", "LiabilityForClaimsAndClaimsAdjustmentExpense"),
+            ("us-gaap", "UnearnedPremiums"),
+        ],
+        "current_assets": [("us-gaap", "AssetsCurrent")],
+        "current_liabilities": [("us-gaap", "LiabilitiesCurrent")],
+        "total_assets": [("us-gaap", "Assets")],
+        "retained_earnings": [("us-gaap", "RetainedEarningsAccumulatedDeficit")],
+        "minority_interest": [("us-gaap", "MinorityInterest")],
+        "shares": [
+            ("dei", "EntityCommonStockSharesOutstanding"),
+            ("us-gaap", "CommonStockSharesOutstanding"),
+            ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding"),
+        ],
+    }
+
+    series_map: dict[str, list[float]] = {}
+    tags_used: dict[str, str] = {}
+    latest_period = None
+    detected_form = "10-K"
+
+    for key, candidates in tag_specs.items():
+        vals, used_tag, period_end, form_used = _extract_sec_annual_series(
+            us_gaap,
+            dei,
+            candidates,
+            max_years=4,
+            is_balance_sheet=(key in balance_sheet_keys),
+        )
+        series_map[key] = vals
+        if used_tag:
+            tags_used[key] = used_tag
+        if period_end and (latest_period is None or period_end > latest_period):
+            latest_period = period_end
+            if form_used:
+                detected_form = form_used
+
+    if not series_map["revenue"] and not series_map["total_assets"]:
+        return None
+
+    return {
+        "provider": f"SEC EDGAR XBRL ({detected_form})",
+        "cik": cik_padded,
+        "entity_name": facts_json.get("entityName") or sec_title,
+        "latest_period": latest_period or detected_form,
+        "currency": "USD",
+        "series": series_map,
+        "tags_used": tags_used,
+    }
+
+
+def fetch_fmp_fundamentals(ticker: str) -> dict | None:
+    if not FMP_API_KEY:
+        return None
+    clean_tkr = ticker.upper().strip()
+    try:
+        base = "https://financialmodelingprep.com/api/v3"
+        urls = {
+            "inc": f"{base}/income-statement/{quote(clean_tkr)}?limit=4&apikey={quote(FMP_API_KEY)}",
+            "bs": f"{base}/balance-sheet-statement/{quote(clean_tkr)}?limit=4&apikey={quote(FMP_API_KEY)}",
+            "cf": f"{base}/cash-flow-statement/{quote(clean_tkr)}?limit=4&apikey={quote(FMP_API_KEY)}",
+        }
+        fetched = {}
+        for k, u in urls.items():
+            req = urllib.request.Request(u, headers={"User-Agent": "TensegrityTerminal/5.2"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, list) and data:
+                fetched[k] = data
+        if "inc" not in fetched or "bs" not in fetched:
+            return None
+
+        inc_list = fetched["inc"]
+        bs_list = fetched["bs"]
+        cf_list = fetched.get("cf") or []
+
+        def col(lst: list[dict], field: str) -> list[float]:
+            out = []
+            for row in lst:
+                v = safe_float(row.get(field), None)
+                if v is not None:
+                    out.append(v)
+            return out
+
+        series = {
+            "revenue": col(inc_list, "revenue"),
+            "ebit": col(inc_list, "operatingIncome"),
+            "ebitda": col(inc_list, "ebitda"),
+            "da": col(inc_list, "depreciationAndAmortization"),
+            "net_income": col(inc_list, "netIncome"),
+            "pretax_income": col(inc_list, "incomeBeforeTax"),
+            "tax_provision": col(inc_list, "incomeTaxExpense"),
+            "interest_expense": col(inc_list, "interestExpense"),
+            "ocf": col(cf_list, "operatingCashFlow"),
+            "capex": [abs(x) for x in col(cf_list, "capitalExpenditure")],
+            "sbc": [abs(x) for x in col(cf_list, "stockBasedCompensation")],
+            "equity": col(bs_list, "totalStockholdersEquity"),
+            "long_term_debt": col(bs_list, "longTermDebt"),
+            "short_term_debt": col(bs_list, "shortTermDebt"),
+            "cash": col(bs_list, "cashAndCashEquivalents"),
+            "short_term_investments": col(bs_list, "shortTermInvestments"),
+            "long_term_investments": col(bs_list, "longTermInvestments"),
+            "deferred_tax_liab": col(bs_list, "deferredTaxLiabilitiesNonCurrent"),
+            "insurance_float": [],
+            "current_assets": col(bs_list, "totalCurrentAssets"),
+            "current_liabilities": col(bs_list, "totalCurrentLiabilities"),
+            "total_assets": col(bs_list, "totalAssets"),
+            "retained_earnings": col(bs_list, "retainedEarnings"),
+            "minority_interest": col(bs_list, "minorityInterest"),
+            "shares": col(inc_list, "weightedAverageShsOutDil"),
+        }
+        rep_curr = str(inc_list[0].get("reportedCurrency") or "USD").upper()
+        latest_date = str(inc_list[0].get("date") or "FY")
+        return {
+            "provider": "Financial Modeling Prep (Standardized)",
+            "latest_period": latest_date,
+            "currency": rep_curr,
+            "series": series,
+        }
+    except Exception as err:
+        logger.warning("FMP API selhalo pro %s: %s", clean_tkr, err)
+        return None
+
+
+def fetch_unified_financial_dataset(clean_ticker: str) -> dict:
+    info: dict = {}
+    fin_df = None
+    bs_df = None
+    cf_df = None
+
+    try:
+        stock = yf.Ticker(clean_ticker)
+        info = stock.info or {}
+        fin_df = stock.financials
+        bs_df = stock.balance_sheet
+        cf_df = stock.cashflow
+    except Exception as err:
+        logger.warning("Chyba při stahování tržního profilu pro %s: %s", clean_ticker, err)
+
+    quote_type = str(info.get("quoteType") or "EQUITY").upper()
+    if quote_type in ("INDEX", "MUTUALFUND", "CRYPTOCURRENCY", "CURRENCY", "FUTURE", "ETF"):
+        raise ValueError(
+            f"Instrument '{clean_ticker}' je typu {quote_type} (nikoli veřejně obchodovaná společnost s účetními výkazy)."
+        )
+
+    raw_currency = str(info.get("currency") or ("CZK" if clean_ticker.endswith(".PR") else "USD"))
+    market_currency = "GBP" if raw_currency == "GBp" else raw_currency.upper()
+    price_scale = 0.01 if raw_currency == "GBp" else 1.0
+
+    current_price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose"), None)
+    if current_price is not None:
+        current_price *= price_scale
+    if current_price is None or current_price <= 0:
+        try:
+            hist_px = yf.Ticker(clean_ticker).history(period="5d")["Close"].dropna()
+            if not hist_px.empty:
+                current_price = float(hist_px.iloc[-1]) * price_scale
+        except Exception:
+            pass
+    if current_price is None or current_price <= 0:
+        raise ValueError(f"Nepodařilo se zjistit aktuální tržní cenu pro titul '{clean_ticker}'.")
+
+    sec_data = fetch_sec_edgar_fundamentals(clean_ticker)
+    fmp_data = None if sec_data is not None else fetch_fmp_fundamentals(clean_ticker)
+
+    if sec_data is not None:
+        stmt_provider = f"{sec_data['provider']} ({sec_data['latest_period']})"
+        stmt_currency = sec_data["currency"]
+        stmt_fx = get_fx_conversion_rate(stmt_currency, market_currency)
+        raw_series = sec_data["series"]
+        scaled_series = {k: [v * stmt_fx for v in vals] for k, vals in raw_series.items()}
+        entity_name = str(info.get("longName") or info.get("shortName") or sec_data.get("entity_name") or clean_ticker)
+    elif fmp_data is not None:
+        stmt_provider = f"{fmp_data['provider']} ({fmp_data['latest_period']})"
+        stmt_currency = fmp_data["currency"]
+        stmt_fx = get_fx_conversion_rate(stmt_currency, market_currency)
+        raw_series = fmp_data["series"]
+        scaled_series = {k: [v * stmt_fx for v in vals] for k, vals in raw_series.items()}
+        entity_name = str(info.get("longName") or info.get("shortName") or clean_ticker)
+    else:
+        stmt_provider = "Yahoo Finance (Neověřená struktura výkazů)"
+        stmt_currency = str(info.get("financialCurrency") or market_currency).upper()
+        stmt_fx = get_fx_conversion_rate(stmt_currency, market_currency)
+        entity_name = str(info.get("longName") or info.get("shortName") or clean_ticker)
+        scaled_series = {
+            "revenue": extract_statement_series(fin_df, ["Total Revenue", "Operating Revenue"], fx_mult=stmt_fx),
+            "ebit": extract_statement_series(fin_df, ["EBIT", "Operating Income"], fx_mult=stmt_fx),
+            "ebitda": extract_statement_series(fin_df, ["EBITDA", "Normalized EBITDA"], fx_mult=stmt_fx),
+            "da": extract_statement_series(cf_df, ["Depreciation And Amortization", "Depreciation Amortization Depletion"], fx_mult=stmt_fx),
+            "net_income": extract_statement_series(fin_df, ["Net Income", "Net Income Common Stockholders"], fx_mult=stmt_fx),
+            "pretax_income": extract_statement_series(fin_df, ["Pretax Income"], fx_mult=stmt_fx),
+            "tax_provision": extract_statement_series(fin_df, ["Tax Provision"], fx_mult=stmt_fx),
+            "interest_expense": extract_statement_series(fin_df, ["Interest Expense", "Interest Expense Non Operating"], fx_mult=stmt_fx),
+            "ocf": extract_statement_series(cf_df, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"], fx_mult=stmt_fx),
+            "capex": [abs(x) for x in extract_statement_series(cf_df, ["Capital Expenditure", "Purchase Of PPE"], fx_mult=stmt_fx)],
+            "sbc": [abs(x) for x in extract_statement_series(cf_df, ["Stock Based Compensation"], fx_mult=stmt_fx)],
+            "equity": extract_statement_series(bs_df, ["Stockholders Equity", "Total Equity Gross Minority Interest"], fx_mult=stmt_fx),
+            "long_term_debt": extract_statement_series(bs_df, ["Long Term Debt", "Total Debt"], fx_mult=stmt_fx),
+            "short_term_debt": extract_statement_series(bs_df, ["Current Debt", "Current Debt And Capital Lease Obligation"], fx_mult=stmt_fx),
+            "cash": extract_statement_series(bs_df, ["Cash And Cash Equivalents"], fx_mult=stmt_fx),
+            "short_term_investments": extract_statement_series(bs_df, ["Other Short Term Investments"], fx_mult=stmt_fx),
+            "long_term_investments": extract_statement_series(bs_df, ["Investments And Advances", "Long Term Equity Investment"], fx_mult=stmt_fx),
+            "deferred_tax_liab": extract_statement_series(bs_df, ["Non Current Deferred Taxes Liabilities"], fx_mult=stmt_fx),
+            "insurance_float": [],
+            "current_assets": extract_statement_series(bs_df, ["Current Assets"], fx_mult=stmt_fx),
+            "current_liabilities": extract_statement_series(bs_df, ["Current Liabilities"], fx_mult=stmt_fx),
+            "total_assets": extract_statement_series(bs_df, ["Total Assets"], fx_mult=stmt_fx),
+            "retained_earnings": extract_statement_series(bs_df, ["Retained Earnings"], fx_mult=stmt_fx),
+            "minority_interest": extract_statement_series(bs_df, ["Minority Interest"], fx_mult=stmt_fx),
+            "shares": [],
+        }
+
+    info_tot_rev = safe_float(info.get("totalRevenue"), None)
+    if info_tot_rev is not None and info_tot_rev > 0 and scaled_series.get("revenue"):
+        info_rev_scaled = info_tot_rev * stmt_fx
+        sec_rev_latest = scaled_series["revenue"][0]
+        if sec_rev_latest > 0 and (info_rev_scaled / sec_rev_latest) > 2.2:
+            scaled_series["revenue"][0] = info_rev_scaled
+
+    def dp_from_series(key: str, info_fallback_key: str | None = None, scale_fx: bool = True, abs_val: bool = False) -> DataPoint:
+        vals = scaled_series.get(key) or []
+        if vals:
+            v = abs(vals[0]) if abs_val else vals[0]
+            return DataPoint(value=v, status="REPORTED", source=stmt_provider)
+        if info_fallback_key:
+            raw_v = safe_float(info.get(info_fallback_key), None)
+            if raw_v is not None:
+                v = raw_v * (stmt_fx if scale_fx else 1.0)
+                if abs_val:
+                    v = abs(v)
+                return DataPoint(value=v, status="REPORTED", source="Market Feed (Summary)")
+        return DataPoint(value=None, status="MISSING", source=stmt_provider, note=f"Chybí položka '{key}' ve výkazu.")
+
+    rev_dp = dp_from_series("revenue", "totalRevenue")
+    ebit_dp = dp_from_series("ebit")
+    da_dp = dp_from_series("da", abs_val=True)
+    ni_dp = dp_from_series("net_income", "netIncomeToCommon")
+    pretax_dp = dp_from_series("pretax_income")
+    tax_dp = dp_from_series("tax_provision")
+    int_exp_dp = dp_from_series("interest_expense", abs_val=True)
+    ocf_dp = dp_from_series("ocf", "operatingCashflow")
+    capex_dp = dp_from_series("capex", abs_val=True)
+    sbc_dp = dp_from_series("sbc", abs_val=True)
+    equity_dp = dp_from_series("equity")
+    cash_dp = dp_from_series("cash", "totalCash")
+    st_inv_dp = dp_from_series("short_term_investments")
+    lt_inv_dp = dp_from_series("long_term_investments")
+    dtl_dp = dp_from_series("deferred_tax_liab", abs_val=True)
+    float_dp = dp_from_series("insurance_float", abs_val=True)
+    min_int_dp = dp_from_series("minority_interest", "minorityInterest")
+
+    if scaled_series.get("ebitda"):
+        ebitda_dp = DataPoint(value=scaled_series["ebitda"][0], status="REPORTED", source=stmt_provider)
+    elif ebit_dp.value is not None and da_dp.value is not None:
+        ebitda_dp = DataPoint(value=ebit_dp.value + da_dp.value, status="REPORTED", source=f"{stmt_provider} (EBIT + D&A)")
+    else:
+        raw_eb_info = safe_float(info.get("ebitda"), None)
+        if raw_eb_info is not None:
+            ebitda_dp = DataPoint(value=raw_eb_info * stmt_fx, status="REPORTED", source="Market Feed (Summary)")
+        else:
+            ebitda_dp = DataPoint(value=None, status="MISSING", source=stmt_provider, note="Chybí EBITDA i kombinace EBIT + odpisy.")
+
+    lt_debt_vals = scaled_series.get("long_term_debt") or []
+    st_debt_vals = scaled_series.get("short_term_debt") or []
+    if lt_debt_vals or st_debt_vals:
+        tot_d = (lt_debt_vals[0] if lt_debt_vals else 0.0) + (st_debt_vals[0] if st_debt_vals else 0.0)
+        debt_dp = DataPoint(value=tot_d, status="REPORTED", source=stmt_provider)
+    else:
+        raw_d_info = safe_float(info.get("totalDebt"), None)
+        if raw_d_info is not None:
+            debt_dp = DataPoint(value=raw_d_info * stmt_fx, status="REPORTED", source="Market Feed (Summary)")
+        else:
+            debt_dp = DataPoint(value=None, status="MISSING", source=stmt_provider, note="Chybí údaj o celkovém dluhu v rozvaze.")
+
+    sec_shares_vals = raw_series.get("shares") if (sec_data or fmp_data) else []
+    info_shares = safe_float(info.get("sharesOutstanding"), None)
+    info_mcap = safe_float(info.get("marketCap"), None)
+
+    shares_dp: DataPoint | None = None
+    if sec_shares_vals and sec_shares_vals[0] > 0:
+        sec_sh = sec_shares_vals[0]
+        if info_mcap and info_mcap > 0 and current_price > 0:
+            implied_class_shares = info_mcap / current_price
+            ratio_sh = max(sec_sh, implied_class_shares) / max(1.0, min(sec_sh, implied_class_shares))
+            if ratio_sh > 1.25:
+                shares_dp = DataPoint(
+                    value=implied_class_shares,
+                    status="REPORTED",
+                    source="MarketCap / Price (Dual-Class / Post-IPO Share Class)",
+                    note=f"Počet akcií upraven pro obchodovanou třídu '{clean_ticker}'.",
+                )
+        if shares_dp is None:
+            shares_dp = DataPoint(value=sec_sh, status="REPORTED", source=stmt_provider)
+    elif info_mcap and info_mcap > 0 and current_price > 0:
+        implied_sh = info_mcap / current_price
+        if info_shares and info_shares > 0:
+            ratio_sh = max(info_shares, implied_sh) / max(1.0, min(info_shares, implied_sh))
+            if ratio_sh > 1.25:
+                shares_dp = DataPoint(
+                    value=implied_sh,
+                    status="ESTIMATED",
+                    source="MarketCap / Price (Post-IPO Normalization)",
+                    note="Počet akcií sjednocen s aktuální tržní kapitalizací po vstupu na burzu.",
+                )
+            else:
+                shares_dp = DataPoint(value=info_shares, status="REPORTED", source="Market Feed")
+        else:
+            shares_dp = DataPoint(value=implied_sh, status="ESTIMATED", source="MarketCap / Price")
+    elif info_shares and info_shares > 0:
+        shares_dp = DataPoint(value=info_shares, status="REPORTED", source="Market Feed")
+    else:
+        raise ValueError(f"Nelze ověřit počet vydaných akcií ani tržní kapitalizaci pro '{clean_ticker}'.")
+
+    if info_mcap and info_mcap > 0:
+        mcap_dp = DataPoint(value=info_mcap, status="REPORTED", source="Market Feed")
+    else:
+        mcap_dp = DataPoint(value=current_price * shares_dp.value, status="ESTIMATED", source="Price * Shares")
+
+    return {
+        "ticker": clean_ticker,
+        "company_name": entity_name,
+        "info": info,
+        "market_currency": market_currency,
+        "stmt_currency": stmt_currency,
+        "stmt_fx": stmt_fx,
+        "stmt_provider": stmt_provider,
+        "current_price": current_price,
+        "series": scaled_series,
+        "points": {
+            "shares": shares_dp,
+            "market_cap": mcap_dp,
+            "revenue": rev_dp,
+            "ebit": ebit_dp,
+            "ebitda": ebitda_dp,
+            "da": da_dp,
+            "net_income": ni_dp,
+            "pretax_income": pretax_dp,
+            "tax_provision": tax_dp,
+            "interest_expense": int_exp_dp,
+            "ocf": ocf_dp,
+            "capex": capex_dp,
+            "sbc": sbc_dp,
+            "equity": equity_dp,
+            "debt": debt_dp,
+            "cash": cash_dp,
+            "short_term_investments": st_inv_dp,
+            "long_term_investments": lt_inv_dp,
+            "deferred_tax_liab": dtl_dp,
+            "insurance_float": float_dp,
+            "minority_interest": min_int_dp,
+        },
+    }
+
+
+# ==============================================================================
+# 4. ŽIVÁ MAKROEKONOMICKÁ DATA, MĚNOVÉ KURZY A ČNB
 # ==============================================================================
 
 _MACRO_CACHE: dict = {"expires_at": None, "data": None}
@@ -439,29 +1140,29 @@ def get_live_market_benchmarks() -> dict:
     sp500_pe = None
 
     try:
-        tnx_hist = yf.Ticker("^TNX").history(period="5d", interval="1d")
-        if not tnx_hist.empty:
-            last_tnx = safe_float(tnx_hist["Close"].dropna().iloc[-1], 0.0)
-            if 0.5 < last_tnx < 15.0:
-                us10y = round(last_tnx, 2)
+        req = urllib.request.Request(
+            "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10",
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            lines = resp.read().decode("utf-8", errors="ignore").strip().splitlines()
+        for line in reversed(lines[1:]):
+            parts = line.split(",")
+            if len(parts) == 2 and parts[1].strip() != ".":
+                candidate = safe_float(parts[1].strip(), 0.0)
+                if 0.5 < candidate < 15.0:
+                    us10y = round(candidate, 2)
+                    break
     except Exception:
         pass
 
     if us10y is None:
         try:
-            req = urllib.request.Request(
-                "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10",
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                lines = resp.read().decode("utf-8", errors="ignore").strip().splitlines()
-            for line in reversed(lines[1:]):
-                parts = line.split(",")
-                if len(parts) == 2 and parts[1].strip() != ".":
-                    candidate = safe_float(parts[1].strip(), 0.0)
-                    if 0.5 < candidate < 15.0:
-                        us10y = round(candidate, 2)
-                        break
+            tnx_hist = yf.Ticker("^TNX").history(period="5d", interval="1d")
+            if not tnx_hist.empty:
+                last_tnx = safe_float(tnx_hist["Close"].dropna().iloc[-1], 0.0)
+                if 0.5 < last_tnx < 15.0:
+                    us10y = round(last_tnx, 2)
         except Exception:
             pass
 
@@ -653,16 +1354,17 @@ def get_live_forex_rates() -> dict:
             rate = FOREX_FALLBACK_RATES[pair]
             live = False
 
-        try:
-            history = yf.Ticker(symbol).history(period="5d", interval="1d")
-            closes = history["Close"].dropna()
-            if not closes.empty:
-                candidate = safe_float(closes.iloc[-1], 0.0)
-                if candidate > 0:
-                    rate = round(candidate, 4)
-                    live = True
-        except Exception:
-            pass
+        if not live:
+            try:
+                history = yf.Ticker(symbol).history(period="5d", interval="1d")
+                closes = history["Close"].dropna()
+                if not closes.empty:
+                    candidate = safe_float(closes.iloc[-1], 0.0)
+                    if candidate > 0:
+                        rate = round(candidate, 4)
+                        live = True
+            except Exception:
+                pass
 
         rates[pair] = {"rate": rate, "live": live}
 
@@ -673,7 +1375,7 @@ def get_live_forex_rates() -> dict:
 
 
 # ==============================================================================
-# 4. SPRÁVA ODBĚRATELŮ, PŘEKLAD ZPRÁV DO ČEŠTINY A LEHKÝ E-MAILOVÝ NEWSLETTER
+# 5. SPRÁVA ODBĚRATELŮ, PŘEKLAD ZPRÁV DO ČEŠTINY A E-MAILOVÝ NEWSLETTER
 # ==============================================================================
 
 def is_valid_email_address(email: str) -> bool:
@@ -817,7 +1519,6 @@ def _clean_czech_news_summary(text: str, title_cs: str) -> str:
         s_clean = s.rstrip(".!?").strip() + "."
         if s_clean not in sentences and not _looks_english(s_clean):
             sentences.append(s_clean)
-        # Každé shrnutí má mít vždy přesně 3 věty.
         if len(sentences) >= 3:
             break
 
@@ -1358,7 +2059,7 @@ def generate_html_newsletter_content(
                                     </td>
                                 </tr>
                             </table>
-                            <table role="presentation" width="100%" cellspacing="6" cellpadding="0" style="margin-bottom: 8px;">
+                            <table role="presentation" width="100%" cellspacing="6" cellpadding="0" style="margin-bottom: 20px;">
                                 <tr>
                                     <td width="33%" style="background-color: #0f1625; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; text-align: center;">
                                         <div style="font-size: 10px; color: #94a3b8;">EUR / CZK</div>
@@ -1371,18 +2072,6 @@ def generate_html_newsletter_content(
                                     <td width="33%" style="background-color: #0f1625; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; text-align: center;">
                                         <div style="font-size: 10px; color: #94a3b8;">GBP / CZK</div>
                                         <div style="font-size: 16px; font-weight: 800; color: #ffffff; font-family: Consolas, monospace; margin-top: 4px;">{gbp_czk:.2f} CZK</div>
-                                    </td>
-                                </tr>
-                            </table>
-                            <table role="presentation" width="100%" cellspacing="6" cellpadding="0" style="margin-bottom: 20px;">
-                                <tr>
-                                    <td width="50%" style="background-color: #0f1625; border: 1px solid #78350f; border-radius: 8px; padding: 12px; text-align: center;">
-                                        <div style="font-size: 10px; color: #f59e0b;">INFLACE V ČR</div>
-                                        <div style="font-size: 16px; font-weight: 800; color: #ffffff; font-family: Consolas, monospace; margin-top: 4px;">{cnb['latest_inflation']}</div>
-                                    </td>
-                                    <td width="50%" style="background-color: #0f1625; border: 1px solid #78350f; border-radius: 8px; padding: 12px; text-align: center;">
-                                        <div style="font-size: 10px; color: #f59e0b;">REPO SAZBA ČNB</div>
-                                        <div style="font-size: 16px; font-weight: 800; color: #ffffff; font-family: Consolas, monospace; margin-top: 4px;">{cnb['repo_rate']}</div>
                                     </td>
                                 </tr>
                             </table>
@@ -1532,12 +2221,12 @@ async def lifespan(app_instance: FastAPI):
     task.cancel()
 
 
-app = FastAPI(title="Tensegrity Terminal | Institutional Valuation Platform", version="4.1", lifespan=lifespan)
+app = FastAPI(title="Tensegrity Terminal | Institutional Valuation Platform", version="5.2", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 # ==============================================================================
-# 5. NEPRŮSTŘELNÝ ADAPTIVNÍ VALUAČNÍ ENGINE
+# 6. VALUAČNÍ ENGINE BEZ TICHÉHO DOMÝŠLENÍ + OWNER EARNINGS + LOOK-THROUGH + SOTP
 # ==============================================================================
 
 ALL_SECTOR_BENCHMARKS = {
@@ -1575,21 +2264,19 @@ def get_currency_risk_free_rate(currency: str, us10y_pct: float) -> float:
 
 def compute_dynamic_scenario_defaults(
     info: dict,
-    fin_df,
-    cf_df,
+    series: dict[str, list[float]],
+    points: dict[str, DataPoint],
     sector: str,
-    stmt_fx: float = 1.0,
+    market_currency: str,
 ) -> tuple[float, float, float]:
     bench = ALL_SECTOR_BENCHMARKS.get(sector, {"ev_ebitda": 13.0, "pe": 19.0, "ev_revenue": 3.0, "pb": 3.0, "growth": 0.075})
     current_price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice"), 0.0) or 0.0
-    shares = safe_float(info.get("sharesOutstanding"), 0.0) or 0.0
-    market_cap = safe_float(info.get("marketCap"), current_price * shares) or 0.0
-    total_debt = (safe_float(info.get("totalDebt"), 0.0) or 0.0) * stmt_fx
-    currency = str(info.get("currency") or "USD").upper()
+    mcap_val = points["market_cap"].value or 0.0
+    debt_val = points["debt"].value if points["debt"].value is not None else 0.0
 
-    total_cap = market_cap + total_debt
-    if total_cap > 0 and total_debt >= 0:
-        auto_leverage = round(max(0.0, min(0.85, total_debt / total_cap)), 2)
+    total_cap = mcap_val + debt_val
+    if total_cap > 0 and points["debt"].value is not None:
+        auto_leverage = round(max(0.0, min(0.85, debt_val / total_cap)), 2)
     else:
         auto_leverage = 0.15
 
@@ -1606,7 +2293,7 @@ def compute_dynamic_scenario_defaults(
         if -0.35 < raw_fwd_g < 1.20:
             forward_implied_g = raw_fwd_g
 
-    rev_hist = extract_statement_series(fin_df, ["Total Revenue", "Operating Revenue"], max_years=4, fx_mult=stmt_fx)
+    rev_hist = series.get("revenue") or []
     hist_cagr = None
     if len(rev_hist) >= 2 and rev_hist[-1] > 0 and rev_hist[0] > 0:
         years = len(rev_hist) - 1
@@ -1622,8 +2309,8 @@ def compute_dynamic_scenario_defaults(
     if hist_cagr is not None and -0.45 < hist_cagr < 2.5:
         backward_signals.append(hist_cagr)
 
-    usd_rate = get_fx_conversion_rate(currency, "USD")
-    mcap_usd = market_cap * usd_rate
+    usd_rate = get_fx_conversion_rate(market_currency, "USD")
+    mcap_usd = mcap_val * usd_rate
 
     if mcap_usd >= 1_000_000_000_000:
         size_dampener = 0.42
@@ -1680,29 +2367,16 @@ def run_valuation_logic(
     exit_mult: float | None = None,
 ) -> dict:
     clean_ticker = resolve_company_ticker(query_or_ticker)
-    try:
-        stock = yf.Ticker(clean_ticker)
-        info = stock.info or {}
-        fin_df = stock.financials
-        bs_df = stock.balance_sheet
-        cf_df = stock.cashflow
-    except Exception as err:
-        logger.warning("Chyba při stahování dat z Yahoo Finance pro %s: %s", clean_ticker, err)
-        info = {}
-        fin_df = None
-        bs_df = None
-        cf_df = None
+    dataset = fetch_unified_financial_dataset(clean_ticker)
 
-    quote_type = str(info.get("quoteType") or "EQUITY").upper()
-    if quote_type in ("INDEX", "MUTUALFUND", "CRYPTOCURRENCY", "CURRENCY", "FUTURE"):
-        raise ValueError(f"Instrument '{clean_ticker}' je typu {quote_type} (nikoli veřejně obchodovaná společnost s účetními výkazy).")
-
-    raw_currency = str(info.get("currency") or "USD")
-    currency = "GBP" if raw_currency == "GBp" else raw_currency.upper()
-    fin_currency = str(info.get("financialCurrency") or currency).upper()
-
-    stmt_fx = get_fx_conversion_rate(fin_currency, currency)
-    price_scale = 0.01 if raw_currency == "GBp" else 1.0
+    info = dataset["info"]
+    currency = dataset["market_currency"]
+    fin_currency = dataset["stmt_currency"]
+    stmt_fx = dataset["stmt_fx"]
+    stmt_provider = dataset["stmt_provider"]
+    current_price = dataset["current_price"]
+    series = dataset["series"]
+    pts: dict[str, DataPoint] = dataset["points"]
 
     sector = str(info.get("sector") or "Technology")
     industry = str(info.get("industry") or "General")
@@ -1711,7 +2385,7 @@ def run_valuation_logic(
     )
     is_real_estate = sector == "Real Estate" or "reit" in industry.lower()
 
-    auto_lev, auto_grw, auto_mult = compute_dynamic_scenario_defaults(info, fin_df, cf_df, sector, stmt_fx)
+    auto_lev, auto_grw, auto_mult = compute_dynamic_scenario_defaults(info, series, pts, sector, currency)
     eff_leverage = leverage if leverage is not None else auto_lev
     eff_growth = growth if growth is not None else auto_grw
     eff_exit_mult = exit_mult if exit_mult is not None else auto_mult
@@ -1721,164 +2395,247 @@ def run_valuation_logic(
     erp_rate = 0.052 if currency == "CZK" else 0.046
 
     exchange = str(info.get("exchange") or "NMS")
-    company_name = str(info.get("longName") or info.get("shortName") or clean_ticker)
+    company_name = dataset["company_name"]
     company_logo_urls = extract_company_logo_urls(info, clean_ticker)
     company_logo_url = company_logo_urls[0] if company_logo_urls else ""
     country = str(info.get("country") or "United States")
     employees = int(safe_float(info.get("fullTimeEmployees"), 0) or 0)
     business_summary = str(info.get("longBusinessSummary") or "")
 
-    current_price = safe_float(info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose"), None)
-    if current_price is not None:
-        current_price *= price_scale
-    if current_price is None or current_price <= 0:
-        try:
-            hist_px = yf.Ticker(clean_ticker).history(period="5d")["Close"].dropna()
-            if not hist_px.empty:
-                current_price = float(hist_px.iloc[-1]) * price_scale
-        except Exception:
-            pass
-    if current_price is None or current_price <= 0:
-        raise ValueError(f"Nepodařilo se zjistit aktuální tržní cenu pro titul '{clean_ticker}'.")
+    shares_outstanding = pts["shares"].value
+    market_cap = pts["market_cap"].value
 
-    raw_shares = safe_float(info.get("sharesOutstanding"), None)
-    raw_mcap = safe_float(info.get("marketCap"), None)
-
-    if raw_shares and raw_shares > 0 and raw_mcap and raw_mcap > 0:
-        shares_outstanding = raw_shares
-        market_cap = raw_mcap
-    elif raw_mcap and raw_mcap > 0:
-        market_cap = raw_mcap
-        shares_outstanding = market_cap / current_price
-    elif raw_shares and raw_shares > 0:
-        shares_outstanding = raw_shares
-        market_cap = current_price * shares_outstanding
-    else:
-        shares_outstanding = 1_000_000_000.0
-        market_cap = current_price * shares_outstanding
-
-    rev_hist = extract_statement_series(fin_df, ["Total Revenue", "Operating Revenue"], fx_mult=stmt_fx)
-    ebitda_hist = extract_statement_series(fin_df, ["EBITDA", "Normalized EBITDA"], fx_mult=stmt_fx)
-    ebit_hist = extract_statement_series(fin_df, ["EBIT", "Operating Income"], fx_mult=stmt_fx)
-    da_hist = extract_statement_series(cf_df, ["Depreciation And Amortization", "Depreciation Amortization Depletion"], fx_mult=stmt_fx)
-    net_inc_hist = extract_statement_series(fin_df, ["Net Income", "Net Income Common Stockholders"], fx_mult=stmt_fx)
-    pretax_hist = extract_statement_series(fin_df, ["Pretax Income"], fx_mult=stmt_fx)
-    tax_hist = extract_statement_series(fin_df, ["Tax Provision"], fx_mult=stmt_fx)
-    int_exp_hist = extract_statement_series(fin_df, ["Interest Expense", "Interest Expense Non Operating"], fx_mult=stmt_fx)
-    ocf_hist = extract_statement_series(cf_df, ["Operating Cash Flow", "Cash Flow From Continuing Operating Activities"], fx_mult=stmt_fx)
-    capex_hist = extract_statement_series(cf_df, ["Capital Expenditure", "Purchase Of PPE"], fx_mult=stmt_fx)
-    sbc_hist = extract_statement_series(cf_df, ["Stock Based Compensation"], fx_mult=stmt_fx)
-    equity_hist = extract_statement_series(bs_df, ["Stockholders Equity", "Total Equity Gross Minority Interest"], fx_mult=stmt_fx)
-    debt_hist = extract_statement_series(bs_df, ["Total Debt", "Long Term Debt"], fx_mult=stmt_fx)
-    cash_hist = extract_statement_series(bs_df, ["Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"], fx_mult=stmt_fx)
-    cur_assets_hist = extract_statement_series(bs_df, ["Current Assets"], fx_mult=stmt_fx)
-    cur_liab_hist = extract_statement_series(bs_df, ["Current Liabilities"], fx_mult=stmt_fx)
-    total_assets_hist = extract_statement_series(bs_df, ["Total Assets"], fx_mult=stmt_fx)
-    retained_earn_hist = extract_statement_series(bs_df, ["Retained Earnings"], fx_mult=stmt_fx)
-
-    raw_debt_info = safe_float(info.get("totalDebt"), None)
-    total_debt = (raw_debt_info * stmt_fx) if raw_debt_info is not None else (debt_hist[0] if debt_hist else 0.0)
-    raw_cash_info = safe_float(info.get("totalCash"), None)
-    total_cash = (raw_cash_info * stmt_fx) if raw_cash_info is not None else (cash_hist[0] if cash_hist else 0.0)
-    raw_min_info = safe_float(info.get("minorityInterest"), 0.0) or 0.0
-    minority_interest = raw_min_info * stmt_fx
-    enterprise_value = market_cap + total_debt + minority_interest - total_cash
-
-    raw_rev_info = safe_float(info.get("totalRevenue"), None)
-    revenue = (raw_rev_info * stmt_fx) if raw_rev_info is not None else (rev_hist[0] if rev_hist else market_cap * 0.25)
-
-    raw_ni_info = safe_float(info.get("netIncomeToCommon"), None)
-    net_income = (raw_ni_info * stmt_fx) if raw_ni_info is not None else (net_inc_hist[0] if net_inc_hist else revenue * 0.12)
-
-    da_val = abs(da_hist[0]) if da_hist else revenue * 0.04
-    raw_ebitda_info = safe_float(info.get("ebitda"), None)
-    reported_ebitda = (raw_ebitda_info * stmt_fx) if raw_ebitda_info is not None else (ebitda_hist[0] if ebitda_hist else None)
-    if reported_ebitda is None:
-        if ebit_hist:
-            reported_ebitda = ebit_hist[0] + da_val
-        else:
-            reported_ebitda = max(net_income * 1.35 + da_val, revenue * 0.18)
-
-    reported_ebit = ebit_hist[0] if ebit_hist else max(net_income * 1.25, reported_ebitda - da_val)
-    book_val_per_share = safe_float(info.get("bookValue"), 0.0)
-    if book_val_per_share and book_val_per_share > 0:
-        book_equity = book_val_per_share * stmt_fx * shares_outstanding
-    elif equity_hist and equity_hist[0] > 0:
-        book_equity = equity_hist[0]
-    else:
-        book_equity = max(market_cap * 0.22, 1.0)
-
-    # Automatická kontrola kvality vstupních dat (data sanity check) pro jednotný chod napříč firmami
     data_warnings: list[str] = []
-    if raw_mcap and raw_mcap > 0 and raw_shares and raw_shares > 0:
-        implied_mcap = current_price * raw_shares
-        mcap_ratio = max(raw_mcap, implied_mcap) / max(1.0, min(raw_mcap, implied_mcap))
-        if mcap_ratio > 1.35:
-            mcap_rounded = round(raw_mcap, 0)
-            implied_rounded = round(implied_mcap, 0)
-            data_warnings.append(
-                f"Rozdíl mezi tržní kapitalizací ({mcap_rounded}) a součinem ceny × počet akcií ({implied_rounded})."
-            )
+    missing_fields: list[str] = []
+    estimated_fields: list[str] = []
 
-    sbc_expense = abs(sbc_hist[0]) if sbc_hist else max(0.0, revenue * 0.02)
+    field_labels_cs = {
+        "revenue": "Tržby",
+        "ebit": "Provozní zisk (EBIT)",
+        "ebitda": "EBITDA",
+        "da": "Odpisy a amortizace (D&A)",
+        "net_income": "Čistý zisk",
+        "ocf": "Provozní cash flow (OCF)",
+        "capex": "Kapitálové výdaje (CapEx)",
+        "sbc": "Akciové odměny (SBC)",
+        "equity": "Vlastní kapitál",
+        "debt": "Celkový dluh",
+        "cash": "Hotovost a ekvivalenty",
+        "interest_expense": "Úrokové náklady",
+    }
+    for f_key, f_label in field_labels_cs.items():
+        dp_item = pts[f_key]
+        if dp_item.status == "MISSING":
+            missing_fields.append(f_label)
+        elif dp_item.status == "ESTIMATED":
+            estimated_fields.append(f_label)
 
-    raw_ocf_info = safe_float(info.get("operatingCashflow"), None)
-    raw_ocf = ocf_hist[0] if ocf_hist else ((raw_ocf_info * stmt_fx) if raw_ocf_info is not None else reported_ebitda * 0.78)
-    raw_capex = abs(capex_hist[0]) if capex_hist else (da_val * 1.1)
-    raw_fcf_info = safe_float(info.get("freeCashflow"), None)
-    reported_fcf = (raw_fcf_info * stmt_fx) if raw_fcf_info is not None else (raw_ocf - raw_capex)
+    if pts["shares"].note:
+        data_warnings.append(pts["shares"].note)
 
-    # Jednotná normalizace volného peněžního toku (FCF) pro všechny společnosti bez ad-hoc úprav podle trhu
-    is_capex_heavy_growth = False
-    if is_real_estate:
-        reported_fcf = max(net_income + da_val * 0.85, raw_ocf * 0.85)
-    elif reported_fcf <= 0 and reported_ebitda > 0:
-        is_capex_heavy_growth = True
-        reported_fcf = max(reported_ebitda * 0.50, revenue * 0.06)
+    if "SEC EDGAR" not in stmt_provider and "Financial Modeling Prep" not in stmt_provider:
+        data_warnings.append(
+            "Účetní výkazy pocházejí ze záložního zdroje (Yahoo Finance), nikoli přímo z regulatorního podání."
+        )
+    elif "S-1" in stmt_provider or "10-Q" in stmt_provider:
+        data_warnings.append(
+            f"Čerstvě kotovaná společnost: data vycházejí z regulatorního podání {stmt_provider} (před prvním výročním 10-K)."
+        )
 
-    normalized_ebitda = max(reported_ebitda * 0.5, reported_ebitda - (sbc_expense * 0.5))
-    sbc_fcf_factor = 0.25 if (raw_ocf > 0 and reported_fcf > raw_ocf * 0.45) else 0.50
-    normalized_fcf = max(reported_fcf * 0.65, reported_fcf - (sbc_expense * sbc_fcf_factor))
+    if missing_fields:
+        data_warnings.append(
+            "Chybějící položky výkazů (nebyly uměle dopočítány): " + ", ".join(missing_fields) + "."
+        )
 
-    if pretax_hist and tax_hist and pretax_hist[0] > 0 and 0 <= tax_hist[0] <= pretax_hist[0] * 0.5:
-        effective_tax_rate = max(0.05, min(0.35, tax_hist[0] / pretax_hist[0]))
+    revenue = pts["revenue"].value
+    reported_ebit = pts["ebit"].value
+    reported_ebitda = pts["ebitda"].value
+    da_val = pts["da"].value
+    net_income = pts["net_income"].value
+    raw_ocf = pts["ocf"].value
+    raw_capex = pts["capex"].value
+    sbc_expense = pts["sbc"].value
+    book_equity = pts["equity"].value
+    total_debt = pts["debt"].value
+    total_cash = pts["cash"].value
+    minority_interest = pts["minority_interest"].value or 0.0
+    st_investments = pts["short_term_investments"].value or 0.0
+    lt_investments = pts["long_term_investments"].value or 0.0
+    deferred_tax_liab = pts["deferred_tax_liab"].value or 0.0
+    insurance_float = pts["insurance_float"].value or 0.0
+
+    if total_debt is not None and total_cash is not None:
+        net_debt = total_debt - total_cash - st_investments
+        enterprise_value = market_cap + total_debt + minority_interest - total_cash - st_investments
+    else:
+        net_debt = None
+        enterprise_value = None
+
+    pretax_val = pts["pretax_income"].value
+    tax_val = pts["tax_provision"].value
+    if pretax_val is not None and tax_val is not None and pretax_val > 0 and 0 <= tax_val <= pretax_val * 0.50:
+        effective_tax_rate = max(0.05, min(0.35, tax_val / pretax_val))
+        tax_rate_status = "REPORTED"
     else:
         effective_tax_rate = 0.21
+        tax_rate_status = "STATUTORY_21PCT"
 
-    raw_beta = safe_float(info.get("beta"), 1.15) or 1.15
-    raw_beta = max(0.50, min(2.40, raw_beta))
-    beta = (2.0 / 3.0) * raw_beta + (1.0 / 3.0) * 1.0
+    maintenance_capex_dp: DataPoint
+    growth_capex_dp: DataPoint
+    owner_earnings_dp: DataPoint
+
+    if raw_capex is not None:
+        if da_val is not None and da_val > 0:
+            maint_capex = min(raw_capex, da_val * 1.05)
+            growth_capex = max(0.0, raw_capex - maint_capex)
+            maintenance_capex_dp = DataPoint(
+                value=maint_capex,
+                status="ESTIMATED",
+                source="Pravidlo min(CapEx, 1,05 × D&A)",
+                note="Odhad kapitálu nutného k udržení stávající konkurenční pozice a objemu.",
+            )
+            growth_capex_dp = DataPoint(
+                value=growth_capex,
+                status="ESTIMATED",
+                source="CapEx - Maintenance CapEx",
+                note="Expanzní kapitálové výdaje nad rámec obnovy.",
+            )
+        else:
+            maint_capex = raw_capex
+            growth_capex = 0.0
+            maintenance_capex_dp = DataPoint(
+                value=maint_capex,
+                status="ESTIMATED",
+                source="100 % reportovaného CapEx (chybí D&A)",
+                note="Bez údajů o odpisech se celý CapEx konzervativně považuje za udržovací.",
+            )
+            growth_capex_dp = DataPoint(value=0.0, status="ESTIMATED", source="Konzervativní předpoklad")
+    else:
+        maint_capex = None
+        growth_capex = None
+        maintenance_capex_dp = DataPoint(value=None, status="MISSING", source=stmt_provider, note="Chybí reportovaný CapEx.")
+        growth_capex_dp = DataPoint(value=None, status="MISSING", source=stmt_provider, note="Chybí reportovaný CapEx.")
+
+    if net_income is not None and maint_capex is not None:
+        da_addback = da_val if da_val is not None else 0.0
+        sbc_deduct = sbc_expense if sbc_expense is not None else 0.0
+        oe_val = net_income + da_addback - sbc_deduct - maint_capex
+        owner_earnings_dp = DataPoint(
+            value=oe_val,
+            status="ESTIMATED",
+            source="Net Income + D&A - SBC - Maintenance CapEx",
+            note="Skutečný peněžní tok dostupný vlastníkům po odečtení obnovy aktiv a SBC.",
+        )
+    elif raw_ocf is not None and maint_capex is not None:
+        sbc_deduct = sbc_expense if sbc_expense is not None else 0.0
+        oe_val = raw_ocf - maint_capex - sbc_deduct
+        owner_earnings_dp = DataPoint(
+            value=oe_val,
+            status="ESTIMATED",
+            source="OCF - Maintenance CapEx - SBC",
+            note="Odvozeno z provozního cash flow po odečtení udržovacího CapEx.",
+        )
+    else:
+        owner_earnings_dp = DataPoint(
+            value=None,
+            status="MISSING",
+            source=stmt_provider,
+            note="Nelze spočítat Owner Earnings (chybí čistý zisk/OCF nebo CapEx).",
+        )
+
+    if net_income is not None:
+        if lt_investments > 0:
+            undistributed_investee_earnings = lt_investments * 0.075 * (1.0 - 0.15)
+            look_through_val = net_income + undistributed_investee_earnings
+            look_through_dp = DataPoint(
+                value=look_through_val,
+                status="ESTIMATED",
+                source="Net Income + Look-Through z dlouhodobých investic",
+                note="Zahrnuje odhadovaný nerozdělený zisk z majetkových účastí po zdanění.",
+            )
+        else:
+            look_through_dp = DataPoint(
+                value=net_income,
+                status="REPORTED",
+                source=stmt_provider,
+                note="Firma nevykazuje významné neprovozní majetkové účasti; shodné s čistým ziskem.",
+            )
+    else:
+        look_through_dp = DataPoint(value=None, status="MISSING", source=stmt_provider)
+
+    if raw_ocf is not None and raw_capex is not None:
+        if is_real_estate and net_income is not None and da_val is not None:
+            reported_fcf = net_income + da_val - maint_capex
+        else:
+            reported_fcf = raw_ocf - raw_capex
+        fcf_dp = DataPoint(value=reported_fcf, status="REPORTED", source=f"{stmt_provider} (OCF - CapEx)")
+    else:
+        raw_fcf_info = safe_float(info.get("freeCashflow"), None)
+        if raw_fcf_info is not None:
+            reported_fcf = raw_fcf_info * stmt_fx
+            fcf_dp = DataPoint(value=reported_fcf, status="REPORTED", source="Market Feed (FCF)")
+        else:
+            reported_fcf = None
+            fcf_dp = DataPoint(value=None, status="MISSING", source=stmt_provider, note="Chybí OCF nebo CapEx pro výpočet FCF.")
+
+    sbc_known = sbc_expense if sbc_expense is not None else 0.0
+    normalized_ebitda = (reported_ebitda - sbc_known) if reported_ebitda is not None else None
+    normalized_fcf = (reported_fcf - sbc_known) if reported_fcf is not None else None
+
+    raw_beta = safe_float(info.get("beta"), None)
+    if raw_beta is not None and 0.20 <= raw_beta <= 3.0:
+        beta = (2.0 / 3.0) * raw_beta + (1.0 / 3.0) * 1.0
+        beta_status = "REPORTED_BLENDED"
+    else:
+        beta = 1.0
+        beta_status = "NEUTRAL_1.0"
+        data_warnings.append("Beta nebyla v tržním feedu dostupná; použita neutrální tržní hodnota 1,00.")
+
     cost_of_equity = rf_rate + beta * erp_rate
 
-    interest_expense = abs(int_exp_hist[0]) if int_exp_hist else total_debt * 0.048
-    pre_tax_cost_of_debt = (interest_expense / total_debt) if total_debt > 0 else (rf_rate + 0.012)
-    pre_tax_cost_of_debt = max(rf_rate + 0.004, min(0.11, pre_tax_cost_of_debt))
+    int_exp_val = pts["interest_expense"].value
+    if total_debt is not None and total_debt > 0 and int_exp_val is not None and int_exp_val > 0:
+        pre_tax_cost_of_debt = max(rf_rate + 0.004, min(0.12, int_exp_val / total_debt))
+        kd_status = "REPORTED"
+    else:
+        pre_tax_cost_of_debt = rf_rate + 0.015
+        kd_status = "ESTIMATED_SPREAD"
 
-    total_capital = market_cap + total_debt
-    weight_equity = (market_cap / total_capital) if total_capital > 0 else 0.90
-    weight_debt = (total_debt / total_capital) if total_capital > 0 else 0.10
+    debt_for_wacc = total_debt if total_debt is not None else 0.0
+    total_capital = market_cap + debt_for_wacc
+    weight_equity = (market_cap / total_capital) if total_capital > 0 else 1.0
+    weight_debt = (debt_for_wacc / total_capital) if total_capital > 0 else 0.0
     wacc = (weight_equity * cost_of_equity) + (weight_debt * pre_tax_cost_of_debt * (1.0 - effective_tax_rate))
-    wacc = max(0.068, min(0.145, wacc))
+    wacc = max(0.062, min(0.155, wacc))
 
-    invested_capital = max(1.0, book_equity + total_debt - total_cash)
-    nopat = reported_ebit * (1.0 - effective_tax_rate)
-    roic = nopat / invested_capital
-    economic_profit = (roic - wacc) * invested_capital
+    if book_equity is not None and total_debt is not None and total_cash is not None and reported_ebit is not None:
+        invested_capital = max(1.0, book_equity + total_debt - total_cash - st_investments)
+        nopat = reported_ebit * (1.0 - effective_tax_rate)
+        roic = nopat / invested_capital
+        economic_profit = (roic - wacc) * invested_capital
+    else:
+        invested_capital = None
+        nopat = None
+        roic = None
+        economic_profit = None
 
     terminal_growth = min(0.03, max(0.02, wacc - 0.055))
     if terminal_growth >= wacc:
         terminal_growth = wacc * 0.45
 
-    def simulate_fcff_dcf(initial_g: float, custom_wacc: float, custom_exit_mult: float, custom_tg: float) -> dict:
+    def simulate_fcff_dcf(initial_g: float, custom_wacc: float, custom_exit_mult: float, custom_tg: float) -> dict | None:
+        if normalized_fcf is None or normalized_fcf <= 0 or net_debt is None:
+            return None
         cf_rows = []
         curr_fcf = normalized_fcf
-        curr_ebitda = normalized_ebitda
+        curr_ebitda = normalized_ebitda if (normalized_ebitda is not None and normalized_ebitda > 0) else None
         pv_sum = 0.0
         for yr in range(1, 6):
             fade_weight = (yr - 1) / 4.0
             yr_growth = initial_g * (1.0 - 0.35 * fade_weight) + custom_tg * (0.35 * fade_weight)
             curr_fcf *= (1.0 + yr_growth)
-            curr_ebitda *= (1.0 + yr_growth)
+            if curr_ebitda is not None:
+                curr_ebitda *= (1.0 + yr_growth)
             disc_factor = 1.0 / ((1.0 + custom_wacc) ** yr)
             pv_cf = curr_fcf * disc_factor
             pv_sum += pv_cf
@@ -1891,12 +2648,15 @@ def run_valuation_logic(
             })
 
         gordon_tv = (curr_fcf * (1.0 + custom_tg)) / max(0.015, custom_wacc - custom_tg)
-        multiple_tv = curr_ebitda * custom_exit_mult
-        blended_tv = 0.5 * gordon_tv + 0.5 * multiple_tv
-        pv_tv = blended_tv / ((1.0 + custom_wacc) ** 5)
+        if curr_ebitda is not None:
+            multiple_tv = curr_ebitda * custom_exit_mult
+            blended_tv = 0.5 * gordon_tv + 0.5 * multiple_tv
+        else:
+            blended_tv = gordon_tv
 
+        pv_tv = blended_tv / ((1.0 + custom_wacc) ** 5)
         ev_val = pv_sum + pv_tv
-        eq_val = max(0.0, ev_val + total_cash - total_debt - minority_interest)
+        eq_val = max(0.0, ev_val - net_debt - minority_interest)
         per_share = eq_val / shares_outstanding
         tv_share_pct = (pv_tv / ev_val * 100.0) if ev_val > 0 else 0.0
         return {
@@ -1909,341 +2669,479 @@ def run_valuation_logic(
         }
 
     dcf_res = simulate_fcff_dcf(eff_growth, wacc, eff_exit_mult, terminal_growth)
-    dcf_intrinsic_share = dcf_res["intrinsic_value_per_share"]
-    dcf_upside = ((dcf_intrinsic_share / current_price) - 1.0) * 100.0 if current_price > 0 else 0.0
+    if dcf_res is not None:
+        dcf_intrinsic_share = dcf_res["intrinsic_value_per_share"]
+        dcf_upside = ((dcf_intrinsic_share / current_price) - 1.0) * 100.0
+    else:
+        dcf_intrinsic_share = None
+        dcf_upside = None
 
     bench = ALL_SECTOR_BENCHMARKS.get(sector, {"ev_ebitda": 13.0, "pe": 19.0, "ev_revenue": 3.0, "pb": 3.0, "growth": 0.075})
-    if is_financial:
-        base_fcfe = max(1.0, net_income * 0.85)
+    if owner_earnings_dp.value is not None and owner_earnings_dp.value > 0:
+        base_fcfe = owner_earnings_dp.value
+    elif is_financial and net_income is not None and net_income > 0:
+        base_fcfe = net_income
     else:
-        # Použijeme vyšší ze dvou konzistentních základů: očištěný FCFF po úrocích nebo hotovostní zisk po úrocích
-        cash_fcfe_base = normalized_fcf - interest_expense * (1.0 - effective_tax_rate)
-        ni_fcfe_base = max(1.0, (net_income - sbc_expense * 0.25)) * 0.90
-        base_fcfe = max(1.0, 0.65 * max(cash_fcfe_base, ni_fcfe_base * 0.75) + 0.35 * ni_fcfe_base)
+        base_fcfe = None
 
-    curr_fcfe = base_fcfe
-    fcfe_pv = 0.0
-    for yr in range(1, 6):
-        fade_w = (yr - 1) / 4.0
-        yr_g = eff_growth * (1.0 - 0.35 * fade_w) + terminal_growth * (0.35 * fade_w)
-        curr_fcfe *= (1.0 + yr_g)
-        fcfe_pv += curr_fcfe / ((1.0 + cost_of_equity) ** yr)
+    if base_fcfe is not None:
+        curr_fcfe = base_fcfe
+        fcfe_pv = 0.0
+        for yr in range(1, 6):
+            fade_w = (yr - 1) / 4.0
+            yr_g = eff_growth * (1.0 - 0.35 * fade_w) + terminal_growth * (0.35 * fade_w)
+            curr_fcfe *= (1.0 + yr_g)
+            fcfe_pv += curr_fcfe / ((1.0 + cost_of_equity) ** yr)
 
-    fcfe_gordon_tv = (curr_fcfe * (1.0 + terminal_growth)) / max(0.02, cost_of_equity - terminal_growth)
-    fcfe_mult_tv = curr_fcfe * min(24.0, bench["pe"] * 0.85)
-    fcfe_tv = fcfe_gordon_tv if is_financial else (0.5 * fcfe_gordon_tv + 0.5 * fcfe_mult_tv)
-    fcfe_equity_val = fcfe_pv + (fcfe_tv / ((1.0 + cost_of_equity) ** 5))
-    fcfe_per_share = max(0.0, fcfe_equity_val / shares_outstanding)
+        fcfe_gordon_tv = (curr_fcfe * (1.0 + terminal_growth)) / max(0.02, cost_of_equity - terminal_growth)
+        fcfe_mult_tv = curr_fcfe * min(24.0, bench["pe"] * 0.85)
+        fcfe_tv = fcfe_gordon_tv if is_financial else (0.5 * fcfe_gordon_tv + 0.5 * fcfe_mult_tv)
+        fcfe_equity_val = fcfe_pv + (fcfe_tv / ((1.0 + cost_of_equity) ** 5))
+        fcfe_per_share = max(0.0, fcfe_equity_val / shares_outstanding)
+    else:
+        fcfe_equity_val = None
+        fcfe_per_share = None
 
-    low_g, high_g = -0.35, 1.50
-    for _ in range(60):
-        mid_g = (low_g + high_g) / 2.0
-        test_price = simulate_fcff_dcf(mid_g, wacc, eff_exit_mult, terminal_growth)["intrinsic_value_per_share"]
-        if test_price < current_price:
-            low_g = mid_g
-        else:
-            high_g = mid_g
-    implied_growth_pct = ((low_g + high_g) / 2.0) * 100.0
+    if dcf_res is not None:
+        low_g, high_g = -0.35, 1.50
+        for _ in range(60):
+            mid_g = (low_g + high_g) / 2.0
+            sim_mid = simulate_fcff_dcf(mid_g, wacc, eff_exit_mult, terminal_growth)
+            if sim_mid is not None and sim_mid["intrinsic_value_per_share"] < current_price:
+                low_g = mid_g
+            else:
+                high_g = mid_g
+        implied_growth_pct = ((low_g + high_g) / 2.0) * 100.0
+    else:
+        implied_growth_pct = None
 
-    roe_est = min(0.55, max(0.04, net_income / max(1.0, book_equity)))
-    pv_ri = 0.0
-    curr_bv = book_equity
-    faded_roe = roe_est
-    for yr in range(1, 6):
-        faded_roe = roe_est * (1.0 - 0.12 * (yr - 1)) + cost_of_equity * (0.12 * (yr - 1))
-        ri_yr = (faded_roe - cost_of_equity) * curr_bv
-        pv_ri += ri_yr / ((1.0 + cost_of_equity) ** yr)
-        curr_bv += faded_roe * curr_bv * 0.45
+    if book_equity is not None and book_equity > 0 and net_income is not None:
+        roe_est = min(0.55, max(-0.20, net_income / book_equity))
+        pv_ri = 0.0
+        curr_bv = book_equity
+        faded_roe = roe_est
+        for yr in range(1, 6):
+            faded_roe = roe_est * (1.0 - 0.12 * (yr - 1)) + cost_of_equity * (0.12 * (yr - 1))
+            ri_yr = (faded_roe - cost_of_equity) * curr_bv
+            pv_ri += ri_yr / ((1.0 + cost_of_equity) ** yr)
+            curr_bv += max(0.0, faded_roe * curr_bv * 0.45)
 
-    terminal_ri = ((faded_roe - cost_of_equity) * curr_bv) / max(0.02, cost_of_equity - terminal_growth)
-    ri_equity_val = max(0.0, book_equity + pv_ri + (terminal_ri / ((1.0 + cost_of_equity) ** 5)))
-    ri_per_share = ri_equity_val / shares_outstanding
+        terminal_ri = ((faded_roe - cost_of_equity) * curr_bv) / max(0.02, cost_of_equity - terminal_growth)
+        ri_equity_val = max(0.0, book_equity + pv_ri + (terminal_ri / ((1.0 + cost_of_equity) ** 5)))
+        ri_per_share = ri_equity_val / shares_outstanding
+    else:
+        roe_est = None
+        ri_equity_val = None
+        ri_per_share = None
 
     fwd_factor = (1.0 + eff_growth) ** 2
     pv_discount_2y_eq = 1.0 / ((1.0 + cost_of_equity) ** 2)
     pv_discount_2y_ev = 1.0 / ((1.0 + wacc) ** 2)
 
-    company_roic_or_roe = roe_est if is_financial else roic
-    quality_mult_adj = max(0.85, min(1.12, 1.0 + (company_roic_or_roe - wacc) * 0.35))
+    quality_signal = (roe_est - cost_of_equity) if (is_financial and roe_est is not None) else ((roic - wacc) if roic is not None else 0.0)
+    quality_mult_adj = max(0.85, min(1.12, 1.0 + quality_signal * 0.35))
 
-    if is_financial:
-        roe_adjusted_pb = max(0.65, min(3.2, bench["pb"] * (roe_est / 0.12)))
-        adj_pe = round((0.65 * bench["pe"] + 0.35 * 11.5) * quality_mult_adj, 1)
-        fwd_ni_pv = max(1.0, net_income) * fwd_factor * pv_discount_2y_eq
-        fwd_rev_pv = revenue * fwd_factor * pv_discount_2y_eq
-        peer_rows = [
-            {
-                "method": "Cena / Čistý zisk (Odiskontovaný Forward 2Y P/E)",
-                "multiple": adj_pe,
-                "forward_metric": round(fwd_ni_pv, 2),
-                "implied_share_price": round(max(0.0, (fwd_ni_pv * adj_pe) / shares_outstanding), 2),
-            },
-            {
-                "method": "Cena / Účetní hodnota upravená o ROE (P/B)",
-                "multiple": round(roe_adjusted_pb, 2),
-                "forward_metric": round(book_equity, 2),
-                "implied_share_price": round(max(0.0, (book_equity * roe_adjusted_pb) / shares_outstanding), 2),
-            },
-            {
-                "method": "Tržní kapitalizace / Výnosy (Odiskontovaný Forward 2Y P/S)",
+    peer_rows = []
+    if not is_financial and normalized_ebitda is not None and normalized_ebitda > 0 and net_debt is not None:
+        mature_ev_ebitda = 0.62 * bench["ev_ebitda"] + 0.38 * 14.5
+        adj_ev_ebitda = round(mature_ev_ebitda * quality_mult_adj, 1)
+        fwd_ebitda_pv = normalized_ebitda * fwd_factor * pv_discount_2y_ev
+        ev_ebitda_price = max(0.0, (fwd_ebitda_pv * adj_ev_ebitda - net_debt - minority_interest) / shares_outstanding)
+        peer_rows.append({
+            "method": "Hodnota podniku / Provozní zisk (Odiskont. Forward 2Y EV/EBITDA)",
+            "multiple": adj_ev_ebitda,
+            "forward_metric": round(fwd_ebitda_pv, 2),
+            "implied_share_price": round(ev_ebitda_price, 2),
+        })
+
+    if net_income is not None and net_income > 0:
+        mature_pe = (0.65 * bench["pe"] + 0.35 * 11.5) if is_financial else (0.62 * bench["pe"] + 0.38 * 19.5)
+        adj_pe = round(mature_pe * quality_mult_adj, 1)
+        fwd_ni_pv = net_income * fwd_factor * pv_discount_2y_eq
+        pe_price = max(0.0, (fwd_ni_pv * adj_pe) / shares_outstanding)
+        peer_rows.append({
+            "method": "Cena / Čistý zisk (Odiskont. Forward 2Y P/E)",
+            "multiple": adj_pe,
+            "forward_metric": round(fwd_ni_pv, 2),
+            "implied_share_price": round(pe_price, 2),
+        })
+
+    if revenue is not None and revenue > 0:
+        if is_financial:
+            fwd_rev_pv = revenue * fwd_factor * pv_discount_2y_eq
+            ps_price = max(0.0, (fwd_rev_pv * bench["ev_revenue"]) / shares_outstanding)
+            peer_rows.append({
+                "method": "Tržní kapitalizace / Výnosy (Odiskont. Forward 2Y P/S)",
                 "multiple": bench["ev_revenue"],
                 "forward_metric": round(fwd_rev_pv, 2),
-                "implied_share_price": round(max(0.0, (fwd_rev_pv * bench["ev_revenue"]) / shares_outstanding), 2),
-            },
-        ]
-        comps_prices = [r["implied_share_price"] for r in peer_rows if r["implied_share_price"] > 0]
-        blended_comps_price = sum(comps_prices) / len(comps_prices) if comps_prices else fcfe_per_share
-    else:
-        mature_ev_ebitda = 0.62 * bench["ev_ebitda"] + 0.38 * 14.5
-        mature_pe = 0.62 * bench["pe"] + 0.38 * 19.5
-        mature_ev_rev = 0.62 * bench["ev_revenue"] + 0.38 * 4.5
-
-        adj_ev_ebitda = round(mature_ev_ebitda * quality_mult_adj, 1)
-        adj_pe = round(mature_pe * quality_mult_adj, 1)
-        adj_ev_rev = round(mature_ev_rev * quality_mult_adj, 1)
-
-        fwd_ebitda_pv = normalized_ebitda * fwd_factor * pv_discount_2y_ev
-        fwd_ni_pv = max(1.0, net_income) * fwd_factor * pv_discount_2y_eq
-        fwd_rev_pv = revenue * fwd_factor * pv_discount_2y_ev
-
-        peer_rows = [
-            {
-                "method": "Hodnota podniku / Provozní zisk (Odiskont. Forward 2Y EV/EBITDA)",
-                "multiple": adj_ev_ebitda,
-                "forward_metric": round(fwd_ebitda_pv, 2),
-                "implied_share_price": round(max(0.0, (fwd_ebitda_pv * adj_ev_ebitda + total_cash - total_debt) / shares_outstanding), 2),
-            },
-            {
-                "method": "Cena / Čistý zisk (Odiskont. Forward 2Y P/E)",
-                "multiple": adj_pe,
-                "forward_metric": round(fwd_ni_pv, 2),
-                "implied_share_price": round(max(0.0, (fwd_ni_pv * adj_pe) / shares_outstanding), 2),
-            },
-            {
+                "implied_share_price": round(ps_price, 2),
+            })
+        elif net_debt is not None:
+            mature_ev_rev = 0.62 * bench["ev_revenue"] + 0.38 * 4.5
+            adj_ev_rev = round(mature_ev_rev * quality_mult_adj, 1)
+            fwd_rev_pv = revenue * fwd_factor * pv_discount_2y_ev
+            ev_sales_price = max(0.0, (fwd_rev_pv * adj_ev_rev - net_debt - minority_interest) / shares_outstanding)
+            peer_rows.append({
                 "method": "Hodnota podniku / Tržby (Odiskont. Forward 2Y EV/Sales)",
                 "multiple": adj_ev_rev,
                 "forward_metric": round(fwd_rev_pv, 2),
-                "implied_share_price": round(max(0.0, (fwd_rev_pv * adj_ev_rev + total_cash - total_debt) / shares_outstanding), 2),
-            },
-            {
-                "method": "Cena / Účetní hodnota vlastního kapitálu (P/B)",
-                "multiple": bench["pb"],
-                "forward_metric": round(book_equity, 2),
-                "implied_share_price": round(max(0.0, (book_equity * bench["pb"]) / shares_outstanding), 2),
-            },
-        ]
-        if is_capex_heavy_growth:
-            comps_prices = [peer_rows[0]["implied_share_price"], peer_rows[2]["implied_share_price"]]
-            comps_prices = [p for p in comps_prices if p > 0]
-        else:
-            comps_prices = [r["implied_share_price"] for r in peer_rows[:3] if r["implied_share_price"] > 0]
-        blended_comps_price = sum(comps_prices) / len(comps_prices) if comps_prices else dcf_intrinsic_share
-
-    core_segment_ev = normalized_ebitda * eff_exit_mult * 0.80
-    growth_segment_ev = normalized_ebitda * (eff_exit_mult * 1.15) * 0.20
-    sotp_ev = core_segment_ev + growth_segment_ev
-    sotp_equity = max(0.0, sotp_ev + total_cash - total_debt - minority_interest)
-    sotp_per_share = (book_equity * 1.05 / shares_outstanding) if is_financial else (sotp_equity / shares_outstanding)
-    nav_per_share = max(0.0, (book_equity + (0.0 if is_financial else (total_cash - total_debt) * 0.25)) / shares_outstanding)
-
-    lbo_base_ev = max(market_cap, enterprise_value)
-    lbo_entry_debt = lbo_base_ev * eff_leverage
-    lbo_entry_equity = max(1000.0, lbo_base_ev - lbo_entry_debt)
-
-    def simulate_lbo(g_rate: float) -> list[dict]:
-        rem_debt = lbo_entry_debt
-        curr_eb = normalized_ebitda
-        curr_fcf_lbo = normalized_fcf
-        rows = []
-        for yr in range(1, 6):
-            curr_eb *= (1.0 + g_rate)
-            curr_fcf_lbo *= (1.0 + g_rate)
-            int_cost = rem_debt * pre_tax_cost_of_debt
-            cash_avail = max(0.0, curr_fcf_lbo - int_cost * (1.0 - effective_tax_rate))
-            principal_paid = min(rem_debt, cash_avail * 0.75)
-            rem_debt -= principal_paid
-            rows.append({
-                "rok": yr,
-                "projektovany_provozni_zisk_pred_odpisy": round(curr_eb, 2),
-                "volny_tok_pro_splaceni": round(cash_avail, 2),
-                "mor_jistiny": round(principal_paid, 2),
-                "zbyvajici_cizi_kapital": round(rem_debt, 2),
-                "fcf_lbo": round(curr_fcf_lbo, 2),
+                "implied_share_price": round(ev_sales_price, 2),
             })
-        return rows
 
-    lbo_years = simulate_lbo(eff_growth)
-    lbo_exit_ev = lbo_years[-1]["projektovany_provozni_zisk_pred_odpisy"] * eff_exit_mult
-    lbo_exit_equity = max(0.0, lbo_exit_ev - lbo_years[-1]["zbyvajici_cizi_kapital"])
-    lbo_moic = (lbo_exit_equity / lbo_entry_equity) if lbo_entry_equity > 0 else 0.0
-    lbo_irr = ((lbo_moic ** (1.0 / 5.0)) - 1.0) * 100.0 if lbo_moic > 0 else -100.0
-
-    growth_grid = [max(-0.50, eff_growth + d) for d in [-0.04, -0.02, 0.0, 0.02, 0.04]]
-    mult_grid = [max(2.0, eff_exit_mult + d) for d in [-5.0, -2.5, 0.0, 2.5, 5.0]]
-    lbo_sensitivity = []
-    for g_val in growth_grid:
-        sim_y = simulate_lbo(g_val)
-        end_eb = sim_y[-1]["projektovany_provozni_zisk_pred_odpisy"]
-        end_debt = sim_y[-1]["zbyvajici_cizi_kapital"]
-        row_cells = []
-        for m_val in mult_grid:
-            eq_out = max(0.0, end_eb * m_val - end_debt)
-            m_out = eq_out / lbo_entry_equity if lbo_entry_equity > 0 else 0.0
-            irr_out = ((m_out ** 0.2) - 1.0) * 100.0 if m_out > 0 else -100.0
-            row_cells.append({"vystupni_nasobek": round(m_val, 1), "irr_procent": round(irr_out, 2)})
-        lbo_sensitivity.append({"tempo_rustu_ebitda_procent": round(g_val * 100.0, 1), "vysledky_irr_dle_nasobku": row_cells})
-
-    wacc_grid = [max(0.05, wacc + d) for d in [-0.015, -0.0075, 0.0, 0.0075, 0.015]]
-    tg_grid = [0.015, 0.020, 0.025, 0.030, 0.035]
-    dcf_sensitivity = []
-    for w_val in wacc_grid:
-        cells = []
-        for tg_val in tg_grid:
-            safe_tg = min(tg_val, w_val - 0.015)
-            p_val = simulate_fcff_dcf(eff_growth, w_val, eff_exit_mult, safe_tg)["intrinsic_value_per_share"]
-            cells.append({"tg": round(tg_val * 100.0, 2), "price": round(p_val, 2)})
-        dcf_sensitivity.append({"wacc": round(w_val * 100.0, 2), "cells": cells})
-
-    bear_val = simulate_fcff_dcf(eff_growth * 0.55, wacc + 0.015, eff_exit_mult * 0.78, max(0.015, terminal_growth - 0.005))["intrinsic_value_per_share"]
-    base_val = dcf_intrinsic_share
-    bull_val = simulate_fcff_dcf(eff_growth * 1.30, max(0.065, wacc - 0.010), eff_exit_mult * 1.18, min(0.035, terminal_growth + 0.005))["intrinsic_value_per_share"]
-    scenario_expected = 0.25 * bear_val + 0.50 * base_val + 0.25 * bull_val
-
-    rng = random.Random(42)
-    mc_results = []
-    for _ in range(2500):
-        sim_g = rng.gauss(eff_growth, max(0.03, abs(eff_growth) * 0.22))
-        sim_wacc = max(0.06, min(0.18, rng.gauss(wacc, 0.011)))
-        sim_mult = max(5.0, rng.gauss(eff_exit_mult, eff_exit_mult * 0.14))
-        sim_margin_shock = rng.gauss(1.0, 0.08)
-        if is_financial:
-            c_fe = base_fcfe * sim_margin_shock
-            pv_fe = 0.0
-            for yr in range(1, 6):
-                yg = sim_g * (1.0 - 0.35 * ((yr - 1) / 4.0))
-                c_fe *= (1.0 + yg)
-                pv_fe += c_fe / ((1.0 + sim_wacc) ** yr)
-            tv_fe = (c_fe * (1.0 + terminal_growth)) / max(0.015, sim_wacc - terminal_growth)
-            eq_m = max(0.0, pv_fe + (tv_fe / ((1.0 + sim_wacc) ** 5)))
+    if book_equity is not None and book_equity > 0:
+        if is_financial and roe_est is not None:
+            pb_mult = round(max(0.65, min(3.2, bench["pb"] * (max(0.04, roe_est) / 0.12))), 2)
         else:
-            c_fcf = normalized_fcf * sim_margin_shock
-            c_eb = normalized_ebitda * sim_margin_shock
-            pv_cf = 0.0
+            pb_mult = bench["pb"]
+        pb_price = max(0.0, (book_equity * pb_mult) / shares_outstanding)
+        peer_rows.append({
+            "method": "Cena / Účetní hodnota vlastního kapitálu (P/B)",
+            "multiple": pb_mult,
+            "forward_metric": round(book_equity, 2),
+            "implied_share_price": round(pb_price, 2),
+        })
+
+    comps_prices = [r["implied_share_price"] for r in peer_rows if r["implied_share_price"] > 0]
+    blended_comps_price = (sum(comps_prices) / len(comps_prices)) if comps_prices else None
+
+    non_operating_investments = st_investments + lt_investments
+    economic_float_benefit = (insurance_float * 0.35) + (deferred_tax_liab * 0.25)
+
+    if is_financial and book_equity is not None and book_equity > 0:
+        operating_core_val = book_equity * 1.05
+        sotp_ev = operating_core_val + non_operating_investments + economic_float_benefit
+        sotp_equity = max(0.0, sotp_ev - minority_interest)
+        sotp_per_share = sotp_equity / shares_outstanding
+    elif normalized_ebitda is not None and normalized_ebitda > 0 and total_debt is not None and total_cash is not None:
+        operating_core_val = normalized_ebitda * eff_exit_mult
+        sotp_ev = operating_core_val + non_operating_investments + economic_float_benefit
+        sotp_equity = max(0.0, sotp_ev + total_cash - total_debt - minority_interest)
+        sotp_per_share = sotp_equity / shares_outstanding
+    else:
+        operating_core_val = None
+        sotp_ev = None
+        sotp_equity = None
+        sotp_per_share = None
+
+    if book_equity is not None and total_debt is not None and total_cash is not None:
+        nav_equity = book_equity + non_operating_investments + (0.0 if is_financial else (total_cash - total_debt) * 0.25)
+        nav_per_share = max(0.0, nav_equity / shares_outstanding)
+    else:
+        nav_per_share = None
+
+    if normalized_ebitda is not None and normalized_ebitda > 0 and normalized_fcf is not None and normalized_fcf > 0:
+        lbo_base_ev = max(market_cap, enterprise_value or market_cap)
+        lbo_entry_debt = lbo_base_ev * eff_leverage
+        lbo_entry_equity = max(1000.0, lbo_base_ev - lbo_entry_debt)
+
+        def simulate_lbo(g_rate: float) -> list[dict]:
+            rem_debt = lbo_entry_debt
+            curr_eb = normalized_ebitda
+            curr_fcf_lbo = normalized_fcf
+            rows = []
             for yr in range(1, 6):
-                fade = (yr - 1) / 4.0
-                yg = sim_g * (1.0 - 0.35 * fade) + terminal_growth * (0.35 * fade)
-                c_fcf *= (1.0 + yg)
-                c_eb *= (1.0 + yg)
-                pv_cf += c_fcf / ((1.0 + sim_wacc) ** yr)
-            tv_g = (c_fcf * (1.0 + terminal_growth)) / max(0.015, sim_wacc - terminal_growth)
-            tv_m = c_eb * sim_mult
-            ev_m = pv_cf + ((0.5 * tv_g + 0.5 * tv_m) / ((1.0 + sim_wacc) ** 5))
-            eq_m = max(0.0, ev_m + total_cash - total_debt - minority_interest)
-        mc_results.append(eq_m / shares_outstanding)
+                curr_eb *= (1.0 + g_rate)
+                curr_fcf_lbo *= (1.0 + g_rate)
+                int_cost = rem_debt * pre_tax_cost_of_debt
+                cash_avail = max(0.0, curr_fcf_lbo - int_cost * (1.0 - effective_tax_rate))
+                principal_paid = min(rem_debt, cash_avail * 0.75)
+                rem_debt -= principal_paid
+                rows.append({
+                    "rok": yr,
+                    "projektovany_provozni_zisk_pred_odpisy": round(curr_eb, 2),
+                    "volny_tok_pro_splaceni": round(cash_avail, 2),
+                    "mor_jistiny": round(principal_paid, 2),
+                    "zbyvajici_cizi_kapital": round(rem_debt, 2),
+                    "fcf_lbo": round(curr_fcf_lbo, 2),
+                })
+            return rows
 
-    mc_results.sort()
-    n_mc = len(mc_results)
-    mc_p5 = mc_results[int(0.05 * n_mc)]
-    mc_p10 = mc_results[int(0.10 * n_mc)]
-    mc_p25 = mc_results[int(0.25 * n_mc)]
-    mc_p50 = mc_results[int(0.50 * n_mc)]
-    mc_p75 = mc_results[int(0.75 * n_mc)]
-    mc_p90 = mc_results[int(0.90 * n_mc)]
-    mc_p95 = mc_results[int(0.95 * n_mc)]
-    prob_above_market = sum(1 for x in mc_results if x > current_price) / n_mc * 100.0
+        lbo_years = simulate_lbo(eff_growth)
+        lbo_exit_ev = lbo_years[-1]["projektovany_provozni_zisk_pred_odpisy"] * eff_exit_mult
+        lbo_exit_equity = max(0.0, lbo_exit_ev - lbo_years[-1]["zbyvajici_cizi_kapital"])
+        lbo_moic = (lbo_exit_equity / lbo_entry_equity) if lbo_entry_equity > 0 else 0.0
+        lbo_irr = ((lbo_moic ** (1.0 / 5.0)) - 1.0) * 100.0 if lbo_moic > 0 else -100.0
 
-    hist_low = mc_results[int(0.02 * n_mc)]
-    hist_high = max(hist_low + 1.0, mc_results[int(0.98 * n_mc)])
-    num_bins = 14
-    bin_width = (hist_high - hist_low) / num_bins
-    mc_histogram = []
-    for i in range(num_bins):
-        b_start = hist_low + i * bin_width
-        b_end = b_start + bin_width
-        b_mid = (b_start + b_end) / 2.0
-        count = sum(1 for v in mc_results if (b_start <= v < b_end) or (i == num_bins - 1 and v >= b_start and v <= b_end))
-        mc_histogram.append({"label": f"{b_mid:.1f}", "midpoint": round(b_mid, 2), "count": count})
+        growth_grid = [max(-0.50, eff_growth + d) for d in [-0.04, -0.02, 0.0, 0.02, 0.04]]
+        mult_grid = [max(2.0, eff_exit_mult + d) for d in [-5.0, -2.5, 0.0, 2.5, 5.0]]
+        lbo_sensitivity = []
+        for g_val in growth_grid:
+            sim_y = simulate_lbo(g_val)
+            end_eb = sim_y[-1]["projektovany_provozni_zisk_pred_odpisy"]
+            end_debt = sim_y[-1]["zbyvajici_cizi_kapital"]
+            row_cells = []
+            for m_val in mult_grid:
+                eq_out = max(0.0, end_eb * m_val - end_debt)
+                m_out = eq_out / lbo_entry_equity if lbo_entry_equity > 0 else 0.0
+                irr_out = ((m_out ** 0.2) - 1.0) * 100.0 if m_out > 0 else -100.0
+                row_cells.append({"vystupni_nasobek": round(m_val, 1), "irr_procent": round(irr_out, 2)})
+            lbo_sensitivity.append({"tempo_rustu_ebitda_procent": round(g_val * 100.0, 1), "vysledky_irr_dle_nasobku": row_cells})
+    else:
+        lbo_entry_equity = None
+        lbo_entry_debt = None
+        lbo_exit_equity = None
+        lbo_moic = None
+        lbo_irr = None
+        lbo_years = []
+        lbo_sensitivity = []
 
-    # Jednotný a konzistentní váhový rámec napříč všemi společnostmi (s úpravou pouze pro finanční instituce)
+    if dcf_res is not None:
+        wacc_grid = [max(0.05, wacc + d) for d in [-0.015, -0.0075, 0.0, 0.0075, 0.015]]
+        tg_grid = [0.015, 0.020, 0.025, 0.030, 0.035]
+        dcf_sensitivity = []
+        for w_val in wacc_grid:
+            cells = []
+            for tg_val in tg_grid:
+                safe_tg = min(tg_val, w_val - 0.015)
+                sim_c = simulate_fcff_dcf(eff_growth, w_val, eff_exit_mult, safe_tg)
+                p_val = sim_c["intrinsic_value_per_share"] if sim_c else 0.0
+                cells.append({"tg": round(tg_val * 100.0, 2), "price": round(p_val, 2)})
+            dcf_sensitivity.append({"wacc": round(w_val * 100.0, 2), "cells": cells})
+
+        bear_val = simulate_fcff_dcf(eff_growth * 0.55, wacc + 0.015, eff_exit_mult * 0.78, max(0.015, terminal_growth - 0.005))["intrinsic_value_per_share"]
+        base_val = dcf_intrinsic_share
+        bull_val = simulate_fcff_dcf(eff_growth * 1.30, max(0.065, wacc - 0.010), eff_exit_mult * 1.18, min(0.035, terminal_growth + 0.005))["intrinsic_value_per_share"]
+        scenario_expected = 0.25 * bear_val + 0.50 * base_val + 0.25 * bull_val
+    else:
+        dcf_sensitivity = []
+        bear_val = None
+        base_val = None
+        bull_val = None
+        scenario_expected = None
+
+    mc_base_ready = (is_financial and base_fcfe is not None) or (not is_financial and dcf_res is not None)
+    if mc_base_ready:
+        seed_val = int(hashlib.sha256(clean_ticker.encode("utf-8")).hexdigest()[:8], 16)
+        rng = random.Random(seed_val)
+        mc_results = []
+        for _ in range(2500):
+            sim_g = rng.gauss(eff_growth, max(0.03, abs(eff_growth) * 0.22))
+            sim_wacc = max(0.06, min(0.18, rng.gauss(wacc, 0.011)))
+            sim_mult = max(5.0, rng.gauss(eff_exit_mult, eff_exit_mult * 0.14))
+            sim_margin_shock = rng.gauss(1.0, 0.08)
+            if is_financial:
+                c_fe = base_fcfe * sim_margin_shock
+                pv_fe = 0.0
+                for yr in range(1, 6):
+                    yg = sim_g * (1.0 - 0.35 * ((yr - 1) / 4.0))
+                    c_fe *= (1.0 + yg)
+                    pv_fe += c_fe / ((1.0 + sim_wacc) ** yr)
+                tv_fe = (c_fe * (1.0 + terminal_growth)) / max(0.015, sim_wacc - terminal_growth)
+                eq_m = max(0.0, pv_fe + (tv_fe / ((1.0 + sim_wacc) ** 5)))
+            else:
+                c_fcf = normalized_fcf * sim_margin_shock
+                c_eb = (normalized_ebitda * sim_margin_shock) if normalized_ebitda is not None else None
+                pv_cf = 0.0
+                for yr in range(1, 6):
+                    fade = (yr - 1) / 4.0
+                    yg = sim_g * (1.0 - 0.35 * fade) + terminal_growth * (0.35 * fade)
+                    c_fcf *= (1.0 + yg)
+                    if c_eb is not None:
+                        c_eb *= (1.0 + yg)
+                    pv_cf += c_fcf / ((1.0 + sim_wacc) ** yr)
+                tv_g = (c_fcf * (1.0 + terminal_growth)) / max(0.015, sim_wacc - terminal_growth)
+                if c_eb is not None:
+                    tv_m = c_eb * sim_mult
+                    blended_tv_m = 0.5 * tv_g + 0.5 * tv_m
+                else:
+                    blended_tv_m = tv_g
+                ev_m = pv_cf + (blended_tv_m / ((1.0 + sim_wacc) ** 5))
+                eq_m = max(0.0, ev_m - net_debt - minority_interest)
+            mc_results.append(eq_m / shares_outstanding)
+
+        mc_results.sort()
+        n_mc = len(mc_results)
+        mc_p5 = mc_results[int(0.05 * n_mc)]
+        mc_p10 = mc_results[int(0.10 * n_mc)]
+        mc_p25 = mc_results[int(0.25 * n_mc)]
+        mc_p50 = mc_results[int(0.50 * n_mc)]
+        mc_p75 = mc_results[int(0.75 * n_mc)]
+        mc_p90 = mc_results[int(0.90 * n_mc)]
+        mc_p95 = mc_results[int(0.95 * n_mc)]
+        prob_above_market = sum(1 for x in mc_results if x > current_price) / n_mc * 100.0
+
+        hist_low = mc_results[int(0.02 * n_mc)]
+        hist_high = max(hist_low + 1.0, mc_results[int(0.98 * n_mc)])
+        num_bins = 14
+        bin_width = (hist_high - hist_low) / num_bins
+        mc_histogram = []
+        for i in range(num_bins):
+            b_start = hist_low + i * bin_width
+            b_end = b_start + bin_width
+            b_mid = (b_start + b_end) / 2.0
+            count = sum(1 for v in mc_results if (b_start <= v < b_end) or (i == num_bins - 1 and v >= b_start and v <= b_end))
+            mc_histogram.append({"label": f"{b_mid:.1f}", "midpoint": round(b_mid, 2), "count": count})
+    else:
+        mc_p5 = mc_p10 = mc_p25 = mc_p50 = mc_p75 = mc_p90 = mc_p95 = None
+        prob_above_market = None
+        mc_histogram = []
+
     if is_financial:
-        weights = {
+        base_weights = {
             "Vícefázový DCF pro podnik": 0.00,
-            "DCF pro vlastní kapitál": 0.30,
+            "Owner Earnings / FCFE DCF": 0.30,
             "Srovnatelné tržní násobky": 0.30,
             "Model reziduálního zisku": 0.30,
-            "Metoda součtu částí": 0.00,
+            "Strukturovaný součet částí (SOTP)": 0.00,
             "Medián Monte Carlo (P50)": 0.10,
         }
     else:
-        weights = {
+        base_weights = {
             "Vícefázový DCF pro podnik": 0.35,
-            "DCF pro vlastní kapitál": 0.15,
+            "Owner Earnings / FCFE DCF": 0.15,
             "Srovnatelné tržní násobky": 0.20,
             "Model reziduálního zisku": 0.05,
-            "Metoda součtu částí": 0.10,
+            "Strukturovaný součet částí (SOTP)": 0.10,
             "Medián Monte Carlo (P50)": 0.15,
         }
 
-    method_values = {
+    method_values: dict[str, float | None] = {
         "Vícefázový DCF pro podnik": dcf_intrinsic_share,
-        "DCF pro vlastní kapitál": fcfe_per_share,
+        "Owner Earnings / FCFE DCF": fcfe_per_share,
         "Srovnatelné tržní násobky": blended_comps_price,
         "Model reziduálního zisku": ri_per_share,
-        "Metoda součtu částí": sotp_per_share,
+        "Strukturovaný součet částí (SOTP)": sotp_per_share,
         "Medián Monte Carlo (P50)": mc_p50,
     }
 
-    weighted_fair_value = sum(weights[m] * method_values[m] for m in weights)
+    available_weight_sum = sum(
+        w for m, w in base_weights.items() if method_values[m] is not None and method_values[m] > 0
+    )
+
+    if available_weight_sum <= 0:
+        raise ValueError(
+            f"Pro titul '{clean_ticker}' chybí klíčové položky účetních výkazů ({', '.join(missing_fields)}), "
+            "proto nelze spočítat spolehlivou vnitřní hodnotu bez umělého domýšlení dat."
+        )
+
+    effective_weights: dict[str, float] = {}
+    for m_name, raw_w in base_weights.items():
+        val = method_values[m_name]
+        if val is not None and val > 0 and raw_w > 0:
+            effective_weights[m_name] = raw_w / available_weight_sum
+        else:
+            effective_weights[m_name] = 0.0
+
+    weighted_fair_value = sum(
+        effective_weights[m] * (method_values[m] or 0.0) for m in effective_weights
+    )
+
     synthesis_rows = []
-    for m_name, w_val in weights.items():
+    for m_name in base_weights:
+        w_val = effective_weights[m_name]
         v_price = method_values[m_name]
-        diff_pct = ((v_price / current_price) - 1.0) * 100.0 if current_price > 0 else 0.0
-        synthesis_rows.append({
-            "method": m_name,
-            "weight_percent": round(w_val * 100.0, 1),
-            "fair_value": round(v_price, 2),
-            "contribution": round(w_val * v_price, 2),
-            "vs_market_percent": round(diff_pct, 2),
-        })
+        if v_price is not None and v_price > 0:
+            diff_pct = ((v_price / current_price) - 1.0) * 100.0
+            synthesis_rows.append({
+                "method": m_name,
+                "status": "AVAILABLE",
+                "weight_percent": round(w_val * 100.0, 1),
+                "fair_value": round(v_price, 2),
+                "contribution": round(w_val * v_price, 2),
+                "vs_market_percent": round(diff_pct, 2),
+            })
+        else:
+            synthesis_rows.append({
+                "method": m_name,
+                "status": "N/A (chybí vstupní data výkazu)",
+                "weight_percent": 0.0,
+                "fair_value": None,
+                "contribution": 0.0,
+                "vs_market_percent": None,
+            })
 
-    integrity_score = 65
-    if len(rev_hist) >= 3:
+    low_beta_ok = beta <= 1.05
+    quality_ok = (roic is not None and roic > wacc) or (is_financial and roe_est is not None and roe_est > cost_of_equity)
+    oe_conversion_ok = (
+        owner_earnings_dp.value is not None
+        and net_income is not None
+        and net_income > 0
+        and owner_earnings_dp.value >= net_income * 0.75
+    )
+    cheap_float_present = (insurance_float > 0) or (deferred_tax_liab > (market_cap * 0.03))
+    high_52w = safe_float(info.get("fiftyTwoWeekHigh"), None)
+    current_drawdown_pct = ((high_52w - current_price) / high_52w * 100.0) if (high_52w and high_52w > current_price) else 0.0
+
+    factor_profile = {
+        "source_provider": stmt_provider,
+        "low_beta_bab": {
+            "label": "Nízká beta / stabilita (BAB)",
+            "passed": low_beta_ok,
+            "detail": f"Upravená Beta {beta:.2f} ({'nízká tržní citlivost' if low_beta_ok else 'vyšší cyklická citlivost'}).",
+        },
+        "quality_qmj": {
+            "label": "Kvalita kapitálu & Moat (QMJ)",
+            "passed": quality_ok,
+            "detail": (
+                f"ROIC {roic * 100:.2f} % vs. WACC {wacc * 100:.2f} %."
+                if roic is not None
+                else (f"ROE {roe_est * 100:.2f} % vs. CoE {cost_of_equity * 100:.2f} %." if roe_est is not None else "Nedostatek dat pro ROIC.")
+            ),
+        },
+        "owner_earnings_conversion": {
+            "label": "Konverze zisku na Owner Earnings",
+            "passed": oe_conversion_ok,
+            "detail": (
+                f"Owner Earnings pokrývají {(owner_earnings_dp.value / net_income) * 100:.1f} % účetního čistého zisku."
+                if (owner_earnings_dp.value is not None and net_income and net_income > 0)
+                else "Nelze ověřit bez kompletního CapEx a čistého zisku."
+            ),
+        },
+        "cheap_float_financing": {
+            "label": "Nízkonákladové zdroje (Float / Odložené daně)",
+            "passed": cheap_float_present,
+            "detail": f"Pojistný float: {insurance_float:,.0f} {currency} | Odložené daňové závazky: {deferred_tax_liab:,.0f} {currency}.",
+        },
+        "drawdown_and_size": {
+            "label": "Aktuální drawdown & velikostní kotva",
+            "passed": current_drawdown_pct < 25.0,
+            "detail": f"Propad od 52týdenního maxima: -{current_drawdown_pct:.1f} % | Tržní kapitalizace: {market_cap:,.0f} {currency}.",
+        },
+        "model_limits": [
+            "Udržovací CapEx je odhadován pravidlem min(CapEx, 1,05 × odpisy), protože účetní standardy nerozlišují expanzní investice v rozvaze.",
+            "Kvantitativní metriky (ROIC, marže, Owner Earnings) potvrzují historickou kvalitu, ale nenahrazují posouzení konkurenční výhody (moat) a regulace.",
+            "U velkých společností (nad 250 mld. USD) působí efekt velikosti ('kotva'), který přirozeně brzdí budoucí procentuální růst.",
+        ],
+    }
+
+    integrity_score = 45
+    if "SEC EDGAR" in stmt_provider:
+        integrity_score += 25
+    elif "Financial Modeling Prep" in stmt_provider:
+        integrity_score += 20
+    else:
         integrity_score += 10
-    if not is_capex_heavy_growth:
+
+    if len(series.get("revenue") or []) >= 3:
         integrity_score += 10
-    if roic > wacc or (is_financial and roe_est > cost_of_equity):
+    if not missing_fields:
         integrity_score += 10
-    primary_intrinsic = fcfe_per_share if is_financial else dcf_intrinsic_share
-    spread_ratio = abs(primary_intrinsic - blended_comps_price) / max(1.0, weighted_fair_value)
-    if spread_ratio < 0.20:
+    else:
+        integrity_score -= min(20, len(missing_fields) * 4)
+    if quality_ok:
         integrity_score += 5
-    elif spread_ratio > 0.45:
-        integrity_score -= 10
-    integrity_score = max(35, min(98, integrity_score))
+    integrity_score = max(25, min(98, integrity_score))
 
-    if is_financial:
-        disagreement_note = (
-            f"Aktivován bankovní/finanční režim (sektor {sector}): váha byla přesměrována na Model reziduálního zisku "
-            f"({ri_per_share:,.2f} {currency}), DCF pro vlastní kapitál ({fcfe_per_share:,.2f} {currency}) a násobky P/E a P/B."
-        )
-    elif is_capex_heavy_growth:
-        disagreement_note = (
-            f"Aktivován růstový režim s normalizací expanzního CapEx: firma masivně investuje do infrastruktury, "
-            f"proto byla posílena váha výhledových tržních násobků ({blended_comps_price:,.2f} {currency}) a očištěného cash flow."
-        )
-    elif spread_ratio > 0.25:
-        disagreement_note = (
-            f"Rozptyl mezi výnosovým modelem ({primary_intrinsic:,.2f} {currency}) a tržními násobky "
-            f"({blended_comps_price:,.2f} {currency}) dosahuje {spread_ratio * 100:.1f} %."
-        )
+    primary_intrinsic = fcfe_per_share if is_financial else (dcf_intrinsic_share or fcfe_per_share)
+    if primary_intrinsic is not None and blended_comps_price is not None:
+        spread_ratio = abs(primary_intrinsic - blended_comps_price) / max(1.0, weighted_fair_value)
+        if spread_ratio > 0.25:
+            disagreement_note = (
+                f"Rozptyl mezi výnosovým modelem ({primary_intrinsic:,.2f} {currency}) a tržními násobky "
+                f"({blended_comps_price:,.2f} {currency}) dosahuje {spread_ratio * 100:.1f} %."
+            )
+        else:
+            disagreement_note = (
+                f"Vysoká konvergence oceňovacích přístupů: výnosový model ({primary_intrinsic:,.2f} {currency}) "
+                f"a relativní násobky ({blended_comps_price:,.2f} {currency}) potvrzují konzistentní odhad vnitřní hodnoty."
+            )
     else:
         disagreement_note = (
-            f"Vysoká konvergence oceňovacích přístupů: výnosový model ({primary_intrinsic:,.2f} {currency}) "
-            f"a relativní násobky ({blended_comps_price:,.2f} {currency}) potvrzují konzistentní odhad vnitřní hodnoty."
+            "Vážená vnitřní hodnota byla sestavena výhradně z modelů, pro které existují ověřená data výkazů."
         )
 
     if data_warnings:
-        disagreement_note += " Upozornění na vstupní data: " + " ".join(data_warnings)
+        disagreement_note += " Kontrola kvality dat: " + " ".join(data_warnings)
 
     green_upper = weighted_fair_value * 0.80
     yellow_upper = weighted_fair_value * 0.90
@@ -2269,45 +3167,62 @@ def run_valuation_logic(
         tranche = 0
         recommendation = "ZÓNA RED — Tržní cena převyšuje váženou vnitřní hodnotu (vyčkat)"
 
+    rev_hist = series.get("revenue") or []
+    ebit_hist = series.get("ebit") or []
+    cur_assets_hist = series.get("current_assets") or []
+    cur_liab_hist = series.get("current_liabilities") or []
+    total_assets_hist = series.get("total_assets") or []
+    retained_earn_hist = series.get("retained_earnings") or []
+
     f_score = 0
-    if net_income > 0:
+    if net_income is not None and net_income > 0:
         f_score += 1
-    if (raw_ocf or 0) > 0:
+    if raw_ocf is not None and raw_ocf > 0:
         f_score += 1
-    if (raw_ocf or 0) > net_income:
+    if raw_ocf is not None and net_income is not None and raw_ocf > net_income:
         f_score += 1
-    if roic > wacc or (is_financial and roe_est > cost_of_equity):
+    if quality_ok:
         f_score += 1
-    net_debt = total_debt - total_cash
-    if is_financial or net_debt <= 0 or (total_debt / max(1.0, reported_ebitda)) < 2.2:
+    if is_financial or (net_debt is not None and (net_debt <= 0 or (normalized_ebitda and total_debt / normalized_ebitda < 2.2))):
         f_score += 1
-    cur_ratio = (cur_assets_hist[0] / cur_liab_hist[0]) if (cur_assets_hist and cur_liab_hist and cur_liab_hist[0] > 0) else 1.8
-    if is_financial or cur_ratio > 1.2:
+    cur_ratio = (cur_assets_hist[0] / cur_liab_hist[0]) if (cur_assets_hist and cur_liab_hist and cur_liab_hist[0] > 0) else None
+    if is_financial or (cur_ratio is not None and cur_ratio > 1.2):
         f_score += 1
-    if len(rev_hist) < 2 or rev_hist[0] >= rev_hist[1]:
+    if len(rev_hist) >= 2 and rev_hist[0] >= rev_hist[1]:
         f_score += 1
-    if len(ebit_hist) < 2 or (ebit_hist[0] / max(1.0, rev_hist[0])) >= (ebit_hist[1] / max(1.0, rev_hist[1])):
-        f_score += 1
-    if is_financial or (revenue / max(1.0, total_assets_hist[0] if total_assets_hist else invested_capital)) > 0.45:
+    if len(ebit_hist) >= 2 and len(rev_hist) >= 2 and rev_hist[0] > 0 and rev_hist[1] > 0:
+        if (ebit_hist[0] / rev_hist[0]) >= (ebit_hist[1] / rev_hist[1]):
+            f_score += 1
+    if is_financial or (revenue is not None and total_assets_hist and total_assets_hist[0] > 0 and (revenue / total_assets_hist[0]) > 0.45):
         f_score += 1
 
     if is_financial:
-        altman_z = 0.0
-        altman_status = f"Finanční instituce (ROE {roe_est * 100:.1f} %)"
-    else:
-        tot_assets = total_assets_hist[0] if total_assets_hist else (invested_capital + total_cash)
-        wc = (cur_assets_hist[0] - cur_liab_hist[0]) if (cur_assets_hist and cur_liab_hist) else (total_cash * 0.6)
-        ret_earn = retained_earn_hist[0] if retained_earn_hist else (book_equity * 0.65)
+        altman_z = None
+        altman_status = f"Finanční instituce (ROE {roe_est * 100:.1f} %)" if roe_est is not None else "Finanční instituce"
+    elif (
+        total_assets_hist and total_assets_hist[0] > 0
+        and cur_assets_hist and cur_liab_hist
+        and retained_earn_hist
+        and reported_ebit is not None
+        and total_debt is not None and total_debt > 0
+        and revenue is not None
+    ):
+        tot_assets = total_assets_hist[0]
+        wc = cur_assets_hist[0] - cur_liab_hist[0]
+        ret_earn = retained_earn_hist[0]
         altman_z = (
-            1.2 * (wc / max(1.0, tot_assets))
-            + 1.4 * (ret_earn / max(1.0, tot_assets))
-            + 3.3 * (reported_ebit / max(1.0, tot_assets))
-            + 0.6 * (market_cap / max(1.0, total_debt if total_debt > 0 else tot_assets * 0.25))
-            + 1.0 * (revenue / max(1.0, tot_assets))
+            1.2 * (wc / tot_assets)
+            + 1.4 * (ret_earn / tot_assets)
+            + 3.3 * (reported_ebit / tot_assets)
+            + 0.6 * (market_cap / total_debt)
+            + 1.0 * (revenue / tot_assets)
         )
         altman_status = "Bezpečné pásmo (nad 2,99)" if altman_z > 2.99 else ("Šedá zóna (1,81–2,99)" if altman_z >= 1.81 else "Zvýšené riziko (pod 1,81)")
+    else:
+        altman_z = None
+        altman_status = "N/A (chybí položky rozvahy nebo nulový dluh)"
 
-    interest_coverage = (reported_ebit / interest_expense) if interest_expense > 0 else 99.0
+    interest_coverage = (reported_ebit / int_exp_val) if (reported_ebit is not None and int_exp_val is not None and int_exp_val > 0) else None
 
     return {
         "spolecnost": clean_ticker,
@@ -2322,108 +3237,135 @@ def run_valuation_logic(
         "country": country,
         "employees": employees,
         "business_summary": business_summary,
+        "data_quality": {
+            "primary_statement_source": stmt_provider,
+            "missing_fields": missing_fields,
+            "estimated_fields": estimated_fields,
+            "warnings": data_warnings,
+            "points": {k: v.to_dict() for k, v in pts.items()},
+        },
+        "factor_and_quality_diagnostics": factor_profile,
         "dynamic_defaults": {
             "leverage_percent": round(auto_lev * 100.0, 1),
             "growth_percent": round(auto_grw * 100.0, 1),
             "exit_multiple": round(auto_mult, 1),
         },
         "trzni_kapitalizace": round(market_cap, 2),
-        "celkovy_dluh": round(total_debt, 2),
-        "hotovost": round(total_cash, 2),
-        "cisty_dluh": round(net_debt, 2),
-        "celkova_hodnota_podniku": round(enterprise_value, 2),
+        "celkovy_dluh": round(total_debt, 2) if total_debt is not None else None,
+        "hotovost": round(total_cash, 2) if total_cash is not None else None,
+        "cisty_dluh": round(net_debt, 2) if net_debt is not None else None,
+        "celkova_hodnota_podniku": round(enterprise_value, 2) if enterprise_value is not None else None,
         "fundamentals": {
-            "revenue": round(revenue, 2),
-            "reported_ebitda": round(reported_ebitda, 2),
-            "normalized_ebitda": round(normalized_ebitda, 2),
-            "reported_fcf": round(reported_fcf, 2),
-            "normalized_fcf": round(normalized_fcf, 2),
-            "sbc_expense": round(sbc_expense, 2),
-            "net_income": round(net_income, 2),
-            "roic_percent": round((roe_est if is_financial else roic) * 100.0, 2),
-            "economic_profit": round(economic_profit, 2),
-            "fcf_conversion_percent": round((normalized_fcf / max(1.0, normalized_ebitda)) * 100.0, 1),
-            "net_debt_to_ebitda": round(net_debt / max(1.0, normalized_ebitda), 2),
-            "interest_coverage": round(interest_coverage, 1),
-            "current_ratio": round(cur_ratio, 2),
-            "operating_margin_percent": round((reported_ebit / max(1.0, revenue)) * 100.0, 2),
+            "revenue": round(revenue, 2) if revenue is not None else None,
+            "reported_ebitda": round(reported_ebitda, 2) if reported_ebitda is not None else None,
+            "normalized_ebitda": round(normalized_ebitda, 2) if normalized_ebitda is not None else None,
+            "reported_fcf": round(reported_fcf, 2) if reported_fcf is not None else None,
+            "normalized_fcf": round(normalized_fcf, 2) if normalized_fcf is not None else None,
+            "owner_earnings": round(owner_earnings_dp.value, 2) if owner_earnings_dp.value is not None else None,
+            "owner_earnings_per_share": round(owner_earnings_dp.value / shares_outstanding, 2) if owner_earnings_dp.value is not None else None,
+            "look_through_earnings": round(look_through_dp.value, 2) if look_through_dp.value is not None else None,
+            "maintenance_capex": round(maintenance_capex_dp.value, 2) if maintenance_capex_dp.value is not None else None,
+            "growth_capex": round(growth_capex_dp.value, 2) if growth_capex_dp.value is not None else None,
+            "sbc_expense": round(sbc_expense, 2) if sbc_expense is not None else None,
+            "net_income": round(net_income, 2) if net_income is not None else None,
+            "roic_percent": round((roe_est if is_financial else roic) * 100.0, 2) if ((roe_est if is_financial else roic) is not None) else None,
+            "economic_profit": round(economic_profit, 2) if economic_profit is not None else None,
+            "fcf_conversion_percent": round((normalized_fcf / normalized_ebitda) * 100.0, 1) if (normalized_fcf is not None and normalized_ebitda and normalized_ebitda > 0) else None,
+            "net_debt_to_ebitda": round(net_debt / normalized_ebitda, 2) if (net_debt is not None and normalized_ebitda and normalized_ebitda > 0) else None,
+            "interest_coverage": round(interest_coverage, 1) if interest_coverage is not None else None,
+            "current_ratio": round(cur_ratio, 2) if cur_ratio is not None else None,
+            "operating_margin_percent": round((reported_ebit / revenue) * 100.0, 2) if (reported_ebit is not None and revenue and revenue > 0) else None,
         },
         "wacc_engine": {
             "risk_free_rate_percent": round(rf_rate * 100.0, 2),
             "erp_percent": round(erp_rate * 100.0, 2),
             "beta": round(beta, 2),
+            "beta_status": beta_status,
             "cost_of_equity_percent": round(cost_of_equity * 100.0, 2),
             "pre_tax_cost_of_debt_percent": round(pre_tax_cost_of_debt * 100.0, 2),
+            "kd_status": kd_status,
             "after_tax_cost_of_debt_percent": round(pre_tax_cost_of_debt * (1.0 - effective_tax_rate) * 100.0, 2),
+            "tax_rate_status": tax_rate_status,
             "weight_equity_percent": round(weight_equity * 100.0, 1),
             "weight_debt_percent": round(weight_debt * 100.0, 1),
             "wacc_percent": round(wacc * 100.0, 2),
         },
         "dcf_valuation": {
+            "available": dcf_res is not None,
             "wacc": round(wacc, 6),
             "terminal_growth": round(terminal_growth, 4),
-            "terminal_value": round(dcf_res["terminal_value"], 2),
-            "tv_share_percent": round(dcf_res["tv_share_percent"], 1),
-            "enterprise_value": round(dcf_res["enterprise_value"], 2),
-            "equity_value": round(dcf_res["equity_value"], 2),
-            "intrinsic_value_per_share": round(dcf_intrinsic_share, 2),
+            "terminal_value": round(dcf_res["terminal_value"], 2) if dcf_res else None,
+            "tv_share_percent": round(dcf_res["tv_share_percent"], 1) if dcf_res else None,
+            "enterprise_value": round(dcf_res["enterprise_value"], 2) if dcf_res else None,
+            "equity_value": round(dcf_res["equity_value"], 2) if dcf_res else None,
+            "intrinsic_value_per_share": round(dcf_intrinsic_share, 2) if dcf_intrinsic_share is not None else None,
             "current_share_price": round(current_price, 2),
-            "upside_downside_percent": round(dcf_upside, 2),
-            "cash_flows": dcf_res["cash_flows"],
+            "upside_downside_percent": round(dcf_upside, 2) if dcf_upside is not None else None,
+            "cash_flows": dcf_res["cash_flows"] if dcf_res else [],
             "sensitivity_matrix": dcf_sensitivity,
         },
         "fcfe_valuation": {
+            "available": fcfe_per_share is not None,
             "cost_of_equity": round(cost_of_equity, 4),
-            "equity_value": round(fcfe_equity_val, 2),
-            "intrinsic_value_per_share": round(fcfe_per_share, 2),
+            "equity_value": round(fcfe_equity_val, 2) if fcfe_equity_val is not None else None,
+            "intrinsic_value_per_share": round(fcfe_per_share, 2) if fcfe_per_share is not None else None,
         },
         "reverse_dcf": {
-            "implied_fcf_growth_percent": round(implied_growth_pct, 2),
+            "available": implied_growth_pct is not None,
+            "implied_fcf_growth_percent": round(implied_growth_pct, 2) if implied_growth_pct is not None else None,
             "assumed_growth_percent": round(eff_growth * 100.0, 2),
-            "expectation_gap_percent": round((eff_growth * 100.0) - implied_growth_pct, 2),
+            "expectation_gap_percent": round((eff_growth * 100.0) - implied_growth_pct, 2) if implied_growth_pct is not None else None,
         },
         "residual_income": {
-            "book_value_equity": round(book_equity, 2),
-            "roe_percent": round(roe_est * 100.0, 2),
-            "equity_value": round(ri_equity_val, 2),
-            "intrinsic_value_per_share": round(ri_per_share, 2),
+            "available": ri_per_share is not None,
+            "book_value_equity": round(book_equity, 2) if book_equity is not None else None,
+            "roe_percent": round(roe_est * 100.0, 2) if roe_est is not None else None,
+            "equity_value": round(ri_equity_val, 2) if ri_equity_val is not None else None,
+            "intrinsic_value_per_share": round(ri_per_share, 2) if ri_per_share is not None else None,
         },
         "peer_comps": {
             "sector": sector,
-            "blended_implied_price": round(blended_comps_price, 2),
+            "blended_implied_price": round(blended_comps_price, 2) if blended_comps_price is not None else None,
             "multiples": peer_rows,
         },
         "metoda_souctu_casti": {
-            "vypoctena_hodnota_podniku": round(sotp_ev, 2),
-            "vypoctena_hodnota_vlastniho_kapitalu": round(sotp_equity, 2),
-            "sotp_per_share": round(sotp_per_share, 2),
-            "nav_per_share": round(nav_per_share, 2),
+            "available": sotp_per_share is not None,
+            "provozni_jadro_hodnota": round(operating_core_val, 2) if operating_core_val is not None else None,
+            "neprovozni_investice": round(non_operating_investments, 2),
+            "ekonomicka_vyhoda_float_a_dani": round(economic_float_benefit, 2),
+            "vypoctena_hodnota_podniku": round(sotp_ev, 2) if sotp_ev is not None else None,
+            "vypoctena_hodnota_vlastniho_kapitalu": round(sotp_equity, 2) if sotp_equity is not None else None,
+            "sotp_per_share": round(sotp_per_share, 2) if sotp_per_share is not None else None,
+            "nav_per_share": round(nav_per_share, 2) if nav_per_share is not None else None,
         },
         "model_odkupu_za_cizi_kapital_base_case": {
-            "vstupni_vlastni_kapital": round(lbo_entry_equity, 2),
-            "vstupni_cizi_kapital": round(lbo_entry_debt, 2),
-            "vystupni_hodnota_vlastniho_kapitalu": round(lbo_exit_equity, 2),
-            "moic": round(lbo_moic, 2),
-            "irr_procent": round(lbo_irr, 2),
+            "available": lbo_moic is not None,
+            "vstupni_vlastni_kapital": round(lbo_entry_equity, 2) if lbo_entry_equity is not None else None,
+            "vstupni_cizi_kapital": round(lbo_entry_debt, 2) if lbo_entry_debt is not None else None,
+            "vystupni_hodnota_vlastniho_kapitalu": round(lbo_exit_equity, 2) if lbo_exit_equity is not None else None,
+            "moic": round(lbo_moic, 2) if lbo_moic is not None else None,
+            "irr_procent": round(lbo_irr, 2) if lbo_irr is not None else None,
         },
         "projektovane_roky": lbo_years,
         "citlivostni_matice_lbo_irr": lbo_sensitivity,
         "scenarios": {
-            "bear": {"probability": 25, "fair_value": round(bear_val, 2)},
-            "base": {"probability": 50, "fair_value": round(base_val, 2)},
-            "bull": {"probability": 25, "fair_value": round(bull_val, 2)},
-            "expected_value": round(scenario_expected, 2),
+            "available": scenario_expected is not None,
+            "bear": {"probability": 25, "fair_value": round(bear_val, 2) if bear_val is not None else None},
+            "base": {"probability": 50, "fair_value": round(base_val, 2) if base_val is not None else None},
+            "bull": {"probability": 25, "fair_value": round(bull_val, 2) if bull_val is not None else None},
+            "expected_value": round(scenario_expected, 2) if scenario_expected is not None else None,
         },
         "monte_carlo": {
-            "iterations": 2500,
-            "p5": round(mc_p5, 2),
-            "p10": round(mc_p10, 2),
-            "p25": round(mc_p25, 2),
-            "p50": round(mc_p50, 2),
-            "p75": round(mc_p75, 2),
-            "p90": round(mc_p90, 2),
-            "p95": round(mc_p95, 2),
-            "prob_above_market_percent": round(prob_above_market, 1),
+            "available": mc_p50 is not None,
+            "iterations": 2500 if mc_p50 is not None else 0,
+            "p5": round(mc_p5, 2) if mc_p5 is not None else None,
+            "p10": round(mc_p10, 2) if mc_p10 is not None else None,
+            "p25": round(mc_p25, 2) if mc_p25 is not None else None,
+            "p50": round(mc_p50, 2) if mc_p50 is not None else None,
+            "p75": round(mc_p75, 2) if mc_p75 is not None else None,
+            "p90": round(mc_p90, 2) if mc_p90 is not None else None,
+            "p95": round(mc_p95, 2) if mc_p95 is not None else None,
+            "prob_above_market_percent": round(prob_above_market, 1) if prob_above_market is not None else None,
             "histogram": mc_histogram,
         },
         "valuation_synthesis": {
@@ -2449,13 +3391,13 @@ def run_valuation_logic(
         },
         "risk_analysis": {
             "piotroski_f_score": f_score,
-            "altman_z_score": round(altman_z, 2),
+            "altman_z_score": round(altman_z, 2) if altman_z is not None else None,
             "altman_status": altman_status,
         },
         "audit_trail": {
-            "model_version": "Tensegrity Institutional Engine v4.1",
+            "model_version": "Tensegrity Institutional Engine v5.2 (SEC + Dynamic IPO + Resilient AI)",
             "timestamp": get_prague_now().strftime("%Y-%m-%d %H:%M:%S %Z"),
-            "data_source": "Yahoo Finance Institutional Feed + Live FX & Treasury",
+            "data_source": f"{stmt_provider} + Live FX & Treasury",
             "currency": currency,
             "financial_currency": fin_currency,
             "fx_applied": round(stmt_fx, 4),
@@ -2470,7 +3412,7 @@ def run_valuation_logic(
 
 
 # ==============================================================================
-# 6. HISTORICKÁ DATA PRO INTERAKTIVNÍ GRAF (TRADINGVIEW / TRADING 212 STYL)
+# 7. HISTORICKÁ DATA PRO INTERAKTIVNÍ GRAF (TRADINGVIEW / TRADING 212 STYL)
 # ==============================================================================
 
 CHART_TIMEFRAME_MAP = {
@@ -2554,54 +3496,190 @@ def fetch_interactive_chart_series(query_or_ticker: str, timeframe: str = "1R") 
 
 
 # ==============================================================================
-# 7. SKUTEČNÝ VOLNÝ AI ANALYTICKÝ PORADCE (BEZ PŘEDNASTAVENÝCH ŠABLON)
+# 8. AI ANALYTICKÝ PORADCE (ODOLNÝ PROTI VÝPADKŮM + ČISTÁ ČEŠTINA BEZ LATEXU)
 # ==============================================================================
 
-def _build_ai_advisor_system_prompt(d: dict) -> str:
-    compact_context = {
-        "spolecnost": d["company_name"],
-        "ticker": d["ticker"],
-        "sektor": d["sector"],
-        "odvetvi": d["industry"],
-        "mena": d["currency"],
-        "trzni_cena": d["dcf_valuation"]["current_share_price"],
-        "vazena_vnitrni_hodnota": d["valuation_synthesis"]["weighted_fair_value"],
-        "zona": d["decision_engine"]["zone"],
-        "bezpecnostni_rezerva_procent": d["decision_engine"]["margin_of_safety_percent"],
-        "dcf_podnik": d["dcf_valuation"]["intrinsic_value_per_share"],
-        "dcf_vlastni_kapital": d["fcfe_valuation"]["intrinsic_value_per_share"],
-        "nasobky_cena": d["peer_comps"]["blended_implied_price"],
-        "monte_carlo_p50": d["monte_carlo"]["p50"],
-        "obraceny_dcf_rust_procent": d["reverse_dcf"]["implied_fcf_growth_percent"],
-        "wacc_procent": d["wacc_engine"]["wacc_percent"],
-        "roic_procent": d["fundamentals"]["roic_percent"],
-        "trzni_kapitalizace": d["trzni_kapitalizace"],
-        "dluh": d["celkovy_dluh"],
-        "hotovost": d["hotovost"],
-        "piotroski": d["risk_analysis"]["piotroski_f_score"],
-    }
+def _sanitize_advisor_output(text: str) -> str:
+    """Převede surové LaTeX příkazy (\text, \frac, \times, \beta) na čistý čitelný text."""
+    s = str(text or "")
+    s = s.replace("\\[", "").replace("\\]", "").replace("\\(", "").replace("\\)", "")
+    s = s.replace("$$", "")
+    # \frac{a}{b} -> (a / b)
+    for _ in range(3):
+        s = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1 / \2)", s)
+    # \text{něco} -> něco
+    s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", s)
+    s = s.replace("\\times", "×").replace("\\cdot", "·").replace("\\beta", "Beta").replace("\\approx", "≈")
+    s = s.replace("_{net}", " (po zdanění)")
+    return s.strip()
+
+
+def _build_ai_advisor_system_prompt(d: dict | None) -> str:
+    context_str = ""
+    if d:
+        compact_context = {
+            "spolecnost": d["company_name"],
+            "ticker": d["ticker"],
+            "zdroj_vykazu": d["data_quality"]["primary_statement_source"],
+            "chybejici_polozky": d["data_quality"]["missing_fields"],
+            "sektor": d["sector"],
+            "odvetvi": d["industry"],
+            "mena": d["currency"],
+            "trzni_cena": d["dcf_valuation"]["current_share_price"],
+            "vazena_vnitrni_hodnota": d["valuation_synthesis"]["weighted_fair_value"],
+            "zona": d["decision_engine"]["zone"],
+            "bezpecnostni_rezerva_procent": d["decision_engine"]["margin_of_safety_percent"],
+            "dcf_podnik": d["dcf_valuation"]["intrinsic_value_per_share"],
+            "owner_earnings_fcfe_akcie": d["fcfe_valuation"]["intrinsic_value_per_share"],
+            "owner_earnings_celkem": d["fundamentals"]["owner_earnings"],
+            "look_through_earnings": d["fundamentals"]["look_through_earnings"],
+            "maintenance_capex": d["fundamentals"]["maintenance_capex"],
+            "growth_capex": d["fundamentals"]["growth_capex"],
+            "sotp_akcie": d["metoda_souctu_casti"]["sotp_per_share"],
+            "nasobky_cena": d["peer_comps"]["blended_implied_price"],
+            "monte_carlo_p50": d["monte_carlo"]["p50"],
+            "obraceny_dcf_rust_procent": d["reverse_dcf"]["implied_fcf_growth_percent"],
+            "wacc_procent": d["wacc_engine"]["wacc_percent"],
+            "roic_procent": d["fundamentals"]["roic_percent"],
+            "trzni_kapitalizace": d["trzni_kapitalizace"],
+            "dluh": d["celkovy_dluh"],
+            "hotovost": d["hotovost"],
+            "piotroski": d["risk_analysis"]["piotroski_f_score"],
+        }
+        context_str = f"\nKontext aktuálně otevřené firmy v terminálu: {json.dumps(compact_context, ensure_ascii=False)}"
+
     return (
-        "Jsi špičkový, neomezený finanční, právní, investiční a všeobecný AI poradce platformy Tensegrity Terminal. "
-        "Odpovídej v perfektní češtině na JAKÝKOLIV dotaz uživatele — ať jde o jednoduchou definici, vysvětlení pojmu, "
-        "hlubokou institucionální analýzu, právo/legislativu, makroekonomiku nebo libovolnou obecnou otázku v dlouhém "
-        "vícekrokovém rozhovoru.\n"
-        "KLÍČOVÉ PRAVIDLO ODBORNOSTI A FORMÁTOVÁNÍ:\n"
-        "- Přizpůsob hloubku, odbornost a délku odpovědi přesně povaze a odbornosti otázky!\n"
-        "- Nikdy nepoužívej surové LaTeX značky jako \\[ ... \\] nebo \\( ... \\) — vzorce a pojmy piš obyčejným českým textem.\n"
-        "- Na jednoduché nebo definitorické otázky (např. 'co je nvda', 'co znamená dcf', 'co je wacc') odpovídej srozumitelně, "
-        "přirozeně a stručně bez zbytečného zahlcování tabulkami nebo výpisem všech metrik terminálu, pokud si je uživatel výslovně nevyžádá.\n"
-        "- Tabulky a hluboké finanční rozbory použij pouze tehdy, když se dotaz skutečně týká srovnání, dat nebo pokročilé analýzy.\n"
-        "- Pečlivě sleduj předchozí zprávy v historii konverzace, aby navazující otázky dávaly plný kontext.\n"
-        f"Volitelný kontext aktuálně otevřené firmy v terminálu: {json.dumps(compact_context, ensure_ascii=False)}"
+        "Jsi špičkový finanční, investiční, právní a všeobecný AI poradce platformy Tensegrity Terminal. "
+        "Odpovídej v perfektní češtině na JAKÝKOLIV dotaz uživatele.\n"
+        "KLÍČOVÁ PRAVIDLA:\n"
+        "1. Přizpůsob styl a jednoduchost vysvětlení přesně přání uživatele (pokud chce vysvětlení 'jako dítěti', použij přirovnání ke stánku s limonádou, hračkám nebo kapesnému).\n"
+        "2. NIKDY nepoužívej LaTeX značky jako \\text{}, \\frac{}, \\[, \\] nebo \\( \\) — piš vzorce obyčejným českým textem (např. 'WACC = podíl vlastního kapitálu × jeho cena + podíl dluhu × úrok po zdanění').\n"
+        "3. Pokud v kontextu firmy chybí některé položky ('chybejici_polozky'), otevřeně na to upozorni.\n"
+        f"{context_str}"
     )
 
 
-def generate_pure_ai_advisor_answer(question: str, history: list[dict], d: dict) -> str:
+def _offline_smart_czech_knowledge_fallback(question: str, d: dict | None) -> str:
+    """Chytrá lokální znalostní báze pro případ, že externí bezplatné API dočasně omezí požadavky."""
+    q = question.lower().strip()
+    as_kid = any(k in q for k in ("ditet", "dítět", "deck", "děck", "jednodus", "jednoduš", "polopat", "laick"))
+
+    if "wacc" in q:
+        wacc_note = ""
+        if d and d.get("wacc_engine"):
+            w_val = d["wacc_engine"]["wacc_percent"]
+            wacc_note = f"\n\nU aktuálně otevřené firmy **{d['company_name']} ({d['ticker']})** vychází WACC na **{w_val} %**."
+        if as_kid:
+            return (
+                "Představ si, že si chceš otevřít **stánek s limonádou** a potřebuješ na něj 100 korun:\n"
+                "1. **50 korun** ti půjčí kamarád a chce za to vrátit o **5 %** víc (to je cena dluhu).\n"
+                "2. **50 korun** ti dá brácha jako spolumajitel a chce z tvého zisku podíl odpovídající **15 %** (to je cena vlastního kapitálu, protože nese větší riziko).\n\n"
+                "**WACC** je prostě průměrná cena všech peněz, které sis na svůj stánek sehnal — tady přesně **10 %**. "
+                "Aby se ti stánek vyplatil, musí vydělat víc než těch 10 %."
+                f"{wacc_note}"
+            )
+        return (
+            "**WACC (vážené průměrné náklady kapitálu)** udává, kolik procent ročně v průměru stojí firmu peníze, kterými financuje své podnikání:\n"
+            "- **Vlastní kapitál (akcie):** výnos, který očekávají akcionáři za podstoupené riziko.\n"
+            "- **Cizí kapitál (dluh):** úrok z úvěrů a dluhopisů snížený o daňovou úsporu (úroky snižují základ daně).\n\n"
+            "**Vzorec:** `WACC = (podíl vlastního kapitálu × cena vlastního kapitálu) + (podíl dluhu × úrok × (1 - daňová sazba))`.\n"
+            "Slouží jako minimální laťka výnosnosti (diskontní sazba) při výpočtu vnitřní hodnoty firmy."
+            f"{wacc_note}"
+        )
+
+    if "dcf" in q:
+        if as_kid:
+            return (
+                "**DCF** je způsob, jak zjistit, kolik dnes stojí kouzelná pokladnička, která ti každý rok vyrobí peníze. "
+                "Protože 100 korun dnes má větší hodnotu než 100 korun za pět let, všechny budoucí peníze z pokladničky se postupně zmenší (odiskontují) a sečtou — a to je dnešní férová cena firmy."
+            )
+        return (
+            "**DCF (Discounted Cash Flow)** převádí odhadované budoucí volné peněžní toky firmy na jejich dnešní hodnotu pomocí diskontní sazby (**WACC**). "
+            "Součet těchto dnešních hodnot plus hodnota firmy po pátém roce (terminální hodnota) minus čistý dluh dává vnitřní hodnotu pro akcionáře."
+        )
+
+    if "owner earnings" in q:
+        if as_kid:
+            return (
+                "**Owner Earnings** jsou peníze, které majiteli firmy skutečně zůstanou v kapse na konci roku poté, co zaplatí všechny opravy strojů, aby firma dál fungovala stejně dobře jako dřív."
+            )
+        return (
+            "**Owner Earnings** (vlastnické zisky podle Warrena Buffetta) se počítají jako: "
+            "`Čistý zisk + Odpisy - Akciové odměny (SBC) - Udržovací kapitálové výdaje (Maintenance CapEx)`. "
+            "Na rozdíl od běžného FCF nepenalizují firmu za investice do dalšího růstu."
+        )
+
+    if "roic" in q:
+        if as_kid:
+            return (
+                "**ROIC** ukazuje, kolik korun zisku dokáže firma vyrobit z každé stokoruny, kterou do ní lidé vložili. Čím vyšší číslo než WACC, tím šikovnější firma."
+            )
+        return (
+            "**ROIC (Return on Invested Capital)** měří návratnost veškerého investovaného kapitálu (`NOPAT / Investovaný kapitál`). "
+            "Pokud je ROIC dlouhodobě vyšší než WACC, firma vytváří ekonomickou hodnotu."
+        )
+
+    return (
+        "Externí bezplatný AI server je momentálně přetížený (limit požadavků), takže nedokázal vygenerovat volnou odpověď. "
+        "Pokud si vložíš vlastní bezplatný **Gemini API klíč** (z Google AI Studio) do souboru `.env` jako `GEMINI_API_KEY=...`, "
+        "bude poradce odpovídat okamžitě a bez omezení na jakoukoliv otázku."
+    )
+
+
+def _call_pollinations_get_or_post(messages: list[dict], question: str, sys_prompt: str) -> str | None:
+    # 1. POST na OpenAI-kompatibilní endpoint
+    for model_name in ("openai", "mistral", "llama"):
+        try:
+            payload = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": 0.65,
+                "seed": random.randint(1, 999999),
+            }
+            req = urllib.request.Request(
+                "https://text.pollinations.ai/openai",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": f"Mozilla/5.0 Tensegrity/{random.randint(100,999)}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                raw_json = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            choices = raw_json.get("choices") or []
+            if choices:
+                content = str((choices[0].get("message") or {}).get("content") or "").strip()
+                if content and len(content) > 5 and "rate limit" not in content.lower():
+                    return content
+        except Exception:
+            continue
+
+    # 2. Přímý GET fallback (často projde i tehdy, když POST endpoint hlásí rate-limit)
+    try:
+        compact_prompt = f"{sys_prompt[:900]}\n\nDotaz uživatele: {question}"
+        get_url = f"https://text.pollinations.ai/{quote(compact_prompt)}?model=openai&seed={random.randint(1,999999)}"
+        req_get = urllib.request.Request(
+            get_url,
+            headers={"User-Agent": f"Mozilla/5.0 TensegrityGET/{random.randint(100,999)}"},
+        )
+        with urllib.request.urlopen(req_get, timeout=12) as resp_get:
+            txt = resp_get.read().decode("utf-8", errors="ignore").strip()
+        if txt and len(txt) > 5 and "rate limit" not in txt.lower() and not txt.startswith("<!DOCTYPE"):
+            return txt
+    except Exception:
+        pass
+
+    return None
+
+
+def generate_pure_ai_advisor_answer(question: str, history: list[dict], d: dict | None) -> str:
     sys_prompt = _build_ai_advisor_system_prompt(d)
     history_lines = []
-    for m in history[-10:]:
+    for m in history[-8:]:
         role_label = "Uživatel" if m.get("role") == "user" else "Poradce"
-        history_lines.append(f"{role_label}: {str(m.get('text', ''))[:700]}")
+        history_lines.append(f"{role_label}: {str(m.get('text', ''))[:600]}")
     history_block = "\n".join(history_lines)
 
     if GEMINI_API_KEY:
@@ -2624,86 +3702,27 @@ def generate_pure_ai_advisor_answer(question: str, history: list[dict], d: dict)
             if candidates:
                 parts = candidates[0].get("content", {}).get("parts") or []
                 if parts and parts[0].get("text"):
-                    return parts[0]["text"].strip()
+                    return _sanitize_advisor_output(parts[0]["text"])
         except Exception as err:
             logger.warning("Gemini API selhalo (%s), zkouším záložní AI...", err)
 
-    for model_name in ("openai", "mistral", "llama"):
-        try:
-            messages = [{"role": "system", "content": sys_prompt}]
-            for m in history[-10:]:
-                messages.append({
-                    "role": "user" if m.get("role") == "user" else "assistant",
-                    "content": str(m.get("text", ""))[:700],
-                })
-            messages.append({"role": "user", "content": question})
+    messages = [{"role": "system", "content": sys_prompt}]
+    for m in history[-8:]:
+        messages.append({
+            "role": "user" if m.get("role") == "user" else "assistant",
+            "content": str(m.get("text", ""))[:600],
+        })
+    messages.append({"role": "user", "content": question})
 
-            payload = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": 0.65,
-                "seed": random.randint(1, 999999),
-            }
-            req = urllib.request.Request(
-                "https://text.pollinations.ai/openai",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": f"TensegrityTerminal/{random.randint(100,999)}",
-                },
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=18) as resp:
-                raw_json = json.loads(resp.read().decode("utf-8", errors="ignore"))
-            choices = raw_json.get("choices") or []
-            if choices:
-                content = str((choices[0].get("message") or {}).get("content") or "").strip()
-                if content and len(content) > 5 and "rate limit" not in content.lower():
-                    return content
-        except Exception:
-            continue
+    free_reply = _call_pollinations_get_or_post(messages, question, sys_prompt)
+    if free_reply:
+        return _sanitize_advisor_output(free_reply)
 
-    try:
-        short_prompt = (
-            f"Odpověz česky, srozumitelně a přímo na otázku bez tabulek, pokud nejsou vyžádány. "
-            f"Otázka: {question}"
-        )
-        get_url = f"https://text.pollinations.ai/{quote(short_prompt[:1200])}?model=openai&seed={random.randint(1, 999999)}"
-        req_get = urllib.request.Request(get_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req_get, timeout=16) as resp_get:
-            txt_out = resp_get.read().decode("utf-8", errors="ignore").strip()
-        if txt_out and len(txt_out) > 5 and not txt_out.startswith("<!DOCTYPE") and "rate limit" not in txt_out.lower():
-            return txt_out
-    except Exception:
-        pass
-
-    q_low = question.lower().strip()
-    if "apple" in q_low or "aapl" in q_low:
-        return (
-            "**Apple (`AAPL`)** je americká technologická společnost známá především chytrými telefony iPhone, "
-            "počítači Mac, tablety iPad, nositelnou elektronikou (Apple Watch, AirPods), operačními systémy "
-            "a rostoucím segmentem služeb (App Store, iCloud, Apple Music, Apple Pay)."
-        )
-    if "dcf" in q_low and ("co je" in q_low or "co znamená" in q_low or "co to je" in q_low):
-        return (
-            "**DCF (Discounted Cash Flow)** znamená diskontování budoucích volných peněžních toků. "
-            "Zjednodušeně jde o výpočet toho, jakou hodnotu mají peníze, které firma nebo projekt vydělá "
-            "v budoucnu, přepočtené na dnešní hodnotu pomocí diskontní sazby (která zohledňuje čas a riziko)."
-        )
-    if "nvda" in q_low or "nvidia" in q_low:
-        return (
-            "**NVIDIA (`NVDA`)** je technologická společnost zaměřená hlavně na návrh grafických čipů (GPU), "
-            "akcelerátorů pro umělou inteligenci, datových center a softwarového ekosystému CUDA."
-        )
-
-    return (
-        "Váš dotaz jsem zaznamenal, ale externí AI poskytovatel právě neodpověděl. "
-        "Zkuste prosím dotaz zopakovat nebo upřesnit, co přesně vás zajímá."
-    )
+    return _sanitize_advisor_output(_offline_smart_czech_knowledge_fallback(question, d))
 
 
 # ==============================================================================
-# 8. API ENDPOINTY, GRAF, EXTERNÍ CRON A EXPORTY
+# 9. API ENDPOINTY, GRAF, EXTERNÍ CRON A EXPORTY
 # ==============================================================================
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -2832,7 +3851,7 @@ def get_institutional_terminal_valuation(
     try:
         return run_valuation_logic(ticker, leverage, growth, exit_mult)
     except ValueError as err:
-        raise HTTPException(status_code=404, detail=str(err))
+        raise HTTPException(status_code=422, detail=str(err))
     except Exception as err:
         raise HTTPException(status_code=500, detail=str(err))
 
@@ -2850,7 +3869,12 @@ async def ask_terminal_advisor(ticker: str, request: Request):
         if not question:
             raise HTTPException(status_code=422, detail="Zadejte prosím svůj dotaz.")
 
-        d = await asyncio.to_thread(run_valuation_logic, ticker, leverage, growth, exit_mult)
+        d = None
+        try:
+            d = await asyncio.to_thread(run_valuation_logic, ticker, leverage, growth, exit_mult)
+        except Exception:
+            d = None
+
         answer = await asyncio.to_thread(generate_pure_ai_advisor_answer, question, history, d)
         return {"answer": answer}
     except HTTPException:
@@ -2925,7 +3949,7 @@ def export_valuation_excel(
 
         ws_sum["B1"] = "TENSEGRITY TERMINAL | INSTITUCIONÁLNÍ VALUAČNÍ MODEL"
         ws_sum["B1"].font = Font(size=14, bold=True)
-        ws_sum["B2"] = f"Společnost: {data['company_name']} ({data['ticker']}) | Sektor: {data['sector']} | Datum: {data['audit_trail']['timestamp']}"
+        ws_sum["B2"] = f"Společnost: {data['company_name']} ({data['ticker']}) | Zdroj: {data['data_quality']['primary_statement_source']}"
         ws_sum.append([])
         ws_sum.append(["Metoda ocenění", "Váha (%)", f"Vnitřní hodnota ({data['currency']})", "Vážený příspěvek", "Rozdíl vs. trh (%)"])
         for cell in ws_sum[4]:
@@ -2934,11 +3958,20 @@ def export_valuation_excel(
             cell.alignment = Alignment(horizontal="center")
 
         for row in data["valuation_synthesis"]["methods"]:
-            ws_sum.append([row["method"], row["weight_percent"], row["fair_value"], row["contribution"], row["vs_market_percent"]])
+            ws_sum.append([
+                row["method"],
+                row["weight_percent"],
+                row["fair_value"] if row["fair_value"] is not None else "N/A",
+                row["contribution"],
+                row["vs_market_percent"] if row["vs_market_percent"] is not None else "N/A",
+            ])
 
         ws_sum.append([])
         ws_sum.append(["Vážená vnitřní hodnota", data["valuation_synthesis"]["weighted_fair_value"]])
         ws_sum.append(["Aktuální tržní cena akcie", data["dcf_valuation"]["current_share_price"]])
+        ws_sum.append(["Owner Earnings (celkem)", data["fundamentals"]["owner_earnings"] if data["fundamentals"]["owner_earnings"] is not None else "N/A"])
+        ws_sum.append(["Look-Through Earnings", data["fundamentals"]["look_through_earnings"] if data["fundamentals"]["look_through_earnings"] is not None else "N/A"])
+        ws_sum.append(["Udržovací CapEx (odhad)", data["fundamentals"]["maintenance_capex"] if data["fundamentals"]["maintenance_capex"] is not None else "N/A"])
         ws_sum.append(["Bezpečnostní rezerva (%)", data["decision_engine"]["margin_of_safety_percent"]])
         ws_sum.append(["Aktivní cenová zóna", data["decision_engine"]["zone"]])
         ws_sum.append(["Doporučená alokace tranše (%)", data["decision_engine"]["tranche_allocation_percent"]])
@@ -2969,7 +4002,7 @@ def export_valuation_excel(
             ("Monte Carlo P90", mc["p90"]),
             ("Monte Carlo P95", mc["p95"]),
         ]:
-            ws_mc.append([label, val])
+            ws_mc.append([label, val if val is not None else "N/A"])
 
         output = io.BytesIO()
         wb.save(output)
@@ -3005,7 +4038,11 @@ def export_valuation_pdf(
         dec = data["decision_engine"]
         dcf = data["dcf_valuation"]
         mc = data["monte_carlo"]
+        fund = data["fundamentals"]
         curr = data["currency"]
+
+        def fmt_or_na(v):
+            return f"{v:,.2f} {curr}" if v is not None else "N/A"
 
         elements = []
         logo_path = resolve_brand_logo_path(prefer_white=False)
@@ -3021,23 +4058,26 @@ def export_valuation_pdf(
             elements.append(Paragraph(f"TENSEGRITY TERMINAL — VALUAČNÍ ZPRÁVA ({data['company_name']})", title_s))
 
         elements.extend([
-            Paragraph(f"Ticker: {data['ticker']} | Sektor: {data['sector']} | Datum: {data['audit_trail']['timestamp']} | Měna: {curr}", sub_s),
-            Paragraph("1. SYNTÉZA VNITŘNÍ HODNOTY A NÁKUPNÍ PÁSMA", sec_s),
+            Paragraph(f"Ticker: {data['ticker']} | Zdroj výkazů: {data['data_quality']['primary_statement_source']} | Měna: {curr}", sub_s),
+            Paragraph("1. SYNTÉZA VNITŘNÍ HODNOTY, OWNER EARNINGS A NÁKUPNÍ PÁSMA", sec_s),
         ])
 
+        mc_str = f"{mc['p50']:,.2f} ({mc['p10']:,.2f} – {mc['p90']:,.2f}) {curr}" if mc["p50"] is not None else "N/A"
         tbl = Table(
             [
                 ["Ukazatel / Oceňovací přístup", "Výstup modelu"],
-                ["Aktuální tržní cena akcie", f"{dcf['current_share_price']:,.2f} {curr}"],
-                ["Vážená vnitřní hodnota", f"{synth['weighted_fair_value']:,.2f} {curr}"],
-                ["Vícefázový výnosový model pro podnik (FCFF)", f"{dcf['intrinsic_value_per_share']:,.2f} {curr}"],
-                ["Výnosový model pro vlastní kapitál (FCFE)", f"{data['fcfe_valuation']['intrinsic_value_per_share']:,.2f} {curr}"],
-                ["Model reziduálního zisku (Residual Income)", f"{data['residual_income']['intrinsic_value_per_share']:,.2f} {curr}"],
-                ["Srovnatelné tržní násobky", f"{data['peer_comps']['blended_implied_price']:,.2f} {curr}"],
-                ["Medián Monte Carlo (P50) / P10–P90", f"{mc['p50']:,.2f} ({mc['p10']:,.2f} – {mc['p90']:,.2f}) {curr}"],
+                ["Aktuální tržní cena akcie", fmt_or_na(dcf["current_share_price"])],
+                ["Vážená vnitřní hodnota", fmt_or_na(synth["weighted_fair_value"])],
+                ["Vícefázový výnosový model pro podnik (FCFF)", fmt_or_na(dcf["intrinsic_value_per_share"])],
+                ["Owner Earnings / FCFE model", fmt_or_na(data["fcfe_valuation"]["intrinsic_value_per_share"])],
+                ["Owner Earnings / akcii (po udržovacím CapEx)", fmt_or_na(fund["owner_earnings_per_share"])],
+                ["Model reziduálního zisku (Residual Income)", fmt_or_na(data["residual_income"]["intrinsic_value_per_share"])],
+                ["Strukturovaný součet částí (SOTP)", fmt_or_na(data["metoda_souctu_casti"]["sotp_per_share"])],
+                ["Srovnatelné tržní násobky", fmt_or_na(data["peer_comps"]["blended_implied_price"])],
+                ["Medián Monte Carlo (P50) / P10–P90", mc_str],
                 ["Bezpečnostní rezerva", f"{dec['margin_of_safety_percent']:.2f} %"],
                 ["Aktivní cenová zóna a alokace", f"{dec['zone']} (Tranše {dec['tranche_allocation_percent']} %)"],
-                ["Index integrity valuace / Piotroski skóre", f"{synth['integrity_score']} / 100 | {data['risk_analysis']['piotroski_f_score']} / 9"],
+                ["Index integrity dat / Piotroski skóre", f"{synth['integrity_score']} / 100 | {data['risk_analysis']['piotroski_f_score']} / 9"],
             ],
             colWidths=[295, 220],
         )
@@ -3068,7 +4108,7 @@ def export_valuation_pdf(
 
 
 # ==============================================================================
-# 9. KOMPLETNÍ WEBOVÉ ROZHRANÍ (TRADINGVIEW GRAF + VOLNÝ AI PORADCE + VALUACE)
+# 10. KOMPLETNÍ WEBOVÉ ROZHRANÍ (ZVĚTŠENÉ KPI BOXY + OKAMŽITÝ OHLC PANEL + AI KLÍČ)
 # ==============================================================================
 
 @app.get("/", response_class=HTMLResponse)
@@ -3079,8 +4119,8 @@ def read_root():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tensegrity Terminal | Institucionální Valuační Platforma</title>
-    <link rel="icon" type="image/png" href="/favicon.ico?v=7">
-    <link rel="shortcut icon" type="image/png" href="/favicon.ico?v=7">
+    <link rel="icon" type="image/png" href="/favicon.ico?v=10">
+    <link rel="shortcut icon" type="image/png" href="/favicon.ico?v=10">
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
@@ -3132,7 +4172,7 @@ def read_root():
             background: rgba(6, 9, 17, 0.85); border: 1px solid var(--border-subtle);
             color: var(--text-primary); font-family: 'Plus Jakarta Sans', sans-serif;
             font-size: 13px; font-weight: 600; padding: 10px 14px; border-radius: 10px;
-            outline: none; width: 220px; letter-spacing: 0.3px;
+            outline: none; width: 230px; letter-spacing: 0.3px;
         }
         .search-wrapper input:focus { border-color: var(--accent-blue); box-shadow: 0 0 12px var(--accent-blue-glow); }
         .btn {
@@ -3161,31 +4201,65 @@ def read_root():
         }
         .audit-pill { margin-left: auto; font: 11px 'JetBrains Mono', monospace; color: var(--text-muted); }
 
+        .data-warning-banner {
+            display: none; margin-bottom: 16px; padding: 12px 16px; border-radius: 10px;
+            background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.38);
+            color: #fbbf24; font-size: 12.5px; line-height: 1.5;
+        }
+
         .company-identity-banner {
-            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;
-            margin-top: 18px; padding: 14px 18px; border-radius: 12px;
-            background: rgba(6, 9, 17, 0.75); border: 1px solid rgba(56, 189, 248, 0.22);
+            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 18px;
+            margin-top: 18px; padding: 18px 22px; border-radius: 14px;
+            background: rgba(6, 9, 17, 0.8); border: 1px solid rgba(56, 189, 248, 0.25);
         }
-        .company-identity-left { display: flex; align-items: center; gap: 14px; }
+        .company-identity-left { display: flex; align-items: center; gap: 16px; }
         .company-logo-frame {
-            width: 44px; height: 44px; border-radius: 10px; background: rgba(255, 255, 255, 0.94);
+            width: 50px; height: 50px; border-radius: 12px; background: rgba(255, 255, 255, 0.95);
             display: flex; align-items: center; justify-content: center; overflow: hidden;
-            border: 1px solid rgba(255,255,255,0.2); flex-shrink: 0;
+            border: 1px solid rgba(255,255,255,0.25); flex-shrink: 0;
         }
-        .company-logo-frame img { width: 32px; height: 32px; object-fit: contain; display: block; }
+        .company-logo-frame img { width: 36px; height: 36px; object-fit: contain; display: block; }
         .company-logo-fallback {
-            width: 44px; height: 44px; border-radius: 10px;
+            width: 50px; height: 50px; border-radius: 12px;
             background: linear-gradient(135deg, rgba(56,189,248,0.25), rgba(2,132,199,0.45));
-            color: #38bdf8; font-weight: 800; font-size: 16px;
+            color: #38bdf8; font-weight: 800; font-size: 18px;
             display: flex; align-items: center; justify-content: center; flex-shrink: 0;
         }
-        .company-title-main { font-size: 16px; font-weight: 800; color: #f8fafc; letter-spacing: 0.2px; }
+        .company-title-main { font-size: 18px; font-weight: 800; color: #f8fafc; letter-spacing: 0.2px; }
         .company-ticker-pill {
-            display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 6px;
-            background: rgba(56, 189, 248, 0.14); color: #38bdf8;
-            font: 700 12px 'JetBrains Mono', monospace;
+            display: inline-block; margin-left: 8px; padding: 3px 9px; border-radius: 6px;
+            background: rgba(56, 189, 248, 0.16); color: #38bdf8;
+            font: 700 12.5px 'JetBrains Mono', monospace;
         }
-        .company-meta-sub { font-size: 12px; color: var(--text-secondary); margin-top: 3px; }
+        .company-meta-sub { font-size: 12.5px; color: var(--text-secondary); margin-top: 4px; }
+
+        .kpi-hero-group {
+            display: flex; align-items: stretch; gap: 16px; flex-wrap: wrap;
+        }
+        .kpi-hero-box {
+            min-width: 225px; padding: 14px 20px; border-radius: 12px;
+            display: flex; flex-direction: column; justify-content: center; gap: 4px;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+        }
+        .kpi-hero-box.market {
+            background: linear-gradient(145deg, rgba(56, 189, 248, 0.14), rgba(15, 23, 42, 0.92));
+            border: 1.5px solid rgba(56, 189, 248, 0.42);
+        }
+        .kpi-hero-box.fair {
+            background: linear-gradient(145deg, rgba(16, 185, 129, 0.16), rgba(15, 23, 42, 0.92));
+            border: 1.5px solid rgba(16, 185, 129, 0.45);
+        }
+        .kpi-hero-label {
+            font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 1px;
+        }
+        .kpi-hero-box.market .kpi-hero-label { color: #7dd3fc; }
+        .kpi-hero-box.fair .kpi-hero-label { color: #6ee7b7; }
+        .kpi-hero-value {
+            font: 800 22px 'JetBrains Mono', monospace; color: #ffffff; letter-spacing: -0.3px;
+        }
+        .kpi-hero-sub {
+            font: 600 11.5px 'JetBrains Mono', monospace; color: var(--text-secondary);
+        }
 
         .tv-toolbar {
             display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
@@ -3211,7 +4285,7 @@ def read_root():
 
         .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(460px, 1fr)); gap: 22px; margin-bottom: 22px; }
         .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 22px; margin-bottom: 22px; }
-        .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 14px; }
+        .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 16px; }
         .card {
             background: var(--bg-card); border: 1px solid var(--border-subtle);
             border-radius: 16px; padding: 22px 26px; box-shadow: 0 10px 25px rgba(0,0,0,0.3);
@@ -3220,10 +4294,12 @@ def read_root():
         .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid var(--border-subtle); flex-wrap: wrap; gap: 8px; }
         .card-title { font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: 1.4px; color: var(--text-secondary); }
         .badge { font-size: 11px; font-family: 'JetBrains Mono', monospace; padding: 3px 8px; border-radius: 6px; background: rgba(56, 189, 248, 0.1); color: var(--accent-blue); border: 1px solid rgba(56, 189, 248, 0.25); }
-        .metric-row { display: flex; justify-content: space-between; align-items: center; margin: 10px 0; font-size: 13.5px; }
+        .badge-verified { background: rgba(16, 185, 129, 0.14); color: #34d399; border-color: rgba(16, 185, 129, 0.35); }
+        .badge-warn { background: rgba(245, 158, 11, 0.14); color: #fbbf24; border-color: rgba(245, 158, 11, 0.35); }
+        .metric-row { display: flex; justify-content: space-between; align-items: center; margin: 10px 0; font-size: 13.5px; gap: 10px; }
         .metric-label { color: var(--text-secondary); }
-        .metric-value { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--text-primary); font-size: 14px; }
-        .metric-value.highlight { color: var(--accent-blue); font-size: 15px; }
+        .metric-value { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: var(--text-primary); font-size: 13.5px; text-align: right; }
+        .metric-value.highlight { color: var(--accent-blue); font-size: 14.5px; }
 
         .chart-container { position: relative; height: 280px; width: 100%; margin-top: 8px; }
 
@@ -3248,6 +4324,16 @@ def read_root():
         .zone-box.red .zone-title { color: #f87171; }
         .zone-val { font-family: 'JetBrains Mono', monospace; font-size: 15px; font-weight: 700; color: #fff; margin-bottom: 4px; }
 
+        .factor-pill-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 10px; }
+        .factor-item {
+            background: rgba(6, 9, 17, 0.65); border: 1px solid var(--border-subtle);
+            border-radius: 10px; padding: 12px 14px;
+        }
+        .factor-item-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; font-size: 12px; font-weight: 700; }
+        .factor-status-ok { color: #34d399; font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+        .factor-status-warn { color: #fbbf24; font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+        .factor-item-desc { font-size: 11.5px; color: var(--text-secondary); line-height: 1.45; }
+
         .table-responsive { width: 100%; overflow-x: auto; }
         table { width: 100%; border-collapse: collapse; margin-top: 8px; }
         th, td { padding: 10px 14px; text-align: center; font-size: 12.5px; border-bottom: 1px solid var(--border-subtle); }
@@ -3258,1097 +4344,1000 @@ def read_root():
         .plain-guide { margin-top: 10px; font-size: 12px; color: var(--text-secondary); line-height: 1.55; }
         .advisor-thread {
             display: flex; flex-direction: column; gap: 14px; margin: 16px 0;
-            max-height: 480px; overflow-y: auto; padding: 8px 10px 8px 2px;
-            scrollbar-width: thin; scrollbar-color: rgba(56, 189, 248, 0.35) rgba(6, 9, 17, 0.4);
+            max-height: 460px; overflow-y: auto; padding: 14px;
+            border: 1px solid var(--border-subtle); border-radius: 12px; background: rgba(6, 9, 17, 0.72);
         }
-        .advisor-thread::-webkit-scrollbar { width: 6px; }
-        .advisor-thread::-webkit-scrollbar-track { background: rgba(6, 9, 17, 0.4); border-radius: 6px; }
-        .advisor-thread::-webkit-scrollbar-thumb { background: rgba(56, 189, 248, 0.35); border-radius: 6px; }
-        .advisor-msg-row { display: flex; gap: 12px; align-items: flex-start; max-width: 92%; }
-        .advisor-msg-row.user-row { align-self: flex-end; flex-direction: row-reverse; }
-        .advisor-avatar {
-            width: 32px; height: 32px; border-radius: 10px; flex-shrink: 0;
-            display: flex; align-items: center; justify-content: center;
-            font: 800 11px 'JetBrains Mono', monospace;
-            background: linear-gradient(135deg, rgba(56, 189, 248, 0.25), rgba(2, 132, 199, 0.45));
-            color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35);
+        .advisor-message { max-width: 88%; padding: 12px 16px; border-radius: 12px; font-size: 13.5px; line-height: 1.65; }
+        .advisor-message.user { align-self: flex-end; background: rgba(56, 189, 248, 0.14); border: 1px solid rgba(56, 189, 248, 0.35); color: #e0f2fe; }
+        .advisor-message.assistant { align-self: flex-start; background: rgba(15, 22, 37, 0.96); border: 1px solid var(--border-subtle); color: #f8fafc; }
+        .advisor-form { display: flex; gap: 10px; flex-wrap: wrap; }
+        .advisor-input {
+            flex: 1; min-width: 240px; padding: 12px 16px; border: 1px solid var(--border-subtle);
+            border-radius: 10px; background: rgba(6, 9, 17, 0.85); color: var(--text-primary);
+            font: 13px 'Plus Jakarta Sans', sans-serif;
         }
-        .advisor-msg-row.user-row .advisor-avatar {
-            background: rgba(16, 185, 129, 0.2); color: #34d399; border-color: rgba(16, 185, 129, 0.35);
-        }
-        .advisor-bubble {
-            padding: 14px 18px; border-radius: 14px; font-size: 13.5px; line-height: 1.65;
-            background: rgba(10, 16, 28, 0.92); border: 1px solid rgba(56, 189, 248, 0.18);
-            color: var(--text-primary); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-        }
-        .advisor-msg-row.user-row .advisor-bubble {
-            background: rgba(16, 185, 129, 0.12); border-color: rgba(16, 185, 129, 0.3);
-        }
-        .advisor-bubble h3, .advisor-bubble h4 {
-            color: #38bdf8; font-size: 14px; font-weight: 800; margin: 10px 0 6px 0; letter-spacing: 0.2px;
-        }
-        .advisor-bubble h3:first-child, .advisor-bubble h4:first-child { margin-top: 0; }
-        .advisor-bubble p { margin: 0 0 8px 0; }
-        .advisor-bubble p:last-child { margin-bottom: 0; }
-        .advisor-bubble ul { margin: 6px 0 10px 18px; }
-        .advisor-bubble li { margin-bottom: 4px; }
-        .advisor-bubble strong { color: #fff; font-weight: 700; }
-        .advisor-bubble table {
-            width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12px;
-            background: rgba(6, 9, 17, 0.7); border-radius: 8px; overflow: hidden;
-        }
-        .advisor-bubble th {
-            background: rgba(56, 189, 248, 0.14); color: #38bdf8; padding: 7px 10px; text-align: left; font-size: 11px;
-        }
-        .advisor-bubble td {
-            padding: 7px 10px; border-bottom: 1px solid var(--border-subtle); font-family: 'Plus Jakarta Sans', sans-serif; text-align: left;
-        }
-        .advisor-form { display: flex; gap: 10px; margin-top: 12px; }
-        .advisor-form input { flex: 1; padding: 12px 16px; border: 1px solid var(--border-subtle); border-radius: 10px; background: rgba(6, 9, 17, 0.85); color: var(--text-primary); font-size: 13.5px; outline: none; }
-        .advisor-form input:focus { border-color: var(--accent-blue); }
+        .advisor-input:focus { outline: none; border-color: var(--accent-blue); }
 
         .modal-backdrop {
-            display: none; position: fixed; inset: 0; background: rgba(4, 7, 15, 0.84);
-            backdrop-filter: blur(6px); z-index: 999; align-items: center; justify-content: center; padding: 20px;
+            display: none; position: fixed; inset: 0; background: rgba(2, 6, 17, 0.82);
+            backdrop-filter: blur(8px); z-index: 1000; align-items: center; justify-content: center; padding: 20px;
         }
         .modal-backdrop.open { display: flex; }
-        .modal-box {
-            background: #0f1625; border: 1px solid var(--border-subtle); border-radius: 16px;
-            max-width: 720px; width: 100%; padding: 28px; box-shadow: 0 20px 50px rgba(0,0,0,0.75);
-            max-height: 86vh; overflow-y: auto;
+        .modal-card {
+            background: #0d1322; border: 1px solid rgba(56, 189, 248, 0.3); border-radius: 18px;
+            max-width: 560px; width: 100%; padding: 26px 28px; box-shadow: 0 25px 60px rgba(0,0,0,0.8);
         }
-        .news-item { padding: 13px 0; border-bottom: 1px solid var(--border-subtle); }
-        .news-item:last-child { border-bottom: none; }
-        .news-item a { color: var(--accent-blue); text-decoration: none; font-weight: 600; font-size: 13.5px; line-height: 1.4; display: block; }
-        .news-item a:hover { text-decoration: underline; }
-        .news-meta { font-size: 11px; color: var(--text-muted); margin-top: 4px; font-family: 'JetBrains Mono', monospace; }
-        .loader { width: 22px; height: 22px; border: 3px solid rgba(255,255,255,0.2); border-radius: 50%; border-top-color: var(--accent-blue); animation: spin 0.8s linear infinite; margin: auto; }
+        .modal-title { font-size: 17px; font-weight: 800; color: #fff; margin-bottom: 8px; }
+        .modal-sub { font-size: 13px; color: var(--text-secondary); line-height: 1.6; margin-bottom: 18px; }
+        .modal-input {
+            width: 100%; background: rgba(6, 9, 17, 0.9); border: 1px solid var(--border-subtle);
+            color: #fff; padding: 12px 14px; border-radius: 10px; font-size: 14px; margin-bottom: 14px; outline: none;
+        }
+        .modal-input:focus { border-color: var(--accent-blue); }
+        .modal-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+        .modal-status { margin-top: 12px; font-size: 12px; font-family: 'JetBrains Mono', monospace; color: #34d399; }
+
+        .loading-overlay {
+            display: none; position: fixed; inset: 0; background: rgba(6, 9, 17, 0.86);
+            backdrop-filter: blur(10px); z-index: 999; flex-direction: column; align-items: center; justify-content: center;
+        }
+        .spinner { width: 44px; height: 44px; border: 3px solid rgba(56, 189, 248, 0.15); border-top-color: var(--accent-blue); border-radius: 50%; animation: spin 0.9s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <div class="brand-wrap">
-                <div class="brand-logo-box">
-                    <img src="/brand-logo.png?v=7" alt="Tensegrity Terminal Logo" onerror="this.parentElement.style.display='none'">
-                </div>
-                <div>
-                    <div class="brand-title">Tensegrity<span>Terminal</span></div>
-                    <div class="brand-subtitle">Intelligence &bull; Adaptivní Institucionální Valuace</div>
-                </div>
-            </div>
-            <div class="controls">
-                <div class="search-wrapper">
-                    <input type="text" id="tickerInput" value="NVDA" placeholder="Název firmy nebo ticker..." aria-label="Název společnosti nebo ticker" onkeydown="if(event.key==='Enter') handleSearchTrigger()">
-                </div>
-                <div class="forex-strip" id="forexRates">
-                    <span>EUR/CZK <strong>--</strong></span>
-                    <span>USD/CZK <strong>--</strong></span>
-                    <span>GBP/CZK <strong>--</strong></span>
-                </div>
-                <button class="btn btn-primary" onclick="handleSearchTrigger()">Analyzovat</button>
-                <button class="btn btn-excel" onclick="downloadExcel()">Excel Model</button>
-                <button class="btn btn-pdf" onclick="downloadPDF()">PDF Zpráva</button>
-                <button class="btn btn-news" onclick="openNewsletterModal()">Newsletter &amp; Zprávy</button>
-            </div>
-        </header>
+<div class="loading-overlay" id="loader">
+    <div class="spinner"></div>
+    <p style="margin-top: 14px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--accent-blue); letter-spacing: 1px;">OVĚŘUJI REGULATORNÍ VÝKAZY &amp; SPOUŠTÍM ENGINE...</p>
+</div>
 
-        <section class="scenario-bar" aria-label="Parametry scénáře">
-            <span class="scenario-heading">Parametry Scénáře</span>
-            <label class="scenario-field" for="leverageInput">
-                Cizí kapitál (% Dluhu)
-                <span class="scenario-input"><input id="leverageInput" type="number" min="0" max="100" step="0.5" value="15"><span>%</span></span>
-            </label>
-            <label class="scenario-field" for="growthInput">
-                Růst peněžních toků
-                <span class="scenario-input"><input id="growthInput" type="number" min="-50" max="150" step="0.5" value="14"><span>%</span></span>
-            </label>
-            <label class="scenario-field" for="exitMultipleInput">
-                Výstupní násobek
-                <span class="scenario-input"><input id="exitMultipleInput" type="number" min="1" max="150" step="0.5" value="21.0"><span>x</span></span>
-            </label>
-            <button class="btn btn-primary" style="padding: 6px 14px;" onclick="loadValuation(false)">Přepočítat model</button>
-            <span class="audit-pill" id="auditTimestamp">Načítám auditní stopu...</span>
-        </section>
+<div class="modal-backdrop" id="newsletterModal">
+    <div class="modal-card">
+        <div class="modal-title">Zpravodaj Tensegrity Terminal</div>
+        <div class="modal-sub">
+            Automatické rozesílání českého makroekonomického a zpravodajského přehledu včetně PDF přílohy probíhá každou
+            <strong>středu a pátek v 7:00</strong> a v <strong>neděli v 19:00</strong>.
+        </div>
+        <input type="email" id="newsletterEmailInput" class="modal-input" placeholder="vas.email@domena.cz">
+        <div class="modal-actions">
+            <button type="button" class="btn btn-primary" onclick="subscribeNewsletter()">Přidat do pravidelného odběru</button>
+            <button type="button" class="btn btn-secondary" onclick="sendNewsletterNow()">Odeslat aktuální vydání ihned (s PDF)</button>
+            <button type="button" class="btn btn-news" onclick="closeNewsletterModal()">Zavřít</button>
+        </div>
+        <div id="newsletterStatus" class="modal-status"></div>
+    </div>
+</div>
 
-        <section class="card matrix-card">
-            <div class="card-header">
-                <span class="card-title">Rozhodovací Rámec — 4 Nákupní Zóny &amp; Alokace Tranší</span>
+<div class="modal-backdrop" id="aiKeyModal">
+    <div class="modal-card">
+        <div class="modal-title">Aktivace vlastního Gemini API klíče</div>
+        <div class="modal-sub">
+            Vložte bezplatný klíč z <strong>Google AI Studio</strong> (začíná znaky <code>AIza...</code>).
+            Klíč se uloží lokálně do souboru <code>.env</code> a AI poradce pak bude odpovídat okamžitě na jakoukoliv otázku bez omezení.
+        </div>
+        <input type="password" id="geminiKeyInput" class="modal-input" placeholder="AIzaSy...">
+        <div class="modal-actions">
+            <button type="button" class="btn btn-primary" onclick="saveGeminiKey()">Uložit a aktivovat AI klíč</button>
+            <button type="button" class="btn btn-news" onclick="closeAiKeyModal()">Zavřít</button>
+        </div>
+        <div id="aiKeyStatus" class="modal-status"></div>
+    </div>
+</div>
+
+<div class="container">
+    <header>
+        <div class="brand-wrap">
+            <div class="brand-logo-box">
+                <img src="/brand-logo.png?v=10" alt="Tensegrity Terminal Logo" onerror="this.style.display='none'">
+            </div>
+            <div>
+                <div class="brand-title">TENSEGRITY<span>TERMINAL</span></div>
+                <div class="brand-subtitle">INSTITUCIONÁLNÍ VALUACE &bull; SEC EDGAR &amp; DATA QUALITY GATE</div>
+            </div>
+        </div>
+        <div class="controls">
+            <div class="search-wrapper">
+                <input type="text" id="tickerInput" value="NVDA" placeholder="Ticker nebo název (např. ČEZ, SpaceX)" onkeydown="if(event.key==='Enter') runValuation(true)">
+            </div>
+            <div class="forex-strip" id="forexRatesBanner">
+                <span>EUR/CZK <strong>24,45</strong></span>
+                <span>USD/CZK <strong>22,30</strong></span>
+                <span>GBP/CZK <strong>29,18</strong></span>
+            </div>
+            <button type="button" class="btn btn-primary" onclick="runValuation(true)">Analyzovat</button>
+            <button type="button" class="btn btn-excel" onclick="downloadExcel()">Excel Model</button>
+            <button type="button" class="btn btn-pdf" onclick="downloadPdf()">PDF Zpráva</button>
+            <button type="button" class="btn btn-news" onclick="openNewsletterModal()">Newsletter</button>
+        </div>
+    </header>
+
+    <div class="scenario-bar">
+        <span class="scenario-heading">Parametry scénáře</span>
+        <label class="scenario-field scenario-input">
+            Cizí kapitál (% Dluhu)
+            <input type="number" id="leverageInput" value="15" min="0" max="100" step="1"> %
+        </label>
+        <label class="scenario-field scenario-input">
+            Růst peněžních toků
+            <input type="number" id="growthInput" value="10" min="-90" max="200" step="0.5"> %
+        </label>
+        <label class="scenario-field scenario-input">
+            Výstupní násobek
+            <input type="number" id="exitMultInput" value="14" min="1" max="120" step="0.5"> x
+        </label>
+        <button type="button" class="btn btn-primary" onclick="runValuation(false)">Přepočítat model</button>
+        <span class="audit-pill" id="auditStamp">Načítám auditní stopu...</span>
+    </div>
+
+    <div class="data-warning-banner" id="dataWarningBanner"></div>
+
+    <!-- 1. ROZHODOVACÍ RÁMEC & 4 CENOVÉ ZÓNY -->
+    <div class="card matrix-card">
+        <div class="card-header">
+            <span class="card-title">Rozhodovací rámec — 4 nákupní zóny &amp; alokace tranší</span>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                <span class="badge badge-verified" id="dataSourceBadge">Zdroj výkazů: --</span>
                 <span class="badge" id="integrityBadge">Index integrity: --</span>
             </div>
-            <div class="thesis-layout">
-                <div class="traffic-lights" aria-label="Semafor zón">
-                    <span class="traffic-light green" id="lightGreen"></span>
-                    <span class="traffic-light yellow" id="lightYellow"></span>
-                    <span class="traffic-light orange" id="lightOrange"></span>
-                    <span class="traffic-light red" id="lightRed"></span>
-                </div>
+        </div>
+        <div class="thesis-layout">
+            <div class="traffic-lights">
+                <span class="traffic-light green" id="light-GREEN"></span>
+                <span class="traffic-light yellow" id="light-YELLOW"></span>
+                <span class="traffic-light orange" id="light-ORANGE"></span>
+                <span class="traffic-light red" id="light-RED"></span>
+            </div>
+            <div>
+                <div style="font-size: 16px; font-weight: 800; color: #fff; margin-bottom: 4px;" id="thesisTitle">Načítám institucionální syntézu...</div>
+                <div style="font-size: 13px; color: var(--text-secondary);" id="thesisSub"></div>
+            </div>
+        </div>
+
+        <div class="company-identity-banner">
+            <div class="company-identity-left">
+                <div id="companyLogoContainer" class="company-logo-fallback">TT</div>
                 <div>
-                    <p class="metric-value" id="thesisRecommendation">Načítám institucionální syntézu...</p>
-                    <p class="plain-guide" id="thesisSummary">Porovnání vážené vnitřní hodnoty se současnou tržní cenou a výpočet bezpečnostní rezervy.</p>
-                </div>
-            </div>
-
-            <div class="company-identity-banner">
-                <div class="company-identity-left">
-                    <div id="companyLogoContainer" class="company-logo-fallback">NV</div>
                     <div>
-                        <div>
-                            <span class="company-title-main" id="companyFullName">NVIDIA Corporation</span>
-                            <span class="company-ticker-pill" id="companyTickerBadge">NVDA</span>
-                        </div>
-                        <div class="company-meta-sub" id="companySectorMeta">Sektor: Technology &bull; Odvětví: Semiconductors &bull; Burza: NMS</div>
+                        <span class="company-title-main" id="companyFullName">NVIDIA Corporation</span>
+                        <span class="company-ticker-pill" id="companyTickerBadge">NVDA</span>
                     </div>
-                </div>
-                <div class="badge" id="companyPricePill">Tržní cena: --</div>
-            </div>
-
-            <div class="grid-4">
-                <div class="zone-box green">
-                    <div class="zone-title">Zóna GREEN (Tranše 55 %)</div>
-                    <div class="zone-val" id="zoneGreenRange">-</div>
-                    <p class="plain-guide" style="margin:0;">Bezpečnostní rezerva nad 20 % pod váženou vnitřní hodnotou.</p>
-                </div>
-                <div class="zone-box yellow">
-                    <div class="zone-title">Zóna YELLOW (Tranše 30 %)</div>
-                    <div class="zone-val" id="zoneYellowRange">-</div>
-                    <p class="plain-guide" style="margin:0;">Atraktivní diskont 10 % až 20 % pod vnitřní hodnotou.</p>
-                </div>
-                <div class="zone-box orange">
-                    <div class="zone-title">Zóna ORANGE (Tranše 15 %)</div>
-                    <div class="zone-val" id="zoneOrangeRange">-</div>
-                    <p class="plain-guide" style="margin:0;">Úvodní akumulační pásmo do 10 % pod vnitřní hodnotou.</p>
-                </div>
-                <div class="zone-box red">
-                    <div class="zone-title">Zóna RED (Tranše 0 %)</div>
-                    <div class="zone-val" id="zoneRedRange">-</div>
-                    <p class="plain-guide" style="margin:0;">Cena nad odhadovanou vnitřní hodnotou; vyčkat.</p>
+                    <div class="company-meta-sub" id="companySectorMeta">Sektor: Technology &bull; Odvětví: Semiconductors &bull; Burza: NMS</div>
                 </div>
             </div>
-        </section>
-
-        <section class="card matrix-card">
-            <div class="card-header">
-                <span class="card-title">Interaktivní Cenový Graf &amp; Historický Vývoj (TradingView / Trading 212)</span>
-                <div style="display:flex; gap:8px; align-items:center;">
-                    <span class="badge" id="tvPeriodChangeBadge">Změna období: --</span>
-                    <button class="tv-tf-btn active" id="btnChartArea" onclick="setTvChartStyle('area')">Plošný (T212)</button>
-                    <button class="tv-tf-btn" id="btnChartCandle" onclick="setTvChartStyle('candle')">Svíčky (TV)</button>
+            <div class="kpi-hero-group">
+                <div class="kpi-hero-box market">
+                    <div class="kpi-hero-label">Aktuální tržní cena</div>
+                    <div class="kpi-hero-value" id="companyPriceBig">--</div>
+                    <div class="kpi-hero-sub" id="companyMcapSub">Tržní kap.: --</div>
                 </div>
-            </div>
-            <div class="tv-toolbar">
-                <div class="tv-tf-group" id="tvTimeframeGroup">
-                    <button class="tv-tf-btn" onclick="changeTvTimeframe('1D', this)">1D</button>
-                    <button class="tv-tf-btn" onclick="changeTvTimeframe('1T', this)">1T</button>
-                    <button class="tv-tf-btn" onclick="changeTvTimeframe('1M', this)">1M</button>
-                    <button class="tv-tf-btn" onclick="changeTvTimeframe('6M', this)">6M</button>
-                    <button class="tv-tf-btn" onclick="changeTvTimeframe('YTD', this)">YTD</button>
-                    <button class="tv-tf-btn active" onclick="changeTvTimeframe('1R', this)">1R</button>
-                    <button class="tv-tf-btn" onclick="changeTvTimeframe('5R', this)">5R</button>
-                    <button class="tv-tf-btn" onclick="changeTvTimeframe('MAX', this)">MAX</button>
-                </div>
-                <div class="tv-readout" id="tvCrosshairReadout">
-                    <span>Najeďte myší na graf pro detailní cenu, čas a objem obchodů (kolečkem myši přiblížíte osu).</span>
-                </div>
-            </div>
-            <div id="tvChartContainer"></div>
-        </section>
-
-        <section class="card matrix-card">
-            <div class="card-header">
-                <span class="card-title">Syntéza Ocenění — Adaptivní Spojení Oceňovacích Metod</span>
-                <span class="badge" id="weightedFairBadge">Vážená vnitřní hodnota: --</span>
-            </div>
-            <div class="table-responsive" id="synthesisTableContainer">
-                <div style="text-align: center; padding: 20px;"><div class="loader"></div></div>
-            </div>
-            <p class="plain-guide" id="disagreementNote"></p>
-        </section>
-
-        <div class="grid-3">
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Živý Graf: Srovnání Metod Ocenění</span>
-                    <span class="badge">Cena na akcii</span>
-                </div>
-                <div class="chart-container">
-                    <canvas id="methodsChartCanvas"></canvas>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Živý Graf: Rozdělení Monte Carlo</span>
-                    <span class="badge">2 500 simulací</span>
-                </div>
-                <div class="chart-container">
-                    <canvas id="monteCarloChartCanvas"></canvas>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Živý Graf: Projekce Toků &amp; Dluhu</span>
-                    <span class="badge">Horizont 5 let</span>
-                </div>
-                <div class="chart-container">
-                    <canvas id="cashFlowChartCanvas"></canvas>
+                <div class="kpi-hero-box fair">
+                    <div class="kpi-hero-label">Vážená vnitřní hodnota</div>
+                    <div class="kpi-hero-value" id="companyFairBig">--</div>
+                    <div class="kpi-hero-sub" id="companyUpsideSub">Potenciál: --</div>
                 </div>
             </div>
         </div>
 
-        <div class="grid-3">
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Fundamenty &amp; Normalizace</span>
-                    <span class="badge" id="fundTicker">NVDA</span>
-                </div>
-                <div class="metric-row"><span class="metric-label">Tržní kapitalizace:</span><span class="metric-value" id="valCap">-</span></div>
-                <div class="metric-row"><span class="metric-label">Hodnota podniku (EV):</span><span class="metric-value highlight" id="valEV">-</span></div>
-                <div class="metric-row"><span class="metric-label">Normalizovaný volný tok:</span><span class="metric-value" id="normFcf">-</span></div>
-                <div class="metric-row"><span class="metric-label">Návratnost vs. náklady kapitálu:</span><span class="metric-value highlight" id="roicVsWacc">-</span></div>
-                <div class="metric-row"><span class="metric-label">Ekonomický zisk:</span><span class="metric-value" id="econProfit">-</span></div>
-                <div class="metric-row"><span class="metric-label">Piotroski / Altman Z-skóre:</span><span class="metric-value" id="riskScores">-</span></div>
+        <div class="grid-4">
+            <div class="zone-box green">
+                <div class="zone-title">ZÓNA GREEN (Tranše 55 %)</div>
+                <div class="zone-val" id="zoneGreenBand">--</div>
+                <div class="plain-guide">Bezpečnostní rezerva nad 20 % pod váženou vnitřní hodnotou.</div>
             </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Výnosové Modely &amp; Tržní Očekávání</span>
-                    <span class="badge">Diskontované toky</span>
-                </div>
-                <div class="metric-row"><span class="metric-label">Vícefázový DCF (podnik) / akcii:</span><span class="metric-value highlight" id="dcfIntrinsicValue">-</span></div>
-                <div class="metric-row"><span class="metric-label">DCF (vlastní kapitál) / Reziduální zisk:</span><span class="metric-value" id="fcfeAndRi">-</span></div>
-                <div class="metric-row"><span class="metric-label">Náklady kapitálu (Beta):</span><span class="metric-value" id="dcfWacc">-</span></div>
-                <div class="metric-row"><span class="metric-label">Podíl terminální hodnoty:</span><span class="metric-value" id="tvShare">-</span></div>
-                <div class="metric-row"><span class="metric-label">Obrácený DCF implikovaný růst:</span><span class="metric-value highlight" id="reverseDcfGrowth">-</span></div>
-                <div class="metric-row"><span class="metric-label">Součet částí / Čistá aktiva:</span><span class="metric-value" id="sotpNav">-</span></div>
+            <div class="zone-box yellow">
+                <div class="zone-title">ZÓNA YELLOW (Tranše 30 %)</div>
+                <div class="zone-val" id="zoneYellowBand">--</div>
+                <div class="plain-guide">Atraktivní diskont 10 % až 20 % pod váženou vnitřní hodnotou.</div>
             </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Scénáře &amp; Pravděpodobnost</span>
-                    <span class="badge">Distribuce hodnot</span>
-                </div>
-                <div class="metric-row"><span class="metric-label">Pesimistický / Základní / Optimistický:</span><span class="metric-value" id="bearBaseBull">-</span></div>
-                <div class="metric-row"><span class="metric-label">Očekávaná hodnota scénářů:</span><span class="metric-value highlight" id="scenExpected">-</span></div>
-                <div class="metric-row"><span class="metric-label">Monte Carlo Medián (P50):</span><span class="metric-value highlight" id="mcP50">-</span></div>
-                <div class="metric-row"><span class="metric-label">Interval P10 – P90:</span><span class="metric-value" id="mcP10P90">-</span></div>
-                <div class="metric-row"><span class="metric-label">Extrémní rozpětí P5 – P95:</span><span class="metric-value" id="mcP5P95">-</span></div>
-                <div class="metric-row"><span class="metric-label">Pravděpodobnost hodnoty nad trhem:</span><span class="metric-value highlight" id="mcProbUpside">-</span></div>
+            <div class="zone-box orange">
+                <div class="zone-title">ZÓNA ORANGE (Tranše 15 %)</div>
+                <div class="zone-val" id="zoneOrangeBand">--</div>
+                <div class="plain-guide">Úvodní akumulační pásmo do 10 % pod vnitřní hodnotou.</div>
+            </div>
+            <div class="zone-box red">
+                <div class="zone-title">ZÓNA RED (Tranše 0 %)</div>
+                <div class="zone-val" id="zoneRedBand">--</div>
+                <div class="plain-guide">Cena nad odhadovanou vnitřní hodnotou; vyčkat.</div>
             </div>
         </div>
+        <p class="plain-guide" id="disagreementNote" style="margin-top: 14px;"></p>
+    </div>
 
-        <div class="grid-2">
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Relativní Ocenění (Srovnatelné Násobky)</span>
-                    <span class="badge" id="peerSector">Sektor</span>
-                </div>
-                <div class="table-responsive" id="peerCompsContainer">
-                    <div style="text-align: center; padding: 20px;"><div class="loader"></div></div>
-                </div>
+    <!-- 2. INTERAKTIVNÍ BURZOVNÍ GRAF -->
+    <div class="card matrix-card">
+        <div class="card-header">
+            <span class="card-title">Interaktivní cenový graf &amp; historický vývoj</span>
+            <span class="badge" id="chartChangeBadge">Vývoj období: --</span>
+        </div>
+        <div class="tv-toolbar">
+            <div class="tv-tf-group" id="tvTimeframeGroup">
+                <button type="button" class="tv-tf-btn" data-tf="1D" onclick="switchChartTimeframe('1D')">1D</button>
+                <button type="button" class="tv-tf-btn" data-tf="1T" onclick="switchChartTimeframe('1T')">1T</button>
+                <button type="button" class="tv-tf-btn" data-tf="1M" onclick="switchChartTimeframe('1M')">1M</button>
+                <button type="button" class="tv-tf-btn" data-tf="6M" onclick="switchChartTimeframe('6M')">6M</button>
+                <button type="button" class="tv-tf-btn" data-tf="YTD" onclick="switchChartTimeframe('YTD')">YTD</button>
+                <button type="button" class="tv-tf-btn active" data-tf="1R" onclick="switchChartTimeframe('1R')">1R</button>
+                <button type="button" class="tv-tf-btn" data-tf="5R" onclick="switchChartTimeframe('5R')">5R</button>
+                <button type="button" class="tv-tf-btn" data-tf="MAX" onclick="switchChartTimeframe('MAX')">MAX</button>
             </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Pákový Odkup &amp; Splácení Dluhu</span>
-                    <span class="badge" id="lboSummaryBadge">Násobek / Výnos</span>
-                </div>
-                <div class="table-responsive" id="lboScheduleContainer">
-                    <div style="text-align: center; padding: 20px;"><div class="loader"></div></div>
-                </div>
+            <div class="tv-readout" id="tvCrosshairReadout">
+                <span>Načítám OHLC přehled posledního obchodního dne...</span>
             </div>
         </div>
+        <div id="tvChartContainer"></div>
+    </div>
 
-        <div class="grid-2">
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Citlivostní Matice (Náklady kapitálu vs. Terminální růst)</span>
-                    <span class="badge">Vnitřní hodnota / akcii</span>
-                </div>
-                <div class="table-responsive" id="dcfSensitivityContainer"></div>
-            </div>
+    <!-- 3. SYNTÉZA OCEŇOVACÍCH METOD -->
+    <div class="card matrix-card">
+        <div class="card-header">
+            <span class="card-title">Syntéza ocenění — adaptivní spojení oceňovacích metod</span>
+            <span class="badge" id="weightedFairBadge">Vážená vnitřní hodnota: --</span>
+        </div>
+        <div class="table-responsive">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Oceňovací metoda</th>
+                        <th>Váha</th>
+                        <th>Vnitřní hodnota / akcii</th>
+                        <th>Vážený příspěvek</th>
+                        <th>Rozdíl vs. tržní cena</th>
+                    </tr>
+                </thead>
+                <tbody id="synthesisTableBody"></tbody>
+            </table>
+        </div>
+    </div>
 
-            <div class="card">
-                <div class="card-header">
-                    <span class="card-title">Citlivostní Matice Pákového Odkupu (Růst vs. Násobek)</span>
-                    <span class="badge">Roční výnosnost (%)</span>
-                </div>
-                <div class="table-responsive" id="sensitivityMatrix"></div>
-            </div>
+    <!-- 4. INTERAKTIVNÍ GRAFY -->
+    <div class="grid-3">
+        <div class="card">
+            <div class="card-header"><span class="card-title">Srovnání metod ocenění</span></div>
+            <div class="chart-container"><canvas id="methodsChart"></canvas></div>
+        </div>
+        <div class="card">
+            <div class="card-header"><span class="card-title">Rozdělení Monte Carlo (2 500 běhů)</span></div>
+            <div class="chart-container"><canvas id="mcChart"></canvas></div>
+        </div>
+        <div class="card">
+            <div class="card-header"><span class="card-title">Projekce toků &amp; dluhu (5 let)</span></div>
+            <div class="chart-container"><canvas id="cashflowChart"></canvas></div>
+        </div>
+    </div>
+
+    <!-- 5. FUNDAMENTÁLNÍ UKAZATELE, OWNER EARNINGS, VÝNOSOVÉ MODELY A SCÉNÁŘE -->
+    <div class="grid-3">
+        <div class="card">
+            <div class="card-header"><span class="card-title">Fundamenty, Owner Earnings &amp; kvalita</span></div>
+            <div class="metric-row"><span class="metric-label">Tržní kapitalizace</span><span class="metric-value" id="mcap">--</span></div>
+            <div class="metric-row"><span class="metric-label">Hodnota podniku (EV)</span><span class="metric-value" id="ev">--</span></div>
+            <div class="metric-row"><span class="metric-label">Owner Earnings (po udržov. CapEx)</span><span class="metric-value highlight" id="ownerEarnings">--</span></div>
+            <div class="metric-row"><span class="metric-label">Udržovací / Růstový CapEx</span><span class="metric-value" id="capexSplit">--</span></div>
+            <div class="metric-row"><span class="metric-label">Look-Through Earnings</span><span class="metric-value" id="lookThrough">--</span></div>
+            <div class="metric-row"><span class="metric-label">Normalizovaný volný tok (FCF)</span><span class="metric-value" id="normFcf">--</span></div>
+            <div class="metric-row"><span class="metric-label">ROIC vs. WACC</span><span class="metric-value" id="roicWacc">--</span></div>
+            <div class="metric-row"><span class="metric-label">Piotroski / Altman</span><span class="metric-value" id="riskScores">--</span></div>
         </div>
 
         <div class="card">
-            <div class="card-header">
-                <span class="card-title">Tensegrity AI Analytický Poradce</span>
-                <span class="badge">Neomezená umělá inteligence</span>
-            </div>
-            <div class="advisor-thread" id="advisorThread">
-                <div class="advisor-msg-row">
-                    <div class="advisor-avatar">AI</div>
-                    <div class="advisor-bubble">
-                        <p>Dobrý den. Jsem plnohodnotná umělá inteligence napojená přímo na živé výkazy, valuace i tržní kontext vybrané společnosti. Zeptejte se mě úplně na cokoliv — na detailní rozbor ocenění, srovnání s konkurencí, rizika, makroekonomiku, investiční strategii nebo jakoukoliv obecnou otázku.</p>
-                    </div>
-                </div>
-            </div>
-            <form class="advisor-form" onsubmit="askAdvisor(event)">
-                <input id="advisorQuestion" type="text" placeholder="Zeptejte se umělé inteligence úplně na cokoliv..." required>
-                <button class="btn btn-primary" id="advisorSubmitBtn" type="submit">Odeslat</button>
-            </form>
+            <div class="card-header"><span class="card-title">Výnosové modely &amp; tržní očekávání</span></div>
+            <div class="metric-row"><span class="metric-label">DCF pro podnik / akcii</span><span class="metric-value highlight" id="dcfShare">--</span></div>
+            <div class="metric-row"><span class="metric-label">Owner Earnings / Reziduální zisk</span><span class="metric-value" id="fcfeRi">--</span></div>
+            <div class="metric-row"><span class="metric-label">Náklady kapitálu (WACC / Beta)</span><span class="metric-value" id="waccBeta">--</span></div>
+            <div class="metric-row"><span class="metric-label">Podíl terminální hodnoty</span><span class="metric-value" id="tvShare">--</span></div>
+            <div class="metric-row"><span class="metric-label">Implikovaný růst z ceny</span><span class="metric-value" id="impliedGrowth">--</span></div>
+            <div class="metric-row"><span class="metric-label">Strukturovaný SOTP / akcii</span><span class="metric-value" id="sotpShare">--</span></div>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><span class="card-title">Scénáře &amp; pravděpodobnost</span></div>
+            <div class="metric-row"><span class="metric-label">Pesimistický / Základní / Optimistický</span><span class="metric-value" id="scenariosTriple">--</span></div>
+            <div class="metric-row"><span class="metric-label">Očekávaná hodnota scénářů</span><span class="metric-value" id="scenarioExpected">--</span></div>
+            <div class="metric-row"><span class="metric-label">Monte Carlo Medián (P50)</span><span class="metric-value highlight" id="mcMedian">--</span></div>
+            <div class="metric-row"><span class="metric-label">Interval P10 – P90</span><span class="metric-value" id="mc1090">--</span></div>
+            <div class="metric-row"><span class="metric-label">Rozpětí P5 – P95</span><span class="metric-value" id="mc595">--</span></div>
+            <div class="metric-row"><span class="metric-label">Pravděpodobnost nad trhem</span><span class="metric-value" id="mcProb">--</span></div>
         </div>
     </div>
 
-    <div class="modal-backdrop" id="newsletterModal" onclick="if(event.target===this) closeNewsletterModal()">
-        <div class="modal-box">
-            <div class="card-header">
-                <span class="card-title">Tensegrity Terminal | Intelligence Newsletter (<span id="newsModalTicker">NVDA</span>)</span>
-                <button class="btn btn-news" style="padding: 4px 10px;" onclick="closeNewsletterModal()">&#10005;</button>
-            </div>
-            <div style="margin-bottom: 14px;">
-                <input id="subscribeEmailInput" type="email" placeholder="Zadejte svou e-mailovou adresu..." style="width: 100%; padding: 12px 16px; border: 1px solid var(--border-subtle); border-radius: 8px; background: rgba(6, 9, 17, 0.85); color: var(--text-primary); font-size: 13px; outline: none; margin-bottom: 10px;">
-                <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                    <button class="btn btn-primary" style="flex: 1; justify-content: center;" onclick="sendNewsletterNow()">Odeslat jednorázově nyní</button>
-                    <button class="btn btn-secondary" style="flex: 1; justify-content: center;" onclick="subscribeNewsletter(event)">Zaevidovat pravidelný odběr</button>
-                </div>
-            </div>
-            <div id="subscribeStatus" style="font-size: 12.5px; margin-bottom: 12px; font-weight: 600;"></div>
-            <div style="font-size: 11.5px; color: var(--text-muted); margin-bottom: 18px; background: rgba(6,9,17,0.6); padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border-subtle);">
-                Pravidelný odběr je automaticky odesílán každou středu v 7:00, každý pátek v 7:00 a každou neděli v 19:00 v kompletním českém překladu.
-            </div>
+    <!-- 6. KARTA EKONOMICKÉ KVALITY, FAKTOROVÉHO PROFILU A MEZÍ MODELU -->
+    <div class="card matrix-card">
+        <div class="card-header">
+            <span class="card-title">Ekonomická kvalita, faktorový profil (BAB / QMJ) &amp; meze modelu</span>
+            <span class="badge">Kvantitativní i kvalitativní diagnostika</span>
+        </div>
+        <div class="factor-pill-grid" id="factorProfileGrid"></div>
+        <div class="plain-guide" id="modelLimitsList" style="margin-top: 12px;"></div>
+    </div>
 
-            <div style="border-top: 1px solid var(--border-subtle); padding-top: 14px;">
-                <div class="card-title" style="margin-bottom: 8px;">Aktuální tržní zprávy pro vybraný titul (přeloženo do češtiny)</div>
-                <div id="newsFeedList">Načítám zprávy...</div>
+    <!-- 7. RELATIVNÍ NÁSOBKY A CITLIVOSTNÍ MATICE -->
+    <div class="grid-2">
+        <div class="card">
+            <div class="card-header"><span class="card-title">Relativní ocenění (srovnatelné násobky)</span></div>
+            <div class="table-responsive">
+                <table>
+                    <thead><tr><th>Metoda</th><th>Násobek</th><th>Metrika</th><th>Implikovaná cena</th></tr></thead>
+                    <tbody id="peerTableBody"></tbody>
+                </table>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header"><span class="card-title">Citlivostní matice (WACC vs. terminální růst)</span></div>
+            <div class="table-responsive">
+                <table>
+                    <thead><tr id="dcfSensHeader"></tr></thead>
+                    <tbody id="dcfSensBody"></tbody>
+                </table>
             </div>
         </div>
     </div>
 
-    <script>
-        let advisorHistory = [];
-        let methodsChartInstance = null;
-        let monteCarloChartInstance = null;
-        let cashFlowChartInstance = null;
-        let currentResolvedTicker = 'NVDA';
-        let currentCurrency = 'USD';
-        let currentWeightedFairValue = null;
+    <!-- 8. AI ANALYTICKÝ PORADCE -->
+    <div class="card">
+        <div class="card-header">
+            <span class="card-title">Tensegrity AI analytický poradce</span>
+            <div style="display:flex;gap:8px;align-items:center;">
+                <span class="badge">Kontext Owner Earnings, SOTP &amp; kvalita dat</span>
+                <button type="button" class="btn btn-news" style="padding:5px 10px;font-size:11px;" onclick="openAiKeyModal()">Nastavit Gemini klíč</button>
+            </div>
+        </div>
+        <div class="advisor-thread" id="advisorMessages">
+            <div class="advisor-message assistant">
+                Dobrý den. Zeptejte se mě na cokoliv — na principy valuací (Owner Earnings, Look-Through, WACC, DCF — klidně i jednoduchým vysvětlením jako pro dítě), konkrétní společnosti, kvalitu jejich účetních výkazů nebo obecná témata.
+            </div>
+        </div>
+        <form class="advisor-form" onsubmit="event.preventDefault(); askAdvisor();">
+            <input type="text" class="advisor-input" id="advisorInput" placeholder="Zeptejte se například: Vysvětli WACC jako dítěti nebo Jak vychází tato firma?">
+            <button type="submit" class="btn btn-primary" id="advisorSendBtn">Odeslat</button>
+        </form>
+    </div>
+</div>
 
-        let tvChart = null;
-        let tvMainSeries = null;
-        let tvVolumeSeries = null;
-        let tvFairPriceLine = null;
-        let tvChartStyle = 'area';
-        let tvCurrentTimeframe = '1R';
-        let tvLastPayload = null;
+<script>
+    let currentTicker = 'NVDA';
+    let currentTimeframe = '1R';
+    let lastFairValue = 0;
+    let lastCurrency = 'USD';
+    let lastBarSnapshot = null;
+    let advisorHistory = [];
+    let chartInstances = {};
+    let tvChart = null;
+    let tvCandleSeries = null;
+    let tvVolumeSeries = null;
+    let tvFairValueLine = null;
 
-        function fmtMoney(val, curr = 'USD') {
-            if (val === null || val === undefined || isNaN(val)) return 'N/A';
-            return Number(val).toLocaleString('cs-CZ', {maximumFractionDigits: 2}) + ' ' + curr;
+    function fmtNum(val, dec = 2) {
+        if (val === null || val === undefined || isNaN(val)) return 'N/A';
+        return Number(val).toLocaleString('cs-CZ', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+    }
+    function fmtMoney(val, curr, dec = 2) {
+        if (val === null || val === undefined || isNaN(val)) return 'N/A';
+        return `${fmtNum(val, dec)} ${curr}`;
+    }
+    function fmtCompact(val, curr) {
+        if (val === null || val === undefined || isNaN(val)) return 'N/A';
+        const abs = Math.abs(val);
+        if (abs >= 1e12) return `${fmtNum(val / 1e12, 2)} bil. ${curr}`;
+        if (abs >= 1e9) return `${fmtNum(val / 1e9, 2)} mld. ${curr}`;
+        if (abs >= 1e6) return `${fmtNum(val / 1e6, 1)} mil. ${curr}`;
+        return `${fmtNum(val, 0)} ${curr}`;
+    }
+    function escapeHtml(text) {
+        return String(text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function openNewsletterModal() {
+        document.getElementById('newsletterStatus').innerText = '';
+        document.getElementById('newsletterModal').classList.add('open');
+    }
+    function closeNewsletterModal() {
+        document.getElementById('newsletterModal').classList.remove('open');
+    }
+
+    function openAiKeyModal() {
+        document.getElementById('aiKeyStatus').innerText = '';
+        document.getElementById('aiKeyModal').classList.add('open');
+    }
+    function closeAiKeyModal() {
+        document.getElementById('aiKeyModal').classList.remove('open');
+    }
+
+    async function saveGeminiKey() {
+        const apiKey = document.getElementById('geminiKeyInput').value.trim();
+        const statusEl = document.getElementById('aiKeyStatus');
+        if (!apiKey || apiKey.length < 15) {
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = 'Zadejte platný Gemini API klíč.';
+            return;
         }
-
-        function fmtLarge(val, curr = 'USD') {
-            if (val === null || val === undefined || isNaN(val)) return 'N/A';
-            const abs = Math.abs(val);
-            if (abs >= 1e12) return (val / 1e12).toFixed(2) + ' bil. ' + curr;
-            if (abs >= 1e9) return (val / 1e9).toFixed(2) + ' mld. ' + curr;
-            if (abs >= 1e6) return (val / 1e6).toFixed(2) + ' mil. ' + curr;
-            return Number(val).toLocaleString('cs-CZ', {maximumFractionDigits: 0}) + ' ' + curr;
-        }
-
-        function handleSearchTrigger() {
-            const typed = (document.getElementById('tickerInput').value || '').trim().toUpperCase();
-            const isSameTicker = typed === currentResolvedTicker.toUpperCase();
-            loadValuation(!isSameTicker);
-        }
-
-        function setTvChartStyle(style) {
-            tvChartStyle = style;
-            document.getElementById('btnChartArea').classList.toggle('active', style === 'area');
-            document.getElementById('btnChartCandle').classList.toggle('active', style === 'candle');
-            if (tvLastPayload) renderTvChartData(tvLastPayload);
-        }
-
-        function changeTvTimeframe(tf, btnEl) {
-            tvCurrentTimeframe = tf;
-            document.querySelectorAll('#tvTimeframeGroup .tv-tf-btn').forEach(b => b.classList.remove('active'));
-            if (btnEl) btnEl.classList.add('active');
-            loadInteractivePriceChart(currentResolvedTicker, tf);
-        }
-
-        async function loadInteractivePriceChart(ticker, timeframe = tvCurrentTimeframe) {
-            try {
-                const res = await fetch('/api/chart/' + encodeURIComponent(ticker) + '?timeframe=' + encodeURIComponent(timeframe));
-                if (!res.ok) return;
-                const payload = await res.json();
-                tvLastPayload = payload;
-                renderTvChartData(payload);
-            } catch (err) {
-                console.error('Chyba při načítání cenového grafu:', err);
-            }
-        }
-
-        function renderTvChartData(payload) {
-            const container = document.getElementById('tvChartContainer');
-            if (!container || typeof LightweightCharts === 'undefined') return;
-
-            const badge = document.getElementById('tvPeriodChangeBadge');
-            const isUp = payload.change_pct >= 0;
-            badge.textContent = `Změna (${payload.timeframe}): ${isUp ? '+' : ''}${payload.change_pct.toFixed(2)} % (${isUp ? '+' : ''}${payload.change_abs.toFixed(2)} ${currentCurrency})`;
-            badge.style.color = isUp ? '#34d399' : '#f87171';
-            badge.style.borderColor = isUp ? 'rgba(16,185,129,0.35)' : 'rgba(239,68,68,0.35)';
-
-            if (tvChart) {
-                tvChart.remove();
-                tvChart = null;
-            }
-
-            tvChart = LightweightCharts.createChart(container, {
-                width: container.clientWidth,
-                height: 360,
-                layout: {
-                    background: { type: 'solid', color: '#070b14' },
-                    textColor: '#94a3b8',
-                    fontFamily: "'JetBrains Mono', monospace",
-                },
-                grid: {
-                    vertLines: { color: 'rgba(255, 255, 255, 0.04)' },
-                    horzLines: { color: 'rgba(255, 255, 255, 0.04)' },
-                },
-                crosshair: {
-                    mode: LightweightCharts.CrosshairMode.Normal,
-                    vertLine: { color: 'rgba(56, 189, 248, 0.45)', labelBackgroundColor: '#0284c7' },
-                    horzLine: { color: 'rgba(56, 189, 248, 0.45)', labelBackgroundColor: '#0284c7' },
-                },
-                rightPriceScale: { borderColor: 'rgba(255, 255, 255, 0.08)' },
-                timeScale: {
-                    borderColor: 'rgba(255, 255, 255, 0.08)',
-                    timeVisible: payload.intraday,
-                    secondsVisible: false,
-                },
+        statusEl.style.color = '#38bdf8';
+        statusEl.innerText = 'Ukládám a aktivuji klíč...';
+        try {
+            const resp = await fetch('/api/settings/gemini-key', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ api_key: apiKey })
             });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.detail || 'Chyba uložení klíče.');
+            statusEl.style.color = '#34d399';
+            statusEl.innerText = data.message;
+        } catch (err) {
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = err.message;
+        }
+    }
 
-            if (tvChartStyle === 'candle') {
-                tvMainSeries = tvChart.addCandlestickSeries({
-                    upColor: '#10b981',
-                    downColor: '#ef4444',
-                    borderVisible: false,
-                    wickUpColor: '#10b981',
-                    wickDownColor: '#ef4444',
-                });
-                tvMainSeries.setData(payload.candles);
-            } else {
-                const lineCol = isUp ? '#10b981' : '#ef4444';
-                const topFill = isUp ? 'rgba(16, 185, 129, 0.28)' : 'rgba(239, 68, 68, 0.28)';
-                tvMainSeries = tvChart.addAreaSeries({
-                    lineColor: lineCol,
-                    topColor: topFill,
-                    bottomColor: 'rgba(7, 11, 20, 0.0)',
-                    lineWidth: 2,
-                });
-                tvMainSeries.setData(payload.candles.map(c => ({ time: c.time, value: c.close })));
+    async function subscribeNewsletter() {
+        const email = document.getElementById('newsletterEmailInput').value.trim();
+        const statusEl = document.getElementById('newsletterStatus');
+        if (!email || !email.includes('@')) {
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = 'Zadejte platnou e-mailovou adresu.';
+            return;
+        }
+        statusEl.style.color = '#38bdf8';
+        statusEl.innerText = 'Ukládám odběr...';
+        try {
+            const resp = await fetch('/subscribe', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email })
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.detail || 'Chyba registrace.');
+            statusEl.style.color = '#34d399';
+            statusEl.innerText = data.message;
+        } catch (err) {
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = err.message;
+        }
+    }
+
+    async function sendNewsletterNow() {
+        const email = document.getElementById('newsletterEmailInput').value.trim();
+        const statusEl = document.getElementById('newsletterStatus');
+        if (!email || !email.includes('@')) {
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = 'Zadejte platnou e-mailovou adresu příjemce.';
+            return;
+        }
+        statusEl.style.color = '#38bdf8';
+        statusEl.innerText = 'Překládám aktuální zprávy do češtiny, generuji PDF a odesílám e-mail...';
+        try {
+            const resp = await fetch('/api/newsletter/send-now', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email })
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.detail || 'Odeslání zpravodaje selhalo.');
+            statusEl.style.color = '#34d399';
+            statusEl.innerText = data.message;
+        } catch (err) {
+            statusEl.style.color = '#f87171';
+            statusEl.innerText = err.message;
+        }
+    }
+
+    async function loadForexBanner() {
+        try {
+            const resp = await fetch('/api/forex-rates');
+            const data = await resp.json();
+            const r = data.rates || {};
+            document.getElementById('forexRatesBanner').innerHTML = `
+                <span>EUR/CZK <strong>${fmtNum(r['EUR/CZK']?.rate, 2)}</strong></span>
+                <span>USD/CZK <strong>${fmtNum(r['USD/CZK']?.rate, 2)}</strong></span>
+                <span>GBP/CZK <strong>${fmtNum(r['GBP/CZK']?.rate, 2)}</strong></span>
+            `;
+        } catch (e) {}
+    }
+
+    function renderOhlcReadout(bar) {
+        if (!bar) return;
+        const readout = document.getElementById('tvCrosshairReadout');
+        readout.innerHTML = `
+            <span>O: <strong>${fmtNum(bar.open, 2)}</strong></span>
+            <span>H: <strong>${fmtNum(bar.high, 2)}</strong></span>
+            <span>L: <strong>${fmtNum(bar.low, 2)}</strong></span>
+            <span>C: <strong>${fmtNum(bar.close, 2)} ${lastCurrency}</strong></span>
+            <span style="color:#38bdf8;">Vnitřní hodnota: <strong>${fmtNum(lastFairValue, 2)} ${lastCurrency}</strong></span>
+        `;
+    }
+
+    function initTvChartIfNeeded() {
+        if (tvChart) return;
+        const container = document.getElementById('tvChartContainer');
+        tvChart = LightweightCharts.createChart(container, {
+            layout: {
+                background: { type: 'solid', color: '#070b14' },
+                textColor: '#94a3b8',
+                fontFamily: "'JetBrains Mono', monospace",
+            },
+            grid: {
+                vertLines: { color: 'rgba(148, 163, 184, 0.06)' },
+                horzLines: { color: 'rgba(148, 163, 184, 0.06)' },
+            },
+            crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+            rightPriceScale: { borderColor: 'rgba(255, 255, 255, 0.1)' },
+            timeScale: { borderColor: 'rgba(255, 255, 255, 0.1)', timeVisible: true, secondsVisible: false },
+        });
+
+        tvCandleSeries = tvChart.addCandlestickSeries({
+            upColor: '#10b981',
+            downColor: '#ef4444',
+            borderVisible: false,
+            wickUpColor: '#10b981',
+            wickDownColor: '#ef4444',
+        });
+
+        tvVolumeSeries = tvChart.addHistogramSeries({
+            priceFormat: { type: 'volume' },
+            priceScaleId: '',
+        });
+        tvVolumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+
+        tvChart.subscribeCrosshairMove((param) => {
+            if (!param || !param.time || !param.seriesData) {
+                if (lastBarSnapshot) renderOhlcReadout(lastBarSnapshot);
+                return;
+            }
+            const bar = param.seriesData.get(tvCandleSeries);
+            if (!bar) {
+                if (lastBarSnapshot) renderOhlcReadout(lastBarSnapshot);
+                return;
+            }
+            renderOhlcReadout(bar);
+        });
+
+        window.addEventListener('resize', () => {
+            if (tvChart && container) {
+                tvChart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+            }
+        });
+    }
+
+    async function loadInteractiveChart(ticker, timeframe) {
+        currentTimeframe = timeframe;
+        document.querySelectorAll('.tv-tf-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.tf === timeframe);
+        });
+        try {
+            initTvChartIfNeeded();
+            const resp = await fetch(`/api/chart/${encodeURIComponent(ticker)}?timeframe=${encodeURIComponent(timeframe)}`);
+            const data = await resp.json();
+            if (!resp.ok) return;
+
+            const candles = data.candles || [];
+            tvChart.applyOptions({ timeScale: { timeVisible: Boolean(data.intraday) } });
+            tvCandleSeries.setData(candles);
+            tvVolumeSeries.setData(data.volumes || []);
+
+            if (candles.length > 0) {
+                lastBarSnapshot = candles[candles.length - 1];
+                renderOhlcReadout(lastBarSnapshot);
             }
 
-            tvVolumeSeries = tvChart.addHistogramSeries({
-                priceFormat: { type: 'volume' },
-                priceScaleId: '',
-            });
-            tvVolumeSeries.priceScale().applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-            tvVolumeSeries.setData(payload.volumes);
-
-            if (currentWeightedFairValue && currentWeightedFairValue > 0) {
-                tvFairPriceLine = tvMainSeries.createPriceLine({
-                    price: currentWeightedFairValue,
+            if (tvFairValueLine) {
+                try { tvCandleSeries.removePriceLine(tvFairValueLine); } catch (e) {}
+                tvFairValueLine = null;
+            }
+            if (lastFairValue > 0) {
+                tvFairValueLine = tvCandleSeries.createPriceLine({
+                    price: lastFairValue,
                     color: '#38bdf8',
-                    lineWidth: 1,
+                    lineWidth: 2,
                     lineStyle: LightweightCharts.LineStyle.Dashed,
                     axisLabelVisible: true,
                     title: 'Vnitřní hodnota',
                 });
             }
 
-            const readout = document.getElementById('tvCrosshairReadout');
-            const candleByTime = new Map(payload.candles.map(c => [String(c.time), c]));
-            tvChart.subscribeCrosshairMove(param => {
-                if (!readout) return;
-                if (!param || !param.time) {
-                    readout.innerHTML = `<span>Poslední cena: <strong>${fmtMoney(payload.last_close, currentCurrency)}</strong> | Najeďte myší na graf pro detailní cenu a čas.</span>`;
-                    return;
-                }
-                const key = String(param.time);
-                const c = candleByTime.get(key);
-                let timeLabel = key;
-                if (typeof param.time === 'number') {
-                    const dt = new Date(param.time * 1000);
-                    timeLabel = dt.toLocaleString('cs-CZ', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
-                }
-                if (c) {
-                    readout.innerHTML =
-                        `<span>Čas: <strong>${timeLabel}</strong></span>` +
-                        `<span>O: <strong>${c.open.toFixed(2)}</strong></span>` +
-                        `<span>H: <strong>${c.high.toFixed(2)}</strong></span>` +
-                        `<span>L: <strong>${c.low.toFixed(2)}</strong></span>` +
-                        `<span>C: <strong>${c.close.toFixed(2)} ${currentCurrency}</strong></span>`;
-                }
-            });
-
             tvChart.timeScale().fitContent();
-        }
+            const chg = data.change_pct || 0;
+            const badge = document.getElementById('chartChangeBadge');
+            badge.innerText = `Vývoj (${timeframe}): ${chg >= 0 ? '+' : ''}${fmtNum(chg, 2)} % (${fmtMoney(data.last_close, lastCurrency)})`;
+            badge.style.color = chg >= 0 ? '#34d399' : '#f87171';
+        } catch (err) {}
+    }
 
-        window.addEventListener('resize', () => {
-            const container = document.getElementById('tvChartContainer');
-            if (tvChart && container) {
-                tvChart.applyOptions({ width: container.clientWidth });
-            }
-        });
+    function switchChartTimeframe(tf) {
+        loadInteractiveChart(currentTicker, tf);
+    }
 
-        function updateCompanyIdentityBanner(d) {
-            const curr = d.currency || 'USD';
-            document.getElementById('companyFullName').textContent = d.company_name;
-            document.getElementById('companyTickerBadge').textContent = d.ticker;
-            document.getElementById('companySectorMeta').textContent =
-                'Sektor: ' + d.sector + ' • Odvětví: ' + d.industry + ' • Burza: ' + d.exchange;
-            document.getElementById('companyPricePill').textContent =
-                'Tržní cena: ' + fmtMoney(d.dcf_valuation.current_share_price, curr);
+    function renderCompanyIdentity(d) {
+        const curr = d.currency;
+        const price = d.dcf_valuation.current_share_price;
+        const fairVal = d.valuation_synthesis.weighted_fair_value;
+        const upside = d.decision_engine.upside_to_fair_value_percent;
 
-            const logoContainer = document.getElementById('companyLogoContainer');
-            const initials = (d.company_name || d.ticker || 'TT').substring(0, 2).toUpperCase();
-            const candidates = Array.isArray(d.company_logo_urls) && d.company_logo_urls.length > 0
-                ? [...d.company_logo_urls]
-                : (d.company_logo_url ? [d.company_logo_url] : []);
+        document.getElementById('companyFullName').innerText = d.company_name || d.ticker;
+        document.getElementById('companyTickerBadge').innerText = d.ticker;
+        document.getElementById('companySectorMeta').innerText =
+            `Sektor: ${d.sector} • Odvětví: ${d.industry} • Burza: ${d.exchange}`;
 
-            function tryNextLogo(idx) {
-                if (idx >= candidates.length) {
+        document.getElementById('companyPriceBig').innerText = fmtMoney(price, curr);
+        document.getElementById('companyMcapSub').innerText = `Tržní kap.: ${fmtCompact(d.trzni_kapitalizace, curr)}`;
+
+        document.getElementById('companyFairBig').innerText = fmtMoney(fairVal, curr);
+        const upsideEl = document.getElementById('companyUpsideSub');
+        upsideEl.innerText = `Potenciál vůči trhu: ${upside >= 0 ? '+' : ''}${fmtNum(upside, 1)} %`;
+        upsideEl.style.color = upside >= 0 ? '#34d399' : '#f87171';
+
+        const logoContainer = document.getElementById('companyLogoContainer');
+        const initials = (d.ticker || 'TT').replace(/[^A-Z0-9]/g, '').slice(0, 3) || 'TT';
+        const candidates = Array.isArray(d.company_logo_urls) && d.company_logo_urls.length
+            ? d.company_logo_urls
+            : (d.company_logo_url ? [d.company_logo_url] : []);
+
+        if (candidates.length > 0) {
+            logoContainer.className = 'company-logo-frame';
+            logoContainer.innerHTML = '';
+            const img = document.createElement('img');
+            img.alt = d.company_name || d.ticker;
+            let idx = 0;
+            img.onerror = function() {
+                idx += 1;
+                if (idx < candidates.length) {
+                    img.src = candidates[idx];
+                } else {
                     logoContainer.className = 'company-logo-fallback';
                     logoContainer.textContent = initials;
-                    return;
                 }
-                logoContainer.className = 'company-logo-frame';
-                const img = document.createElement('img');
-                img.src = candidates[idx];
-                img.alt = d.company_name;
-                img.onload = function() {
-                    if (img.naturalWidth < 12 || img.naturalHeight < 12) tryNextLogo(idx + 1);
-                };
-                img.onerror = function() { tryNextLogo(idx + 1); };
-                logoContainer.replaceChildren(img);
-            }
-            tryNextLogo(0);
+            };
+            img.src = candidates[0];
+            logoContainer.appendChild(img);
+        } else {
+            logoContainer.className = 'company-logo-fallback';
+            logoContainer.textContent = initials;
         }
+    }
 
-        function renderCharts(d) {
-            if (typeof Chart === 'undefined') return;
-            const curr = d.currency || 'USD';
-            const gridColor = 'rgba(255, 255, 255, 0.06)';
-            const tickColor = '#94a3b8';
+    function renderCharts(d) {
+        Object.values(chartInstances).forEach(ch => { if (ch) ch.destroy(); });
 
-            const ctx1 = document.getElementById('methodsChartCanvas').getContext('2d');
-            if (methodsChartInstance) methodsChartInstance.destroy();
-            const activeMethods = d.valuation_synthesis.methods.filter(m => m.weight_percent > 0);
-            const methodLabels = ['Tržní cena', 'Vážená hodnota', ...activeMethods.map(m => m.method)];
-            const methodValues = [
-                d.dcf_valuation.current_share_price,
-                d.valuation_synthesis.weighted_fair_value,
-                ...activeMethods.map(m => m.fair_value)
-            ];
-            const barColors = methodValues.map((val, idx) => {
-                if (idx === 0) return '#f59e0b';
-                if (idx === 1) return '#38bdf8';
-                return val >= d.dcf_valuation.current_share_price ? 'rgba(16, 185, 129, 0.75)' : 'rgba(239, 68, 68, 0.75)';
-            });
+        const curr = d.currency;
+        const ctxM = document.getElementById('methodsChart').getContext('2d');
+        const methodItems = [
+            { label: 'Cena', val: d.dcf_valuation.current_share_price, color: '#64748b' },
+            { label: 'Vážená', val: d.valuation_synthesis.weighted_fair_value, color: '#38bdf8' },
+            { label: 'DCF', val: d.dcf_valuation.intrinsic_value_per_share, color: '#0284c7' },
+            { label: 'Owner E.', val: d.fcfe_valuation.intrinsic_value_per_share, color: '#10b981' },
+            { label: 'Násobky', val: d.peer_comps.blended_implied_price, color: '#8b5cf6' },
+            { label: 'MC P50', val: d.monte_carlo.p50, color: '#f59e0b' },
+        ].filter(x => x.val !== null && x.val !== undefined);
 
-            methodsChartInstance = new Chart(ctx1, {
-                type: 'bar',
-                data: {
-                    labels: methodLabels,
-                    datasets: [{ label: 'Hodnota (' + curr + ')', data: methodValues, backgroundColor: barColors, borderRadius: 6 }]
-                },
-                options: {
-                    indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-                    plugins: { legend: { display: false } },
-                    scales: {
-                        x: { grid: { color: gridColor }, ticks: { color: tickColor, font: { size: 10 } } },
-                        y: { grid: { display: false }, ticks: { color: tickColor, font: { size: 10 } } }
-                    }
-                }
-            });
-
-            const ctx2 = document.getElementById('monteCarloChartCanvas').getContext('2d');
-            if (monteCarloChartInstance) monteCarloChartInstance.destroy();
-            const hist = d.monte_carlo.histogram || [];
-            const currentP = d.dcf_valuation.current_share_price;
-            monteCarloChartInstance = new Chart(ctx2, {
-                type: 'bar',
-                data: {
-                    labels: hist.map(h => h.label),
-                    datasets: [{
-                        label: 'Počet simulací',
-                        data: hist.map(h => h.count),
-                        backgroundColor: hist.map(h => h.midpoint >= currentP ? 'rgba(56, 189, 248, 0.75)' : 'rgba(148, 163, 184, 0.45)'),
-                        borderRadius: 4
-                    }]
-                },
-                options: {
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: { legend: { display: false } },
-                    scales: {
-                        x: { grid: { display: false }, ticks: { color: tickColor, font: { size: 10 } } },
-                        y: { grid: { color: gridColor }, ticks: { color: tickColor, font: { size: 10 } } }
-                    }
-                }
-            });
-
-            const ctx3 = document.getElementById('cashFlowChartCanvas').getContext('2d');
-            if (cashFlowChartInstance) cashFlowChartInstance.destroy();
-            const cfRows = d.dcf_valuation.cash_flows || [];
-            const lboRows = d.projektovane_roky || [];
-            cashFlowChartInstance = new Chart(ctx3, {
-                type: 'bar',
-                data: {
-                    labels: cfRows.map(r => 'Rok ' + r.rok),
-                    datasets: [
-                        { label: 'Volný peněžní tok', data: cfRows.map(r => r.volny_penezni_tok / 1e9), backgroundColor: 'rgba(16, 185, 129, 0.75)', borderRadius: 6 },
-                        { label: 'Zůstatek dluhu (LBO)', data: lboRows.map(r => r.zbyvajici_cizi_kapital / 1e9), type: 'line', borderColor: '#38bdf8', backgroundColor: '#38bdf8', tension: 0.3 }
-                    ]
-                },
-                options: {
-                    responsive: true, maintainAspectRatio: false,
-                    plugins: { legend: { labels: { color: tickColor, font: { size: 10 } } } },
-                    scales: {
-                        x: { grid: { display: false }, ticks: { color: tickColor, font: { size: 10 } } },
-                        y: { grid: { color: gridColor }, ticks: { color: tickColor, font: { size: 10 }, callback: v => v.toFixed(1) + ' mld.' } }
-                    }
-                }
-            });
-        }
-
-        async function loadForexRates() {
-            try {
-                const res = await fetch('/api/forex-rates');
-                const data = await res.json();
-                const container = document.getElementById('forexRates');
-                container.replaceChildren();
-                Object.entries(data.rates).forEach(([pair, item]) => {
-                    const span = document.createElement('span');
-                    span.innerHTML = pair + ' <strong>' + Number(item.rate).toFixed(2) + '</strong>';
-                    container.appendChild(span);
-                });
-            } catch (err) { console.error(err); }
-        }
-
-        async function loadValuation(useCompanyDefaults = true) {
-            const rawQuery = (document.getElementById('tickerInput').value || 'NVDA').trim();
-            const params = new URLSearchParams();
-
-            if (!useCompanyDefaults) {
-                const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
-                const growth = document.getElementById('growthInput').valueAsNumber / 100;
-                const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
-                if (!isNaN(leverage)) params.set('leverage', leverage);
-                if (!isNaN(growth)) params.set('growth', growth);
-                if (!isNaN(exitMult)) params.set('exit_mult', exitMult);
-            }
-
-            const queryString = params.toString();
-            const endpoint = '/api/valuation/' + encodeURIComponent(rawQuery) + (queryString ? '?' + queryString : '');
-
-            try {
-                const res = await fetch(endpoint);
-                const d = await res.json();
-                if (!res.ok) throw new Error(d.detail || 'Valuaci se nepodařilo načíst.');
-
-                const curr = d.currency || 'USD';
-                const prevTicker = currentResolvedTicker;
-                currentResolvedTicker = d.ticker;
-                currentCurrency = curr;
-                currentWeightedFairValue = d.valuation_synthesis.weighted_fair_value;
-
-                document.getElementById('tickerInput').value = d.ticker;
-                document.getElementById('fundTicker').textContent = d.ticker;
-                document.getElementById('auditTimestamp').textContent = d.audit_trail.model_version + ' | ' + d.audit_trail.timestamp;
-
-                if (useCompanyDefaults && d.dynamic_defaults) {
-                    document.getElementById('leverageInput').value = d.dynamic_defaults.leverage_percent;
-                    document.getElementById('growthInput').value = d.dynamic_defaults.growth_percent;
-                    document.getElementById('exitMultipleInput').value = d.dynamic_defaults.exit_multiple;
-                }
-
-                updateCompanyIdentityBanner(d);
-
-                if (useCompanyDefaults || prevTicker !== d.ticker || !tvLastPayload) {
-                    loadInteractivePriceChart(d.ticker, tvCurrentTimeframe);
-                } else if (tvLastPayload) {
-                    renderTvChartData(tvLastPayload);
-                }
-
-                const dec = d.decision_engine;
-                const synth = d.valuation_synthesis;
-                document.getElementById('integrityBadge').textContent = 'Index integrity: ' + synth.integrity_score + ' / 100';
-                document.getElementById('weightedFairBadge').textContent = 'Vážená vnitřní hodnota: ' + fmtMoney(synth.weighted_fair_value, curr);
-
-                ['lightGreen', 'lightYellow', 'lightOrange', 'lightRed'].forEach(id => document.getElementById(id).classList.remove('active'));
-                const lightMap = { GREEN: 'lightGreen', YELLOW: 'lightYellow', ORANGE: 'lightOrange', RED: 'lightRed' };
-                if (lightMap[dec.zone]) document.getElementById(lightMap[dec.zone]).classList.add('active');
-
-                document.getElementById('thesisRecommendation').textContent = dec.recommendation + ' (Doporučená tranše: ' + dec.tranche_allocation_percent + ' %)';
-                document.getElementById('thesisSummary').textContent =
-                    'Aktuální tržní cena: ' + fmtMoney(d.dcf_valuation.current_share_price, curr) +
-                    ' | Vážená vnitřní hodnota: ' + fmtMoney(synth.weighted_fair_value, curr) +
-                    ' | Bezpečnostní rezerva: ' + dec.margin_of_safety_percent.toFixed(2) + ' %.';
-
-                const b = dec.bands;
-                document.getElementById('zoneGreenRange').textContent = '0,00 – ' + fmtMoney(b.green_max, curr);
-                document.getElementById('zoneYellowRange').textContent = fmtMoney(b.yellow_min, curr) + ' – ' + fmtMoney(b.yellow_max, curr);
-                document.getElementById('zoneOrangeRange').textContent = fmtMoney(b.orange_min, curr) + ' – ' + fmtMoney(b.orange_max, curr);
-                document.getElementById('zoneRedRange').textContent = 'nad ' + fmtMoney(b.red_min, curr);
-
-                let synHtml = '<table><thead><tr><th>Oceňovací metoda</th><th>Váha</th><th>Vnitřní hodnota / akcii</th><th>Vážený příspěvek</th><th>Rozdíl vs. tržní cena</th></tr></thead><tbody>';
-                synth.methods.forEach(m => {
-                    const col = m.vs_market_percent >= 0 ? '#34d399' : '#f87171';
-                    synHtml += `<tr><td>${m.method}</td><td>${m.weight_percent.toFixed(1)} %</td><td>${fmtMoney(m.fair_value, curr)}</td><td>${fmtMoney(m.contribution, curr)}</td><td style="color:${col};">${m.vs_market_percent >= 0 ? '+' : ''}${m.vs_market_percent.toFixed(2)} %</td></tr>`;
-                });
-                synHtml += '</tbody></table>';
-                document.getElementById('synthesisTableContainer').innerHTML = synHtml;
-                document.getElementById('disagreementNote').textContent = synth.disagreement_note;
-
-                renderCharts(d);
-
-                const f = d.fundamentals;
-                document.getElementById('valCap').textContent = fmtLarge(d.trzni_kapitalizace, curr);
-                document.getElementById('valEV').textContent = fmtLarge(d.celkova_hodnota_podniku, curr);
-                document.getElementById('normFcf').textContent = fmtLarge(f.normalized_fcf, curr);
-                document.getElementById('roicVsWacc').textContent = f.roic_percent.toFixed(2) + ' % vs. ' + d.wacc_engine.wacc_percent.toFixed(2) + ' %';
-                document.getElementById('econProfit').textContent = fmtLarge(f.economic_profit, curr);
-                document.getElementById('riskScores').textContent = 'Piotroski ' + d.risk_analysis.piotroski_f_score + '/9 | ' + d.risk_analysis.altman_status;
-
-                const dcf = d.dcf_valuation;
-                document.getElementById('dcfIntrinsicValue').textContent = fmtMoney(dcf.intrinsic_value_per_share, curr);
-                document.getElementById('fcfeAndRi').textContent = fmtMoney(d.fcfe_valuation.intrinsic_value_per_share, curr) + ' / ' + fmtMoney(d.residual_income.intrinsic_value_per_share, curr);
-                document.getElementById('dcfWacc').textContent = d.wacc_engine.wacc_percent.toFixed(2) + ' % (Beta ' + d.wacc_engine.beta.toFixed(2) + ')';
-                document.getElementById('tvShare').textContent = dcf.tv_share_percent.toFixed(1) + ' % z EV';
-                document.getElementById('reverseDcfGrowth').textContent = d.reverse_dcf.implied_fcf_growth_percent.toFixed(2) + ' % ročně';
-                document.getElementById('sotpNav').textContent = fmtMoney(d.metoda_souctu_casti.sotp_per_share, curr) + ' / ' + fmtMoney(d.metoda_souctu_casti.nav_per_share, curr);
-
-                const sc = d.scenarios;
-                const mc = d.monte_carlo;
-                document.getElementById('bearBaseBull').textContent = sc.bear.fair_value.toFixed(1) + ' / ' + sc.base.fair_value.toFixed(1) + ' / ' + sc.bull.fair_value.toFixed(1);
-                document.getElementById('scenExpected').textContent = fmtMoney(sc.expected_value, curr);
-                document.getElementById('mcP50').textContent = fmtMoney(mc.p50, curr);
-                document.getElementById('mcP10P90').textContent = fmtMoney(mc.p10, curr) + ' – ' + fmtMoney(mc.p90, curr);
-                document.getElementById('mcP5P95').textContent = fmtMoney(mc.p5, curr) + ' – ' + fmtMoney(mc.p95, curr);
-                document.getElementById('mcProbUpside').textContent = mc.prob_above_market_percent.toFixed(1) + ' %';
-
-                document.getElementById('peerSector').textContent = d.peer_comps.sector;
-                let peerHtml = '<table><thead><tr><th>Metoda</th><th>Násobek</th><th>Metrika (PV)</th><th>Implikovaná cena</th></tr></thead><tbody>';
-                d.peer_comps.multiples.forEach(p => {
-                    peerHtml += `<tr><td>${p.method}</td><td>${p.multiple}x</td><td>${fmtLarge(p.forward_metric, curr)}</td><td>${fmtMoney(p.implied_share_price, curr)}</td></tr>`;
-                });
-                peerHtml += '</tbody></table>';
-                document.getElementById('peerCompsContainer').innerHTML = peerHtml;
-
-                const lbo = d.model_odkupu_za_cizi_kapital_base_case;
-                document.getElementById('lboSummaryBadge').textContent = 'Násobek ' + lbo.moic + 'x | Výnos ' + lbo.irr_procent + ' %';
-                let schedHtml = '<table><thead><tr><th>Rok</th><th>Provozní zisk</th><th>Volný tok</th><th>Splátka dluhu</th><th>Zůstatek dluhu</th></tr></thead><tbody>';
-                d.projektovane_roky.forEach(y => {
-                    schedHtml += `<tr><td>Rok ${y.rok}</td><td>${fmtLarge(y.projektovany_provozni_zisk_pred_odpisy, curr)}</td><td>${fmtLarge(y.volny_tok_pro_splaceni, curr)}</td><td>${fmtLarge(y.mor_jistiny, curr)}</td><td>${fmtLarge(y.zbyvajici_cizi_kapital, curr)}</td></tr>`;
-                });
-                schedHtml += '</tbody></table>';
-                document.getElementById('lboScheduleContainer').innerHTML = schedHtml;
-
-                const dcfMat = dcf.sensitivity_matrix || [];
-                if (dcfMat.length > 0) {
-                    let dMatHtml = '<table><thead><tr><th>Náklady kapitálu \\ Terminální růst</th>' + dcfMat[0].cells.map(c => `<th>${c.tg.toFixed(2)} %</th>`).join('') + '</tr></thead><tbody>';
-                    dcfMat.forEach(r => {
-                        dMatHtml += `<tr><td><strong>${r.wacc.toFixed(2)} %</strong></td>`;
-                        r.cells.forEach(c => {
-                            const col = c.price >= dcf.current_share_price ? '#34d399' : '#f87171';
-                            dMatHtml += `<td style="color:${col};">${c.price.toFixed(2)}</td>`;
-                        });
-                        dMatHtml += '</tr>';
-                    });
-                    dMatHtml += '</tbody></table>';
-                    document.getElementById('dcfSensitivityContainer').innerHTML = dMatHtml;
-                }
-
-                const lboMat = d.citlivostni_matice_lbo_irr || [];
-                if (lboMat.length > 0) {
-                    let lMatHtml = '<table><thead><tr><th>Růst \\ Výstupní násobek</th>' + lboMat[0].vysledky_irr_dle_nasobku.map(m => `<th>${m.vystupni_nasobek.toFixed(1)}x</th>`).join('') + '</tr></thead><tbody>';
-                    lboMat.forEach(r => {
-                        lMatHtml += `<tr><td><strong>${r.tempo_rustu_ebitda_procent.toFixed(1)} %</strong></td>`;
-                        r.vysledky_irr_dle_nasobku.forEach(c => {
-                            const col = c.irr_procent >= 0 ? '#34d399' : '#f87171';
-                            lMatHtml += `<td style="color:${col};">${c.irr_procent.toFixed(2)} %</td>`;
-                        });
-                        lMatHtml += '</tr>';
-                    });
-                    lMatHtml += '</tbody></table>';
-                    document.getElementById('sensitivityMatrix').innerHTML = lMatHtml;
-                }
-            } catch (err) {
-                document.getElementById('thesisRecommendation').textContent = 'Chyba při načítání valuace: ' + err.message;
-                console.error(err);
-            }
-        }
-
-        function openNewsletterModal() {
-            const ticker = currentResolvedTicker || (document.getElementById('tickerInput').value || 'NVDA').trim().toUpperCase();
-            document.getElementById('newsModalTicker').textContent = ticker;
-            document.getElementById('subscribeStatus').textContent = '';
-            document.getElementById('newsletterModal').classList.add('open');
-            loadTickerNews(ticker);
-        }
-
-        function closeNewsletterModal() {
-            document.getElementById('newsletterModal').classList.remove('open');
-        }
-
-        async function loadTickerNews(ticker) {
-            const listEl = document.getElementById('newsFeedList');
-            listEl.innerHTML = '<div style="text-align:center; padding:12px;"><div class="loader"></div></div>';
-            try {
-                const res = await fetch('/api/news/' + encodeURIComponent(ticker));
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || 'Zprávy se nepodařilo načíst.');
-                const articles = data.articles || [];
-                if (articles.length === 0) {
-                    listEl.innerHTML = '<p style="color:var(--text-muted); font-size:12.5px;">Žádné aktuální zprávy nenalezeny.</p>';
-                    return;
-                }
-                listEl.innerHTML = articles.map(a => `
-                    <div class="news-item">
-                        <a href="${a.url}" target="_blank" rel="noopener">${a.title} &#8599;</a>
-                        <div class="news-meta">${a.source}</div>
-                    </div>
-                `).join('');
-            } catch (err) {
-                listEl.innerHTML = `<p style="color:#f87171; font-size:12.5px;">${err.message}</p>`;
-            }
-        }
-
-        async function sendNewsletterNow() {
-            const email = document.getElementById('subscribeEmailInput').value.trim();
-            const st = document.getElementById('subscribeStatus');
-            if (!email) {
-                st.style.color = '#f87171';
-                st.textContent = 'Zadejte prosím platnou e-mailovou adresu.';
-                return;
-            }
-            st.style.color = '#38bdf8';
-            st.textContent = 'Generuji kompletní český přehled a odesílám e-mail...';
-            try {
-                const res = await fetch('/api/newsletter/send-now', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email })
-                });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || 'Odeslání selhalo.');
-                st.style.color = '#34d399';
-                st.textContent = data.message;
-            } catch (err) {
-                st.style.color = '#f87171';
-                st.textContent = err.message;
-            }
-        }
-
-        async function subscribeNewsletter(e) {
-            if (e) e.preventDefault();
-            const email = document.getElementById('subscribeEmailInput').value.trim();
-            const st = document.getElementById('subscribeStatus');
-            if (!email) {
-                st.style.color = '#f87171';
-                st.textContent = 'Zadejte prosím platnou e-mailovou adresu.';
-                return;
-            }
-            try {
-                const res = await fetch('/subscribe', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ email })
-                });
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.detail || 'Registrace odběru selhala.');
-                st.style.color = '#34d399';
-                st.textContent = data.message;
-            } catch (err) {
-                st.style.color = '#f87171';
-                st.textContent = err.message;
-            }
-        }
-
-        function renderMarkdownToHtml(mdText) {
-            var rawStr = String(mdText || '');
-            var lines = rawStr.split('\n');
-            var htmlOut = '';
-            var inList = false;
-            var inTable = false;
-
-            function escapeHtmlText(txt) {
-                return String(txt || '')
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;');
-            }
-
-            function formatInline(str) {
-                var safe = escapeHtmlText(str);
-                safe = safe.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-                safe = safe.replace(/`([^`]+)`/g, '<code style="background:rgba(56,189,248,0.12);padding:1px 5px;border-radius:4px;font-size:12px;">$1</code>');
-                return safe;
-            }
-
-            function isTableDivider(lineStr) {
-                var trimmed = lineStr.replace(/[|\-:\s]/g, '');
-                return trimmed.length === 0;
-            }
-
-            for (var i = 0; i < lines.length; i++) {
-                var rawLine = lines[i].trim();
-
-                if (rawLine.length > 1 && rawLine.charAt(0) === '|' && rawLine.charAt(rawLine.length - 1) === '|') {
-                    if (inList) {
-                        htmlOut += '</ul>';
-                        inList = false;
-                    }
-                    if (isTableDivider(rawLine)) {
-                        continue;
-                    }
-                    var innerLine = rawLine.substring(1, rawLine.length - 1);
-                    var cells = innerLine.split('|');
-                    if (!inTable) {
-                        inTable = true;
-                        htmlOut += '<table><thead><tr>';
-                        for (var cIdx = 0; cIdx < cells.length; cIdx++) {
-                            htmlOut += '<th>' + formatInline(cells[cIdx].trim()) + '</th>';
-                        }
-                        htmlOut += '</tr></thead><tbody>';
-                    } else {
-                        htmlOut += '<tr>';
-                        for (var rIdx = 0; rIdx < cells.length; rIdx++) {
-                            htmlOut += '<td>' + formatInline(cells[rIdx].trim()) + '</td>';
-                        }
-                        htmlOut += '</tr>';
-                    }
-                    continue;
-                } else if (inTable) {
-                    htmlOut += '</tbody></table>';
-                    inTable = false;
-                }
-
-                if (rawLine.indexOf('### ') === 0) {
-                    if (inList) {
-                        htmlOut += '</ul>';
-                        inList = false;
-                    }
-                    htmlOut += '<h4>' + formatInline(rawLine.substring(4)) + '</h4>';
-                } else if (rawLine.indexOf('## ') === 0) {
-                    if (inList) {
-                        htmlOut += '</ul>';
-                        inList = false;
-                    }
-                    htmlOut += '<h3>' + formatInline(rawLine.substring(3)) + '</h3>';
-                } else if (rawLine.indexOf('- ') === 0 || rawLine.indexOf('* ') === 0) {
-                    if (!inList) {
-                        htmlOut += '<ul>';
-                        inList = true;
-                    }
-                    htmlOut += '<li>' + formatInline(rawLine.substring(2)) + '</li>';
-                } else if (rawLine === '') {
-                    if (inList) {
-                        htmlOut += '</ul>';
-                        inList = false;
-                    }
-                } else {
-                    if (inList) {
-                        htmlOut += '</ul>';
-                        inList = false;
-                    }
-                    htmlOut += '<p>' + formatInline(rawLine) + '</p>';
+        chartInstances.methods = new Chart(ctxM, {
+            type: 'bar',
+            data: {
+                labels: methodItems.map(x => x.label),
+                datasets: [{
+                    label: `Hodnota (${curr})`,
+                    data: methodItems.map(x => x.val),
+                    backgroundColor: methodItems.map(x => x.color),
+                    borderRadius: 6
+                }]
+            },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { ticks: { color: '#94a3b8', font: { size: 11 } }, grid: { display: false } },
+                    y: { ticks: { color: '#94a3b8', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,0.06)' } }
                 }
             }
-            if (inList) {
-                htmlOut += '</ul>';
-            }
-            if (inTable) {
-                htmlOut += '</tbody></table>';
-            }
-            return htmlOut || ('<p>' + escapeHtmlText(rawStr) + '</p>');
-        }
-
-        async function askAdvisor(e) {
-            e.preventDefault();
-            const input = document.getElementById('advisorQuestion');
-            const submitBtn = document.getElementById('advisorSubmitBtn');
-            const q = input.value.trim();
-            if (!q) return;
-
-            const thread = document.getElementById('advisorThread');
-            const userRow = document.createElement('div');
-            userRow.className = 'advisor-msg-row user-row';
-            userRow.innerHTML = `<div class="advisor-avatar">VY</div><div class="advisor-bubble"><p>${q.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</p></div>`;
-            thread.appendChild(userRow);
-            input.value = '';
-            submitBtn.disabled = true;
-
-            const aiRow = document.createElement('div');
-            aiRow.className = 'advisor-msg-row';
-            aiRow.innerHTML = `<div class="advisor-avatar">AI</div><div class="advisor-bubble"><p style="color:#94a3b8;">Analyzuji data a připravuji odpověď...</p></div>`;
-            thread.appendChild(aiRow);
-            thread.scrollTop = thread.scrollHeight;
-
-            const bubbleEl = aiRow.querySelector('.advisor-bubble');
-            const ticker = currentResolvedTicker || document.getElementById('tickerInput').value.trim() || 'NVDA';
-            const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
-            const growth = document.getElementById('growthInput').valueAsNumber / 100;
-            const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
-
-            try {
-                const res = await fetch('/api/advisor/' + encodeURIComponent(ticker), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        question: q,
-                        history: advisorHistory,
-                        scenario: { leverage, growth, exit_mult: exitMult }
-                    })
-                });
-                const data = await res.json();
-                const replyText = res.ok ? data.answer : (data.detail || 'Nepodařilo se zpracovat dotaz.');
-                bubbleEl.innerHTML = renderMarkdownToHtml(replyText);
-                thread.scrollTop = thread.scrollHeight;
-
-                if (res.ok) {
-                    advisorHistory.push({ role: 'user', text: q });
-                    advisorHistory.push({ role: 'advisor', text: replyText });
-                    if (advisorHistory.length > 40) advisorHistory = advisorHistory.slice(-40);
-                }
-            } catch (err) {
-                bubbleEl.innerHTML = `<p>Nepodařilo se spojit s AI poradcem: ${err.message}</p>`;
-            } finally {
-                submitBtn.disabled = false;
-            }
-        }
-
-        function downloadExcel() {
-            const ticker = currentResolvedTicker || document.getElementById('tickerInput').value.trim() || 'NVDA';
-            const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
-            const growth = document.getElementById('growthInput').valueAsNumber / 100;
-            const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
-            window.location.href = '/api/export/excel/' + encodeURIComponent(ticker) + '?leverage=' + leverage + '&growth=' + growth + '&exit_mult=' + exitMult;
-        }
-
-        function downloadPDF() {
-            const ticker = currentResolvedTicker || document.getElementById('tickerInput').value.trim() || 'NVDA';
-            const leverage = document.getElementById('leverageInput').valueAsNumber / 100;
-            const growth = document.getElementById('growthInput').valueAsNumber / 100;
-            const exitMult = document.getElementById('exitMultipleInput').valueAsNumber;
-            window.location.href = '/api/export/pdf/' + encodeURIComponent(ticker) + '?leverage=' + leverage + '&growth=' + growth + '&exit_mult=' + exitMult;
-        }
-
-        document.addEventListener('DOMContentLoaded', () => {
-            try { loadForexRates(); } catch (e) { console.error(e); }
-            try { loadValuation(true); } catch (e) { console.error(e); }
         });
-    </script>
+
+        const hist = d.monte_carlo.histogram || [];
+        const ctxMc = document.getElementById('mcChart').getContext('2d');
+        chartInstances.mc = new Chart(ctxMc, {
+            type: 'bar',
+            data: {
+                labels: hist.map(b => b.label),
+                datasets: [{
+                    label: 'Počet simulací',
+                    data: hist.map(b => b.count),
+                    backgroundColor: hist.map(b => b.midpoint >= d.dcf_valuation.current_share_price ? 'rgba(16, 185, 129, 0.7)' : 'rgba(56, 189, 248, 0.45)'),
+                    borderRadius: 4
+                }]
+            },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { display: false } },
+                scales: {
+                    x: { ticks: { color: '#94a3b8', font: { size: 10 }, maxRotation: 45 }, grid: { display: false } },
+                    y: { ticks: { color: '#94a3b8', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,0.06)' } }
+                }
+            }
+        });
+
+        const cfRows = d.dcf_valuation.cash_flows || [];
+        const lboRows = d.projektovane_roky || [];
+        const ctxCf = document.getElementById('cashflowChart').getContext('2d');
+        chartInstances.cf = new Chart(ctxCf, {
+            type: 'bar',
+            data: {
+                labels: cfRows.map(r => `Rok ${r.rok}`),
+                datasets: [
+                    {
+                        label: 'Volný peněžní tok (FCF)',
+                        data: cfRows.map(r => r.volny_penezni_tok / 1e9),
+                        backgroundColor: 'rgba(56, 189, 248, 0.75)',
+                        borderRadius: 5
+                    },
+                    {
+                        label: 'Zbývající dluh v LBO (mld.)',
+                        data: lboRows.map(r => r.zbyvajici_cizi_kapital / 1e9),
+                        backgroundColor: 'rgba(245, 158, 11, 0.75)',
+                        borderRadius: 5
+                    }
+                ]
+            },
+            options: {
+                responsive: true, maintainAspectRatio: false,
+                plugins: { legend: { labels: { color: '#94a3b8', font: { size: 11 } } } },
+                scales: {
+                    x: { ticks: { color: '#94a3b8', font: { size: 11 } }, grid: { display: false } },
+                    y: { ticks: { color: '#94a3b8', font: { size: 11 } }, grid: { color: 'rgba(255,255,255,0.06)' } }
+                }
+            }
+        });
+    }
+
+    async function runValuation(useDynamicDefaults = false) {
+        const rawQuery = document.getElementById('tickerInput').value.trim() || 'NVDA';
+        document.getElementById('loader').style.display = 'flex';
+        try {
+            let url = `/api/valuation/${encodeURIComponent(rawQuery)}`;
+            if (!useDynamicDefaults) {
+                const lev = parseFloat(document.getElementById('leverageInput').value) / 100.0;
+                const grw = parseFloat(document.getElementById('growthInput').value) / 100.0;
+                const mult = parseFloat(document.getElementById('exitMultInput').value);
+                url += `?leverage=${lev}&growth=${grw}&exit_mult=${mult}`;
+            }
+
+            const resp = await fetch(url);
+            const d = await resp.json();
+            if (!resp.ok) throw new Error(d.detail || 'Chyba výpočtu.');
+
+            currentTicker = d.ticker;
+            document.getElementById('tickerInput').value = d.ticker;
+
+            if (d.dynamic_defaults && useDynamicDefaults) {
+                document.getElementById('leverageInput').value = d.dynamic_defaults.leverage_percent;
+                document.getElementById('growthInput').value = d.dynamic_defaults.growth_percent;
+                document.getElementById('exitMultInput').value = d.dynamic_defaults.exit_multiple;
+            }
+
+            const curr = d.currency;
+            const synth = d.valuation_synthesis;
+            const dec = d.decision_engine;
+            const dcf = d.dcf_valuation;
+            const fund = d.fundamentals;
+            const waccE = d.wacc_engine;
+            const sc = d.scenarios;
+            const mc = d.monte_carlo;
+            const dq = d.data_quality;
+
+            lastFairValue = synth.weighted_fair_value;
+            lastCurrency = curr;
+
+            renderCompanyIdentity(d);
+
+            const srcBadge = document.getElementById('dataSourceBadge');
+            srcBadge.innerText = `Výkazy: ${dq.primary_statement_source}`;
+            if (dq.primary_statement_source.includes('SEC EDGAR') || dq.primary_statement_source.includes('Financial Modeling Prep')) {
+                srcBadge.className = 'badge badge-verified';
+            } else {
+                srcBadge.className = 'badge badge-warn';
+            }
+
+            const warnBanner = document.getElementById('dataWarningBanner');
+            if (dq.warnings && dq.warnings.length > 0) {
+                warnBanner.style.display = 'block';
+                warnBanner.innerHTML = `<strong>Kontrola kvality účetních dat:</strong> ${escapeHtml(dq.warnings.join(' '))}`;
+            } else {
+                warnBanner.style.display = 'none';
+            }
+
+            document.getElementById('auditStamp').innerText = `${d.audit_trail.model_version} | ${d.audit_trail.timestamp}`;
+            document.getElementById('integrityBadge').innerText = `Index integrity: ${synth.integrity_score} / 100`;
+            document.getElementById('weightedFairBadge').innerText = `Vážená vnitřní hodnota: ${fmtMoney(synth.weighted_fair_value, curr)}`;
+
+            ['GREEN', 'YELLOW', 'ORANGE', 'RED'].forEach(z => {
+                document.getElementById(`light-${z}`).classList.toggle('active', dec.zone === z);
+            });
+            document.getElementById('thesisTitle').innerText = `${dec.recommendation} (Doporučená tranše: ${dec.tranche_allocation_percent} %)`;
+            document.getElementById('thesisSub').innerText =
+                `Aktuální tržní cena: ${fmtMoney(dcf.current_share_price, curr)} | Vážená vnitřní hodnota: ${fmtMoney(synth.weighted_fair_value, curr)} | Bezpečnostní rezerva: ${fmtNum(dec.margin_of_safety_percent)} %.`;
+
+            document.getElementById('zoneGreenBand').innerText = `0,00 – ${fmtMoney(dec.bands.green_max, curr)}`;
+            document.getElementById('zoneYellowBand').innerText = `${fmtMoney(dec.bands.yellow_min, curr)} – ${fmtMoney(dec.bands.yellow_max, curr)}`;
+            document.getElementById('zoneOrangeBand').innerText = `${fmtMoney(dec.bands.orange_min, curr)} – ${fmtMoney(dec.bands.orange_max, curr)}`;
+            document.getElementById('zoneRedBand').innerText = `nad ${fmtMoney(dec.bands.red_min, curr)}`;
+            document.getElementById('disagreementNote').innerText = synth.disagreement_note;
+
+            document.getElementById('synthesisTableBody').innerHTML = synth.methods.map(m => `
+                <tr>
+                    <td>${escapeHtml(m.method)}</td>
+                    <td>${fmtNum(m.weight_percent, 1)} %</td>
+                    <td>${m.fair_value !== null ? fmtMoney(m.fair_value, curr) : '<span style="color:#fbbf24;">N/A (chybí data)</span>'}</td>
+                    <td>${fmtMoney(m.contribution, curr)}</td>
+                    <td style="color: ${m.vs_market_percent === null ? '#94a3b8' : (m.vs_market_percent >= 0 ? '#34d399' : '#f87171')};">${m.vs_market_percent !== null ? `${m.vs_market_percent >= 0 ? '+' : ''}${fmtNum(m.vs_market_percent)} %` : 'N/A'}</td>
+                </tr>
+            `).join('');
+
+            document.getElementById('mcap').innerText = fmtCompact(d.trzni_kapitalizace, curr);
+            document.getElementById('ev').innerText = fmtCompact(d.celkova_hodnota_podniku, curr);
+            document.getElementById('ownerEarnings').innerText = fund.owner_earnings !== null
+                ? `${fmtCompact(fund.owner_earnings, curr)} (${fmtMoney(fund.owner_earnings_per_share, curr)}/akcie)`
+                : 'N/A';
+            document.getElementById('capexSplit').innerText = (fund.maintenance_capex !== null && fund.growth_capex !== null)
+                ? `${fmtCompact(fund.maintenance_capex, curr)} / ${fmtCompact(fund.growth_capex, curr)}`
+                : 'N/A';
+            document.getElementById('lookThrough').innerText = fmtCompact(fund.look_through_earnings, curr);
+            document.getElementById('normFcf').innerText = fmtCompact(fund.normalized_fcf, curr);
+            document.getElementById('roicWacc').innerText = fund.roic_percent !== null
+                ? `${fmtNum(fund.roic_percent)} % vs. ${fmtNum(waccE.wacc_percent)} %`
+                : `N/A vs. ${fmtNum(waccE.wacc_percent)} %`;
+            document.getElementById('riskScores').innerText = `${d.risk_analysis.piotroski_f_score}/9 • ${d.risk_analysis.altman_status}`;
+
+            document.getElementById('dcfShare').innerText = fmtMoney(dcf.intrinsic_value_per_share, curr);
+            document.getElementById('fcfeRi').innerText = `${fmtMoney(d.fcfe_valuation.intrinsic_value_per_share, curr)} / ${fmtMoney(d.residual_income.intrinsic_value_per_share, curr)}`;
+            document.getElementById('waccBeta').innerText = `${fmtNum(waccE.wacc_percent)} % (${fmtNum(waccE.beta)})`;
+            document.getElementById('tvShare').innerText = dcf.tv_share_percent !== null ? `${fmtNum(dcf.tv_share_percent, 1)} % z EV` : 'N/A';
+            document.getElementById('impliedGrowth').innerText = d.reverse_dcf.implied_fcf_growth_percent !== null ? `${fmtNum(d.reverse_dcf.implied_fcf_growth_percent)} % ročně` : 'N/A';
+            document.getElementById('sotpShare').innerText = fmtMoney(d.metoda_souctu_casti.sotp_per_share, curr);
+
+            document.getElementById('scenariosTriple').innerText = sc.available
+                ? `${fmtNum(sc.bear.fair_value, 1)} / ${fmtNum(sc.base.fair_value, 1)} / ${fmtNum(sc.bull.fair_value, 1)} ${curr}`
+                : 'N/A';
+            document.getElementById('scenarioExpected').innerText = fmtMoney(sc.expected_value, curr);
+            document.getElementById('mcMedian').innerText = fmtMoney(mc.p50, curr);
+            document.getElementById('mc1090').innerText = mc.p10 !== null ? `${fmtMoney(mc.p10, curr)} – ${fmtMoney(mc.p90, curr)}` : 'N/A';
+            document.getElementById('mc595').innerText = mc.p5 !== null ? `${fmtMoney(mc.p5, curr)} – ${fmtMoney(mc.p95, curr)}` : 'N/A';
+            document.getElementById('mcProb').innerText = mc.prob_above_market_percent !== null ? `${fmtNum(mc.prob_above_market_percent, 1)} %` : 'N/A';
+
+            const fp = d.factor_and_quality_diagnostics || {};
+            const factorKeys = ['low_beta_bab', 'quality_qmj', 'owner_earnings_conversion', 'cheap_float_financing', 'drawdown_and_size'];
+            document.getElementById('factorProfileGrid').innerHTML = factorKeys.map(k => {
+                const item = fp[k];
+                if (!item) return '';
+                return `
+                    <div class="factor-item">
+                        <div class="factor-item-head">
+                            <span>${escapeHtml(item.label)}</span>
+                            <span class="${item.passed ? 'factor-status-ok' : 'factor-status-warn'}">${item.passed ? 'SPLNĚNO' : 'UPOZORNĚNÍ'}</span>
+                        </div>
+                        <div class="factor-item-desc">${escapeHtml(item.detail)}</div>
+                    </div>
+                `;
+            }).join('');
+
+            const limits = fp.model_limits || [];
+            document.getElementById('modelLimitsList').innerHTML =
+                `<strong>Metodické limity a rizika odhadu:</strong> ` + limits.map(l => escapeHtml(l)).join(' &bull; ');
+
+            document.getElementById('peerTableBody').innerHTML = (d.peer_comps.multiples || []).map(p => `
+                <tr>
+                    <td>${escapeHtml(p.method)}</td>
+                    <td>${fmtNum(p.multiple, 1)}x</td>
+                    <td>${fmtCompact(p.forward_metric, curr)}</td>
+                    <td>${fmtMoney(p.implied_share_price, curr)}</td>
+                </tr>
+            `).join('');
+
+            const sens = dcf.sensitivity_matrix || [];
+            if (sens.length > 0) {
+                document.getElementById('dcfSensHeader').innerHTML = '<th>WACC \\ Růst</th>' + sens[0].cells.map(c => `<th>${fmtNum(c.tg, 2)} %</th>`).join('');
+                document.getElementById('dcfSensBody').innerHTML = sens.map(row => `
+                    <tr>
+                        <td><strong>${fmtNum(row.wacc, 2)} %</strong></td>
+                        ${row.cells.map(c => `<td style="color:${c.price >= dcf.current_share_price ? '#34d399' : '#f87171'};">${fmtNum(c.price, 2)}</td>`).join('')}
+                    </tr>
+                `).join('');
+            } else {
+                document.getElementById('dcfSensHeader').innerHTML = '<th>Citlivostní matice DCF</th>';
+                document.getElementById('dcfSensBody').innerHTML = '<tr><td>N/A — pro výpočet matice chybí reportovaný FCF nebo dluh.</td></tr>';
+            }
+
+            renderCharts(d);
+            await loadInteractiveChart(d.ticker, currentTimeframe);
+        } catch (err) {
+            const warnBanner = document.getElementById('dataWarningBanner');
+            warnBanner.style.display = 'block';
+            warnBanner.innerHTML = `<strong>Chyba při zpracování titulu:</strong> ${escapeHtml(err.message)}`;
+        } finally {
+            document.getElementById('loader').style.display = 'none';
+        }
+    }
+
+    function downloadExcel() {
+        const lev = parseFloat(document.getElementById('leverageInput').value) / 100.0;
+        const grw = parseFloat(document.getElementById('growthInput').value) / 100.0;
+        const mult = parseFloat(document.getElementById('exitMultInput').value);
+        window.location.href = `/api/export/excel/${encodeURIComponent(currentTicker)}?leverage=${lev}&growth=${grw}&exit_mult=${mult}`;
+    }
+
+    function downloadPdf() {
+        const lev = parseFloat(document.getElementById('leverageInput').value) / 100.0;
+        const grw = parseFloat(document.getElementById('growthInput').value) / 100.0;
+        const mult = parseFloat(document.getElementById('exitMultInput').value);
+        window.location.href = `/api/export/pdf/${encodeURIComponent(currentTicker)}?leverage=${lev}&growth=${grw}&exit_mult=${mult}`;
+    }
+
+    function formatAdvisorReply(rawText) {
+        let cleaned = String(rawText || '')
+            .replace(/\\\[|\\\]|\\\(|\\\)/g, '')
+            .replace(/\$\$/g, '')
+            .replace(/\\text\{([^{}]*)\}/g, '$1')
+            .replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, '($1 / $2)')
+            .replace(/\\times/g, '×')
+            .replace(/\\beta/g, 'Beta');
+        let htmlOut = escapeHtml(cleaned);
+        htmlOut = htmlOut.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+        htmlOut = htmlOut.replace(/`([^`]+)`/g, '<code style="background:rgba(56,189,248,0.14);padding:2px 5px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;">$1</code>');
+        return htmlOut.replace(/\n/g, '<br>');
+    }
+
+    async function askAdvisor() {
+        const inputEl = document.getElementById('advisorInput');
+        const btnEl = document.getElementById('advisorSendBtn');
+        const msgBox = document.getElementById('advisorMessages');
+        const question = inputEl.value.trim();
+        if (!question) return;
+
+        inputEl.value = '';
+        btnEl.disabled = true;
+
+        const userDiv = document.createElement('div');
+        userDiv.className = 'advisor-message user';
+        userDiv.innerText = question;
+        msgBox.appendChild(userDiv);
+
+        const aiDiv = document.createElement('div');
+        aiDiv.className = 'advisor-message assistant';
+        aiDiv.innerHTML = '<span style="color:#38bdf8;">Zpracovávám odpověď...</span>';
+        msgBox.appendChild(aiDiv);
+        msgBox.scrollTop = msgBox.scrollHeight;
+
+        try {
+            const resp = await fetch(`/api/advisor/${encodeURIComponent(currentTicker)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    question,
+                    history: advisorHistory,
+                    scenario: {
+                        leverage: parseFloat(document.getElementById('leverageInput').value) / 100.0,
+                        growth: parseFloat(document.getElementById('growthInput').value) / 100.0,
+                        exit_mult: parseFloat(document.getElementById('exitMultInput').value)
+                    }
+                })
+            });
+            const data = await resp.json();
+            if (!resp.ok) throw new Error(data.detail || 'Chyba AI poradce.');
+
+            aiDiv.innerHTML = formatAdvisorReply(data.answer);
+            advisorHistory.push({ role: 'user', text: question });
+            advisorHistory.push({ role: 'assistant', text: data.answer });
+        } catch (err) {
+            aiDiv.innerHTML = `<span style="color:#f87171;">${escapeHtml(err.message)}</span>`;
+        } finally {
+            btnEl.disabled = false;
+            msgBox.scrollTop = msgBox.scrollHeight;
+        }
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+        loadForexBanner();
+        runValuation(true);
+    });
+</script>
 </body>
-</html>
-"""
+</html>"""
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
