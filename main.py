@@ -1474,7 +1474,7 @@ def _looks_english(text: str) -> bool:
     if not text:
         return False
     en_markers = re.findall(
-        r"\b(the|and|with|from|for|that|this|are|was|were|have|has|will|would|could|should|market|stocks|shares|fed|rate|rates|inflation|economy|quarter|earnings|guidance|investors|trading|growth|debt|says|after|over|new|us|china|europe|bank|price|prices|oil|tech)\b",
+        r"\b(the|and|with|from|for|that|this|are|was|were|have|has|will|would|could|should|market|stocks|shares|fed|rate|rates|inflation|economy|quarter|earnings|guidance|investors|trading|growth|debt|says|after|over|new|us|china|europe|bank|price|prices|oil|tech|tariff|threats|pile|pressure|partners|sign|trade|deals)\b",
         text.lower(),
     )
     cz_chars = re.findall(r"[ěščřžýáíéúůďťňĚŠČŘŽÝÁÍÉÚŮĎŤŇ]", text)
@@ -1485,7 +1485,27 @@ def _fallback_translate_en_to_cs(text: str) -> str:
     clean = re.sub(r"\s+", " ", (text or "")).strip()
     if not clean or not _looks_english(clean):
         return clean
-    chunks = [clean[i:i + 450] for i in range(0, min(len(clean), 1350), 450)]
+
+    # 1. Primární překlad přes Google Translate endpoint (přeloží celé věty i titulky do přirozené češtiny)
+    try:
+        gt_url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=cs&dt=t&q={quote(clean[:2200])}"
+        req_gt = urllib.request.Request(
+            gt_url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        )
+        with urllib.request.urlopen(req_gt, timeout=8) as resp_gt:
+            gt_payload = json.loads(resp_gt.read().decode("utf-8", errors="ignore"))
+        if isinstance(gt_payload, list) and gt_payload and isinstance(gt_payload[0], list):
+            gt_translated = "".join(
+                str(seg[0]) for seg in gt_payload[0] if isinstance(seg, list) and seg and seg[0]
+            ).strip()
+            if gt_translated and not _looks_english(gt_translated):
+                return gt_translated
+    except Exception:
+        pass
+
+    # 2. Záložní překlad po blocích přes MyMemory API
+    chunks = [clean[i:i + 450] for i in range(0, min(len(clean), 1800), 450)]
     translated_parts: list[str] = []
     for chunk in chunks:
         try:
@@ -1503,7 +1523,40 @@ def _fallback_translate_en_to_cs(text: str) -> str:
     return " ".join(translated_parts).strip()
 
 
+def _fetch_article_lead_paragraphs(article_url: str) -> str:
+    """Stáhne úvodní odstavce přímo z článku, pokud má RSS jen krátký popisek."""
+    if not article_url or not article_url.startswith(("http://", "https://")):
+        return ""
+    try:
+        req = urllib.request.Request(
+            article_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            page_html = _decode_bytes_smart(resp.read(160_000), ctype)
+        paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", page_html, flags=re.IGNORECASE | re.DOTALL)
+        clean_paras: list[str] = []
+        for p in paragraphs:
+            txt = re.sub(r"<[^>]+>", " ", html.unescape(p))
+            txt = re.sub(r"\s+", " ", txt).strip()
+            if len(txt) >= 55 and not any(
+                skip in txt.lower()
+                for skip in ("cookie", "subscribe", "sign in", "prihlasit", "přihlásit", "newsletter", "all rights reserved")
+            ):
+                clean_paras.append(txt)
+            if len(" ".join(clean_paras)) >= 1100:
+                break
+        return " ".join(clean_paras)[:1400]
+    except Exception:
+        return ""
+
+
 def _clean_czech_news_summary(text: str, title_cs: str) -> str:
+    """Zajistí 100% český text v rozsahu 4 až 5 věcných vět bez anglických zbytků."""
     cleaned = re.sub(r"\[?\s*Zdroj\s*:[^\]]*\]?", "", text or "", flags=re.IGNORECASE)
     cleaned = re.sub(r"https?://\S+", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -1511,31 +1564,38 @@ def _clean_czech_news_summary(text: str, title_cs: str) -> str:
     if _looks_english(cleaned):
         cleaned = _fallback_translate_en_to_cs(cleaned)
 
-    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if len(s.strip()) > 8]
+    raw_sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if len(s.strip()) > 10]
     sentences: list[str] = []
     for s in raw_sentences:
         if _looks_english(s):
             s = _fallback_translate_en_to_cs(s)
+        if _looks_english(s):
+            continue
         s_clean = s.rstrip(".!?").strip() + "."
-        if s_clean not in sentences and not _looks_english(s_clean):
+        if s_clean not in sentences:
             sentences.append(s_clean)
-        if len(sentences) >= 3:
+        if len(sentences) >= 5:
             break
 
-    base_t = title_cs.rstrip(".!?").strip()
+    clean_subject = re.sub(r"^\d+\.\s*", "", title_cs or "").rstrip(".!?").strip()
+    if _looks_english(clean_subject):
+        clean_subject = _fallback_translate_en_to_cs(clean_subject).rstrip(".!?").strip()
+
+    # Doplnění do minimálně 4 vět (cíl 4–5 vět) výhradně čistou češtinou
     fallback_pool = [
-        f"Téma se zaměřuje na klíčový vývoj v oblasti {base_t.lower()}.",
-        "Událost má přímý dopad na tržní sentiment, regulaci nebo hospodaření dotčených subjektů.",
-        "Další vývoj bude sledovat trh, investoři i institucionální analytici.",
+        f"Klíčovým bodem aktuálního vývoje jsou události kolem tématu {clean_subject}." if clean_subject and not _looks_english(clean_subject) else "Zpráva přináší zásadní impulsy pro vývoj na finančních a kapitálových trzích.",
+        "Tržní účastníci vyhodnocují bezprostřední dopad těchto informací na ocenění aktiv a ziskovost firem.",
+        "Další směřování situace může ovlivnit měnovou politiku centrálních bank i regulatorní prostředí.",
+        "Institucionální investoři proto pečlivě sledují navazující makroekonomická data a oficiální stanoviska.",
     ]
     idx_fb = 0
-    while len(sentences) < 3 and idx_fb < len(fallback_pool):
+    while len(sentences) < 4 and idx_fb < len(fallback_pool):
         cand = fallback_pool[idx_fb]
         idx_fb += 1
         if cand not in sentences:
             sentences.append(cand)
 
-    return " ".join(sentences[:3])
+    return " ".join(sentences[:5])
 
 
 def _translate_and_summarize_batch_czech(articles: list[dict]) -> list[dict]:
@@ -1548,17 +1608,17 @@ def _translate_and_summarize_batch_czech(articles: list[dict]) -> list[dict]:
                 {
                     "index": idx,
                     "title": art["raw_title"],
-                    "snippet": art["raw_text"][:1600],
+                    "snippet": art["raw_text"][:2200],
                 }
                 for idx, art in enumerate(articles)
             ]
             prompt = (
-                "Jsi špičkový editor a překladatel českého zpravodaje Tensegrity Terminal zaměřeného na "
-                "finance, akvizice, politiku, investice, občanský a obchodní zákoník, zákony, legislativu a soudy.\n"
+                "Jsi špičkový editor a překladatel českého institucionálního zpravodaje Tensegrity Terminal zaměřeného na "
+                "makroekonomiku, finanční trhy, akvizice (M&A), centrální banky, hospodářskou politiku, investice a legislativu.\n"
                 "Pro KAŽDOU položku ze seznamu splň přísně tato pravidla:\n"
-                "1. Přelož nadpis ('title_cs') do naprosto plynulé, spisovné a přirozené ČEŠTINY (nikdy nenechávej angličtinu).\n"
-                "2. Vytvoř věcné, hutné a srozumitelné shrnutí nejdůležitějšího ('summary_cs') v ČEŠTINĚ přesně na 3 věty.\n"
-                "3. Do textu shrnutí NIKDY nepiš název média, zdroj článku ani citace typu 'říká', 'napsal' bez kontextu – piš věcně jako analytické shrnutí.\n"
+                "1. Přelož nadpis ('title_cs') do naprosto plynulé, spisovné ČEŠTINY (nikdy nenechávej anglická slova v titulku).\n"
+                "2. Vytvoř věcné, hutné a konkrétní analytické shrnutí ('summary_cs') v ČEŠTINĚ o rozsahu 4 AŽ 5 VĚT na základě textu článku.\n"
+                "3. Do textu shrnutí NIKDY nepiš název média ani zdroj článku.\n"
                 "4. Vrať výhradně čistý JSON ve formátu pole objektů: [{\"index\": 0, \"title_cs\": \"...\", \"summary_cs\": \"...\"}].\n\n"
                 f"Vstupní data: {json.dumps(items_payload, ensure_ascii=False)}"
             )
